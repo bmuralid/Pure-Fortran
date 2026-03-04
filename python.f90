@@ -20,6 +20,8 @@ public :: sort_int_vec !@pyapi kind=subroutine args=x:integer(:):intent(inout) d
 public :: argsort_real !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of real vector"
 public :: argsort_int !@pyapi kind=subroutine args=x:integer(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of integer vector"
 public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="integer arange(start, stop, step)"
+public :: logspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional,base:real(dp):intent(in):optional desc="logspace(start, stop, num=50, endpoint=True, base=10)"
+public :: geomspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional desc="geomspace(start, stop, num=50, endpoint=True)"
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
 public :: var_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
 public :: zeros_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 0"
@@ -68,6 +70,13 @@ public :: searchsorted_left_int !@pyapi kind=function ret=integer(:) args=a:inte
 public :: searchsorted_right_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted right indices for integer vectors"
 public :: searchsorted_left_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) desc="searchsorted left index for scalar integer query"
 public :: searchsorted_right_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) desc="searchsorted right index for scalar integer query"
+public :: setdiff1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique values in a not in b"
+public :: intersect1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique intersection of a and b"
+public :: unique_int_inv_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),inv:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with inverse and counts"
+public :: lexsort2_int !@pyapi kind=function ret=integer(:) args=key0:integer(:):intent(in),key1:integer(:):intent(in) desc="lexsort((key0,key1)): sort by key1 then key0, return 0-based indices"
+public :: ravel_multi_index_2d !@pyapi kind=function ret=integer args=rc:integer(:):intent(in),shape:integer(:):intent(in) desc="2D ravel_multi_index"
+public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:intent(in),shape:integer(:):intent(in) desc="2D unravel_index"
+public :: kron_2d !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),b:integer(:,:):intent(in) desc="2D Kronecker product for integer matrices"
 public :: histogram_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:integer(:):intent(out),edges:real(dp)(:):intent(out) desc="1D histogram with explicit real bin edges"
 public :: histogram_int_edges !@pyapi kind=subroutine args=x:integer(:):intent(in),bins:integer(:):intent(in),h:integer(:):intent(out),edges:integer(:):intent(out) desc="1D histogram with explicit integer bin edges"
 public :: reduceat_add_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for real vector"
@@ -430,6 +439,79 @@ contains
          end do
       end function arange_int
 
+      function logspace(start, stop, num, endpoint, base) result(x)
+         real(kind=dp), intent(in) :: start, stop
+         integer, intent(in), optional :: num
+         logical, intent(in), optional :: endpoint
+         real(kind=dp), intent(in), optional :: base
+         real(kind=dp), allocatable :: x(:)
+         integer :: n, i
+         logical :: ep
+         real(kind=dp) :: b, dx
+         n = 50
+         if (present(num)) n = max(0, num)
+         ep = .true.
+         if (present(endpoint)) ep = endpoint
+         b = 10.0_dp
+         if (present(base)) b = base
+         allocate(x(n))
+         if (n <= 0) return
+         if (n == 1) then
+            if (ep) then
+               x(1) = b**stop
+            else
+               x(1) = b**start
+            end if
+            return
+         end if
+         if (ep) then
+            dx = (stop - start) / real(n - 1, kind=dp)
+         else
+            dx = (stop - start) / real(n, kind=dp)
+         end if
+         do i = 1, n
+            x(i) = b**(start + dx * real(i - 1, kind=dp))
+         end do
+      end function logspace
+
+      function geomspace(start, stop, num, endpoint) result(x)
+         real(kind=dp), intent(in) :: start, stop
+         integer, intent(in), optional :: num
+         logical, intent(in), optional :: endpoint
+         real(kind=dp), allocatable :: x(:)
+         integer :: n, i
+         logical :: ep
+         real(kind=dp) :: sgn, la, lb, dx
+         n = 50
+         if (present(num)) n = max(0, num)
+         ep = .true.
+         if (present(endpoint)) ep = endpoint
+         if (start == 0.0_dp .or. stop == 0.0_dp) error stop 'geomspace: start/stop must be non-zero'
+         if (start * stop < 0.0_dp) error stop 'geomspace: start/stop must have same sign'
+         sgn = 1.0_dp
+         if (start < 0.0_dp) sgn = -1.0_dp
+         la = log(abs(start))
+         lb = log(abs(stop))
+         allocate(x(n))
+         if (n <= 0) return
+         if (n == 1) then
+            if (ep) then
+               x(1) = stop
+            else
+               x(1) = start
+            end if
+            return
+         end if
+         if (ep) then
+            dx = (lb - la) / real(n - 1, kind=dp)
+         else
+            dx = (lb - la) / real(n, kind=dp)
+         end if
+         do i = 1, n
+            x(i) = sgn * exp(la + dx * real(i - 1, kind=dp))
+         end do
+      end function geomspace
+
       function bincount_int(x, minlength) result(c)
          integer, intent(in) :: x(:)
          integer, intent(in), optional :: minlength
@@ -531,6 +613,127 @@ contains
          end do
          idx = lo - 1
       end function searchsorted_right_int_scalar
+
+      function setdiff1d_int(a, b) result(c)
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: c(:)
+         integer, allocatable :: ua(:), ub(:), tmp(:)
+         integer :: i, j, nout
+         ua = unique_int(a)
+         ub = unique_int(b)
+         allocate(tmp(1:size(ua)), source=0)
+         nout = 0
+         do i = 1, size(ua)
+            do j = 1, size(ub)
+               if (ua(i) == ub(j)) exit
+            end do
+            if (j > size(ub)) then
+               nout = nout + 1
+               tmp(nout) = ua(i)
+            end if
+         end do
+         allocate(c(1:nout))
+         if (nout > 0) c = tmp(1:nout)
+      end function setdiff1d_int
+
+      function intersect1d_int(a, b) result(c)
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: c(:)
+         integer, allocatable :: ua(:), ub(:), tmp(:)
+         integer :: i, j, nout
+         ua = unique_int(a)
+         ub = unique_int(b)
+         allocate(tmp(1:min(size(ua), size(ub))), source=0)
+         nout = 0
+         do i = 1, size(ua)
+            do j = 1, size(ub)
+               if (ua(i) == ub(j)) then
+                  nout = nout + 1
+                  tmp(nout) = ua(i)
+                  exit
+               end if
+            end do
+         end do
+         allocate(c(1:nout))
+         if (nout > 0) c = tmp(1:nout)
+      end function intersect1d_int
+
+      subroutine unique_int_inv_counts(a, u, inv, cnt)
+         integer, intent(in) :: a(:)
+         integer, allocatable, intent(out) :: u(:), inv(:), cnt(:)
+         integer :: i, j, n
+         u = unique_int(a)
+         n = size(a)
+         allocate(inv(1:n), source=0)
+         allocate(cnt(1:size(u)), source=0)
+         do i = 1, n
+            do j = 1, size(u)
+               if (a(i) == u(j)) then
+                  inv(i) = j - 1
+                  cnt(j) = cnt(j) + 1
+                  exit
+               end if
+            end do
+         end do
+      end subroutine unique_int_inv_counts
+
+      function lexsort2_int(key0, key1) result(idx)
+         integer, intent(in) :: key0(:), key1(:)
+         integer, allocatable :: idx(:)
+         integer :: i, j, n, t
+         n = size(key0)
+         if (size(key1) /= n) error stop 'lexsort2_int: key size mismatch'
+         allocate(idx(1:n))
+         do i = 1, n
+            idx(i) = i - 1
+         end do
+         do i = 2, n
+            t = idx(i)
+            j = i - 1
+            do while (j >= 1)
+               if (key1(idx(j)+1) < key1(t+1)) exit
+               if (key1(idx(j)+1) == key1(t+1) .and. key0(idx(j)+1) <= key0(t+1)) exit
+               idx(j+1) = idx(j)
+               j = j - 1
+            end do
+            idx(j+1) = t
+         end do
+      end function lexsort2_int
+
+      function ravel_multi_index_2d(rc, shape) result(i)
+         integer, intent(in) :: rc(:), shape(:)
+         integer :: i
+         if (size(rc) < 2 .or. size(shape) < 2) error stop 'ravel_multi_index_2d: expected rank-2 inputs'
+         i = rc(1) * shape(2) + rc(2)
+      end function ravel_multi_index_2d
+
+      function unravel_index_2d(i, shape) result(rc)
+         integer, intent(in) :: i
+         integer, intent(in) :: shape(:)
+         integer, allocatable :: rc(:)
+         if (size(shape) < 2) error stop 'unravel_index_2d: expected shape rank 2'
+         allocate(rc(1:2))
+         rc(1) = i / shape(2)
+         rc(2) = mod(i, shape(2))
+      end function unravel_index_2d
+
+      function kron_2d(a, b) result(k)
+         integer, intent(in) :: a(:,:), b(:,:)
+         integer, allocatable :: k(:,:)
+         integer :: i, j, p, q, ra, ca, rb, cb
+         ra = size(a,1); ca = size(a,2)
+         rb = size(b,1); cb = size(b,2)
+         allocate(k(1:ra*rb, 1:ca*cb), source=0)
+         do i = 1, ra
+            do j = 1, ca
+               do p = 1, rb
+                  do q = 1, cb
+                     k((i-1)*rb+p, (j-1)*cb+q) = a(i,j) * b(p,q)
+                  end do
+               end do
+            end do
+         end do
+      end function kron_2d
 
       subroutine histogram_real_edges(x, bins, h, edges)
          real(kind=dp), intent(in) :: x(:), bins(:)

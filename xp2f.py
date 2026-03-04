@@ -800,6 +800,8 @@ def detect_needed_helpers(tree):
     np_helper_map = {
         "arange": {"arange_int"},
         "linspace": {"arange_int"},
+        "logspace": {"logspace"},
+        "geomspace": {"geomspace"},
         "cumsum": {"cumsum"},
         "cumprod": {"cumprod"},
         "gradient": {"gradient_1d"},
@@ -2417,6 +2419,13 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"logspace", "geomspace"}
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "take"
                 and len(node.args) >= 2
             ):
@@ -2658,7 +2667,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"zeros", "ones", "full", "linspace", "arange"}
+                and node.func.attr in {"zeros", "ones", "full", "linspace", "logspace", "geomspace", "arange"}
                 and len(node.args) >= 1
             ):
                 return f"size({self.expr(node)})"
@@ -2922,6 +2931,10 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "arange" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "linspace" and len(node.args) >= 1:
+                    return 1
+                if node.func.attr == "logspace" and len(node.args) >= 1:
+                    return 1
+                if node.func.attr == "geomspace" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "eye":
                     return 2
@@ -4625,7 +4638,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"full", "full_like", "clip", "linspace", "diff", "gradient"}
+                and node.func.attr in {"full", "full_like", "clip", "linspace", "logspace", "geomspace", "diff", "gradient"}
                 and len(node.args) >= 1
             ):
                 if node.func.attr == "full" and len(node.args) >= 2:
@@ -4653,6 +4666,41 @@ class translator(ast.NodeVisitor):
                         f"({a0} + ({a1} - {a0}) * real(arange_int(0, int({num}), 1), kind=dp) / "
                         f"real(max(1, int({num}) - 1), kind=dp))"
                     )
+                if node.func.attr == "logspace" and len(node.args) >= 2:
+                    start = self.expr(node.args[0])
+                    stop = self.expr(node.args[1])
+                    num = "50"
+                    endpoint = ".true."
+                    base = "10.0_dp"
+                    if len(node.args) >= 3:
+                        num = self.expr(node.args[2])
+                    if len(node.args) >= 4:
+                        endpoint = self.expr(node.args[3])
+                    if len(node.args) >= 5:
+                        base = self.expr(node.args[4])
+                    for kw in node.keywords:
+                        if kw.arg == "num":
+                            num = self.expr(kw.value)
+                        elif kw.arg == "endpoint":
+                            endpoint = self.expr(kw.value)
+                        elif kw.arg == "base":
+                            base = self.expr(kw.value)
+                    return f"logspace({start}, {stop}, int({num}), {endpoint}, {base})"
+                if node.func.attr == "geomspace" and len(node.args) >= 2:
+                    start = self.expr(node.args[0])
+                    stop = self.expr(node.args[1])
+                    num = "50"
+                    endpoint = ".true."
+                    if len(node.args) >= 3:
+                        num = self.expr(node.args[2])
+                    if len(node.args) >= 4:
+                        endpoint = self.expr(node.args[3])
+                    for kw in node.keywords:
+                        if kw.arg == "num":
+                            num = self.expr(kw.value)
+                        elif kw.arg == "endpoint":
+                            endpoint = self.expr(kw.value)
+                    return f"geomspace({start}, {stop}, int({num}), {endpoint})"
                 if node.func.attr == "diff":
                     a0 = self.expr(node.args[0])
                     axis = -1
@@ -5093,6 +5141,53 @@ class translator(ast.NodeVisitor):
                 a0 = self.expr(node.args[0])
                 i0 = self.expr(node.args[1])
                 return f"{helper}({a0}, {i0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "logspace"
+                and len(node.args) >= 2
+            ):
+                start = self.expr(node.args[0])
+                stop = self.expr(node.args[1])
+                num = "50"
+                endpoint = ".true."
+                base = "10.0_dp"
+                if len(node.args) >= 3:
+                    num = self.expr(node.args[2])
+                if len(node.args) >= 4:
+                    endpoint = self.expr(node.args[3])
+                if len(node.args) >= 5:
+                    base = self.expr(node.args[4])
+                for kw in node.keywords:
+                    if kw.arg == "num":
+                        num = self.expr(kw.value)
+                    elif kw.arg == "endpoint":
+                        endpoint = self.expr(kw.value)
+                    elif kw.arg == "base":
+                        base = self.expr(kw.value)
+                return f"logspace({start}, {stop}, int({num}), {endpoint}, {base})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "geomspace"
+                and len(node.args) >= 2
+            ):
+                start = self.expr(node.args[0])
+                stop = self.expr(node.args[1])
+                num = "50"
+                endpoint = ".true."
+                if len(node.args) >= 3:
+                    num = self.expr(node.args[2])
+                if len(node.args) >= 4:
+                    endpoint = self.expr(node.args[3])
+                for kw in node.keywords:
+                    if kw.arg == "num":
+                        num = self.expr(kw.value)
+                    elif kw.arg == "endpoint":
+                        endpoint = self.expr(kw.value)
+                return f"geomspace({start}, {stop}, int({num}), {endpoint})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -5811,6 +5906,17 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_log(t.id)
                         else:
                             self._mark_alloc_int(t.id)
+
+                # np.logspace(...), np.geomspace(...)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Name)
+                    and v.func.value.id == "np"
+                    and v.func.attr in {"logspace", "geomspace"}
+                ):
+                    self._mark_alloc_real(t.id, rank=1)
                     k_node = None
                     if len(v.args) >= 2:
                         k_node = v.args[1]
