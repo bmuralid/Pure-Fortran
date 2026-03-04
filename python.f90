@@ -47,6 +47,7 @@ public :: str_isspace !@pyapi kind=function ret=logical args=s:character:intent(
 public :: cumsum_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative sum of real vector"
 public :: unique_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="sorted unique values of integer vector"
 public :: tile_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="tile integer vector reps times"
+public :: tile_int_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile integer matrix reps0 x reps1 times"
 public :: diag_from_vec_int !@pyapi kind=function ret=integer(:,:) args=v:integer(:):intent(in) desc="return diagonal matrix from integer vector"
 public :: cumprod_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative product of integer vector"
 public :: repeat_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="repeat each integer element reps times"
@@ -56,10 +57,16 @@ public :: diag_from_vec_real !@pyapi kind=function ret=real(dp)(:,:) args=v:real
 public :: repeat_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="repeat each real element reps times"
 public :: diag_from_mat_int !@pyapi kind=function ret=integer(:) args=a:integer(:,:):intent(in) desc="return main diagonal of integer matrix"
 public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="tile real vector reps times"
+public :: tile_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps0:integer:intent(in),reps1:integer:intent(in) desc="tile real matrix reps0 x reps1 times"
 public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional desc="return n x m identity-like matrix (default m=n)"
 public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="sorted unique values of real vector"
 public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
+public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in) desc="solve linear system A x = b using LAPACK DGESV"
+public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="determinant of square matrix using LAPACK DGETRF"
+public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="matrix inverse using LAPACK DGETRF/DGETRI"
+public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="right eigenpairs of real square matrix using LAPACK DGEEV (real-spectrum only)"
+public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="full SVD using LAPACK DGESVD"
 
 public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
 public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
@@ -96,11 +103,16 @@ end interface repeat
 
 interface tile
    module procedure tile_real, tile_int
+   module procedure tile_real_2d, tile_int_2d
 end interface tile
 
 interface unique
    module procedure unique_real, unique_int
 end interface unique
+
+interface linalg_solve
+   module procedure linalg_solve_vec, linalg_solve_mat
+end interface linalg_solve
 
 contains
 
@@ -798,6 +810,23 @@ contains
          end do
       end function tile_int
 
+      function tile_int_2d(x, reps0, reps1) result(y)
+         integer, intent(in) :: x(:,:)
+         integer, intent(in) :: reps0, reps1
+         integer, allocatable :: y(:,:)
+         integer :: m, n, r0, r1, i, j
+         m = size(x,1)
+         n = size(x,2)
+         r0 = max(0, reps0)
+         r1 = max(0, reps1)
+         allocate(y(1:m*r0, 1:n*r1))
+         do i = 1, r0
+            do j = 1, r1
+               y((i-1)*m+1:i*m, (j-1)*n+1:j*n) = x
+            end do
+         end do
+      end function tile_int_2d
+
       function diag_from_vec_int(v) result(x)
          integer, intent(in) :: v(:)
          integer, allocatable :: x(:,:)
@@ -919,6 +948,23 @@ contains
          end do
       end function tile_real
 
+      function tile_real_2d(x, reps0, reps1) result(y)
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in) :: reps0, reps1
+         real(kind=dp), allocatable :: y(:,:)
+         integer :: m, n, r0, r1, i, j
+         m = size(x,1)
+         n = size(x,2)
+         r0 = max(0, reps0)
+         r1 = max(0, reps1)
+         allocate(y(1:m*r0, 1:n*r1))
+         do i = 1, r0
+            do j = 1, r1
+               y((i-1)*m+1:i*m, (j-1)*n+1:j*n) = x
+            end do
+         end do
+      end function tile_real_2d
+
       function eye_real(n, m) result(x)
          integer, intent(in) :: n
          integer, intent(in), optional :: m
@@ -992,6 +1038,195 @@ contains
          g(2:n-1) = 0.5_dp * (x(3:n) - x(1:n-2))
          g(n) = x(n) - x(n-1)
       end function gradient_1d
+
+      function linalg_solve_vec(a, b) result(x)
+         real(kind=dp), intent(in) :: a(:,:), b(:)
+         real(kind=dp), allocatable :: x(:)
+         real(kind=dp), allocatable :: ac(:,:), bc(:,:)
+         integer, allocatable :: ipiv(:)
+         integer :: n, info
+         interface
+            subroutine dgesv(n, nrhs, a, lda, ipiv, b, ldb, info)
+               integer, intent(in) :: n, nrhs, lda, ldb
+               integer, intent(out) :: ipiv(*), info
+               double precision, intent(inout) :: a(lda,*), b(ldb,*)
+            end subroutine dgesv
+         end interface
+         n = size(a, 1)
+         if (size(a,2) /= n) stop "linalg_solve: matrix must be square"
+         if (size(b) /= n) stop "linalg_solve: rhs size mismatch"
+         allocate(ac(1:n,1:n), source=a)
+         allocate(bc(1:n,1), source=0.0_dp)
+         bc(:,1) = b
+         allocate(ipiv(1:n))
+         call dgesv(n, 1, ac, n, ipiv, bc, n, info)
+         if (info /= 0) stop "linalg_solve: dgesv failed"
+         allocate(x(1:n))
+         x = bc(:,1)
+      end function linalg_solve_vec
+
+      function linalg_solve_mat(a, b) result(x)
+         real(kind=dp), intent(in) :: a(:,:), b(:,:)
+         real(kind=dp), allocatable :: x(:,:)
+         real(kind=dp), allocatable :: ac(:,:), bc(:,:)
+         integer, allocatable :: ipiv(:)
+         integer :: n, nrhs, info
+         interface
+            subroutine dgesv(n, nrhs, a, lda, ipiv, b, ldb, info)
+               integer, intent(in) :: n, nrhs, lda, ldb
+               integer, intent(out) :: ipiv(*), info
+               double precision, intent(inout) :: a(lda,*), b(ldb,*)
+            end subroutine dgesv
+         end interface
+         n = size(a, 1)
+         if (size(a,2) /= n) stop "linalg_solve: matrix must be square"
+         if (size(b,1) /= n) stop "linalg_solve: rhs row mismatch"
+         nrhs = size(b,2)
+         allocate(ac(1:n,1:n), source=a)
+         allocate(bc(1:n,1:nrhs), source=b)
+         allocate(ipiv(1:n))
+         call dgesv(n, nrhs, ac, n, ipiv, bc, n, info)
+         if (info /= 0) stop "linalg_solve: dgesv failed"
+         allocate(x(1:n,1:nrhs))
+         x = bc
+      end function linalg_solve_mat
+
+      function linalg_det(a) result(detv)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp) :: detv
+         real(kind=dp), allocatable :: ac(:,:)
+         integer, allocatable :: ipiv(:)
+         integer :: n, i, info, sgn
+         interface
+            subroutine dgetrf(m, n, a, lda, ipiv, info)
+               integer, intent(in) :: m, n, lda
+               integer, intent(out) :: ipiv(*), info
+               double precision, intent(inout) :: a(lda,*)
+            end subroutine dgetrf
+         end interface
+         n = size(a,1)
+         if (size(a,2) /= n) stop "linalg_det: matrix must be square"
+         allocate(ac(1:n,1:n), source=a)
+         allocate(ipiv(1:n))
+         call dgetrf(n, n, ac, n, ipiv, info)
+         if (info < 0) stop "linalg_det: dgetrf argument error"
+         if (info > 0) then
+            detv = 0.0_dp
+            return
+         end if
+         sgn = 1
+         do i = 1, n
+            if (ipiv(i) /= i) sgn = -sgn
+         end do
+         detv = real(sgn, kind=dp)
+         do i = 1, n
+            detv = detv * ac(i,i)
+         end do
+      end function linalg_det
+
+      function linalg_inv(a) result(ai)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable :: ai(:,:)
+         real(kind=dp), allocatable :: ac(:,:), work(:)
+         integer, allocatable :: ipiv(:)
+         integer :: n, info, lwork
+         interface
+            subroutine dgetrf(m, n, a, lda, ipiv, info)
+               integer, intent(in) :: m, n, lda
+               integer, intent(out) :: ipiv(*), info
+               double precision, intent(inout) :: a(lda,*)
+            end subroutine dgetrf
+            subroutine dgetri(n, a, lda, ipiv, work, lwork, info)
+               integer, intent(in) :: n, lda, lwork
+               integer, intent(in) :: ipiv(*)
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*), work(*)
+            end subroutine dgetri
+         end interface
+         n = size(a,1)
+         if (size(a,2) /= n) stop "linalg_inv: matrix must be square"
+         allocate(ac(1:n,1:n), source=a)
+         allocate(ipiv(1:n))
+         call dgetrf(n, n, ac, n, ipiv, info)
+         if (info /= 0) stop "linalg_inv: dgetrf failed"
+         allocate(work(1))
+         lwork = -1
+         call dgetri(n, ac, n, ipiv, work, lwork, info)
+         if (info /= 0) stop "linalg_inv: dgetri workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dgetri(n, ac, n, ipiv, work, lwork, info)
+         if (info /= 0) stop "linalg_inv: dgetri failed"
+         allocate(ai(1:n,1:n))
+         ai = ac
+      end function linalg_inv
+
+      subroutine linalg_eig(a, w, v)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable, intent(out) :: w(:), v(:,:)
+         real(kind=dp), allocatable :: ac(:,:), wr(:), wi(:), vr(:,:), vl_dummy(:,:), work(:)
+         integer :: n, info, lwork
+         interface
+            subroutine dgeev(jobvl, jobvr, n, a, lda, wr, wi, vl, ldvl, vr, ldvr, work, lwork, info)
+               character(len=1), intent(in) :: jobvl, jobvr
+               integer, intent(in) :: n, lda, ldvl, ldvr, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*)
+               double precision, intent(out) :: wr(*), wi(*), vl(ldvl,*), vr(ldvr,*), work(*)
+            end subroutine dgeev
+         end interface
+         n = size(a,1)
+         if (size(a,2) /= n) stop "linalg_eig: matrix must be square"
+         allocate(ac(1:n,1:n), source=a)
+         allocate(wr(1:n), wi(1:n))
+         allocate(vr(1:n,1:n))
+         allocate(vl_dummy(1,1))
+         allocate(work(1))
+         lwork = -1
+         call dgeev('N', 'V', n, ac, n, wr, wi, vl_dummy, 1, vr, n, work, lwork, info)
+         if (info /= 0) stop "linalg_eig: dgeev workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dgeev('N', 'V', n, ac, n, wr, wi, vl_dummy, 1, vr, n, work, lwork, info)
+         if (info /= 0) stop "linalg_eig: dgeev failed"
+         if (maxval(abs(wi)) > 1.0e-12_dp) stop "linalg_eig: complex eigenvalues not supported in this transpiler path"
+         allocate(w(1:n), source=wr)
+         allocate(v(1:n,1:n), source=vr)
+      end subroutine linalg_eig
+
+      subroutine linalg_svd(a, u, s, vt)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable, intent(out) :: u(:,:), s(:), vt(:,:)
+         real(kind=dp), allocatable :: ac(:,:), work(:)
+         integer :: m, n, k, info, lwork
+         interface
+            subroutine dgesvd(jobu, jobvt, m, n, a, lda, s, u, ldu, vt, ldvt, work, lwork, info)
+               character(len=1), intent(in) :: jobu, jobvt
+               integer, intent(in) :: m, n, lda, ldu, ldvt, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*)
+               double precision, intent(out) :: s(*), u(ldu,*), vt(ldvt,*), work(*)
+            end subroutine dgesvd
+         end interface
+         m = size(a,1)
+         n = size(a,2)
+         k = min(m,n)
+         allocate(ac(1:m,1:n), source=a)
+         allocate(u(1:m,1:m), source=0.0_dp)
+         allocate(s(1:k), source=0.0_dp)
+         allocate(vt(1:n,1:n), source=0.0_dp)
+         allocate(work(1))
+         lwork = -1
+         call dgesvd('A', 'A', m, n, ac, m, s, u, m, vt, n, work, lwork, info)
+         if (info /= 0) stop "linalg_svd: dgesvd workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dgesvd('A', 'A', m, n, ac, m, s, u, m, vt, n, work, lwork, info)
+         if (info /= 0) stop "linalg_svd: dgesvd failed"
+      end subroutine linalg_svd
 
       pure real(kind=dp) function var(x, ddof)
          real(kind=dp), intent(in) :: x(:)

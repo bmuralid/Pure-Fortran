@@ -2221,8 +2221,13 @@ class translator(ast.NodeVisitor):
                     if r1 <= 1 and r2 <= 1:
                         return 1
                     return 2
-                if node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique"} and len(node.args) >= 1:
+                if node.func.attr in {"cumsum", "cumprod", "repeat", "unique"} and len(node.args) >= 1:
                     return 1
+                if node.func.attr == "tile" and len(node.args) >= 1:
+                    r0 = self._rank_expr(node.args[0])
+                    if len(node.args) >= 2 and isinstance(node.args[1], (ast.Tuple, ast.List)):
+                        return max(2, r0)
+                    return max(1, r0)
                 if node.func.attr in {"hstack", "vstack", "column_stack", "concatenate"} and len(node.args) >= 1:
                     seq = node.args[0]
                     if not (isinstance(seq, (ast.Tuple, ast.List)) and seq.elts):
@@ -3690,6 +3695,10 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"repeat", "tile"}:
                     reps = "1"
                     if len(node.args) >= 2:
+                        if node.func.attr == "tile" and isinstance(node.args[1], (ast.Tuple, ast.List)) and len(node.args[1].elts) == 2:
+                            r0 = self.expr(node.args[1].elts[0])
+                            r1 = self.expr(node.args[1].elts[1])
+                            return f"tile({a0}, int({r0}), int({r1}))"
                         reps = self.expr(node.args[1])
                     for kw in node.keywords:
                         if kw.arg in {"repeats", "reps"}:
