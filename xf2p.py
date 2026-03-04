@@ -1789,62 +1789,9 @@ class basic_f2p:
         self.emit("import numpy.typing as npt")
         self.emit("from dataclasses import dataclass")
         self.emit("from types import SimpleNamespace")
+        self.emit("from fortran_py_runtime import *")
         if self.seen_parameter:
             self.emit("from typing import Final")
-        self.emit("")
-        self.emit("def _f_size(a, dim=None):")
-        self.emit("    arr = np.asarray(a)")
-        self.emit("    if dim is None:")
-        self.emit("        return arr.size")
-        self.emit("    return arr.shape[int(dim) - 1]")
-        self.emit("")
-        self.emit("def _f_spread(a, dim=None, ncopies=None):")
-        self.emit("    arr = np.asarray(a)")
-        self.emit("    d = 1 if dim is None else int(dim)")
-        self.emit("    ncopy = 1 if ncopies is None else int(ncopies)")
-        self.emit("    axis = d - 1")
-        self.emit("    ex = np.expand_dims(arr, axis=axis)")
-        self.emit("    return np.repeat(ex, ncopy, axis=axis)")
-        self.emit("")
-        self.emit("def _f_assign_array(lhs, rhs):")
-        self.emit("    arr = np.array(rhs, copy=True)")
-        self.emit("    if lhs is None:")
-        self.emit("        return arr")
-        self.emit("    lhs_arr = np.asarray(lhs)")
-        self.emit("    if arr.ndim == 0 and lhs_arr.ndim > 0:")
-        self.emit("        lhs_arr[...] = arr.item()")
-        self.emit("        return lhs")
-        self.emit("    if lhs_arr.shape != arr.shape or lhs_arr.dtype != arr.dtype:")
-        self.emit("        return arr")
-        self.emit("    lhs_arr[...] = arr")
-        self.emit("    return lhs")
-        self.emit("")
-        self.emit("def mean_1d(x):")
-        self.emit("    a = np.asarray(x, dtype=np.float64)")
-        self.emit("    return np.float64(np.mean(a)) if a.size else np.float64(0.0)")
-        self.emit("")
-        self.emit("def var_1d(x):")
-        self.emit("    a = np.asarray(x, dtype=np.float64)")
-        self.emit("    return np.float64(np.var(a, ddof=1)) if a.size > 1 else np.float64(0.0)")
-        self.emit("")
-        self.emit("def argsort_real(x):")
-        self.emit("    return np.argsort(np.asarray(x, dtype=np.float64))")
-        self.emit("")
-        self.emit("def random_normal_vec(x):")
-        self.emit("    return _f_assign_array(x, np.random.normal(size=np.asarray(x).shape))")
-        self.emit("")
-        self.emit("def random_choice2(weights, n, z=None):")
-        self.emit("    p = np.asarray(weights, dtype=np.float64)")
-        self.emit("    p = p / np.sum(p)")
-        self.emit("    out = np.random.choice(np.arange(p.size), size=int(n), p=p)")
-        self.emit("    return _f_assign_array(z, out)")
-        self.emit("")
-        self.emit("def random_choice_prob(weights, n, z=None):")
-        self.emit("    return random_choice2(weights, n, z)")
-        self.emit("")
-        self.emit("def random_choice_norep(n, k, out=None):")
-        self.emit("    vals = np.random.choice(np.arange(int(n)), size=int(k), replace=False)")
-        self.emit("    return _f_assign_array(out, vals)")
         self.emit("")
 
         i = 0
@@ -2012,6 +1959,13 @@ def main() -> int:
             lines.pop()
         return lines
 
+    def _ensure_runtime_file(dst_dir: Path) -> None:
+        rt = Path(__file__).with_name("fortran_py_runtime.py")
+        if rt.exists():
+            dst = dst_dir / "fortran_py_runtime.py"
+            if not dst.exists():
+                dst.write_text(rt.read_text(encoding="utf-8"), encoding="utf-8")
+
     def process_one(src_paths: list[Path], out_path: Path) -> int:
         timings = {}
         ft_run = None
@@ -2066,8 +2020,8 @@ def main() -> int:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         src_tag = ", ".join(p.name for p in src_paths)
         py = f"# transpiled by xf2p.py from {src_tag} on {stamp}\n" + py
-    out_path.write_text(py, encoding="utf-8")
-    if not args.run:
+        out_path.write_text(py, encoding="utf-8")
+        _ensure_runtime_file(out_path.parent)
         if args.tee_both:
             try:
                 src_text = src_paths[0].read_text(encoding="utf-8") if len(src_paths) == 1 else "\n\n".join(
@@ -2250,6 +2204,7 @@ def main() -> int:
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             py = f"# transpiled by xf2p.py from {p.name} on {stamp}\n" + py
             out_path.write_text(py, encoding="utf-8")
+            _ensure_runtime_file(out_path.parent)
             if not args.run:
                 if args.tee_both:
                     print(f"--- original: {p} ---")
