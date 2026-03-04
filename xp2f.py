@@ -725,9 +725,19 @@ def detect_needed_helpers(tree):
         "repeat": {"repeat"},
         "tile": {"tile"},
         "unique": {"unique"},
+        "bincount": {"bincount_int"},
+        "searchsorted": {"searchsorted_left_int", "searchsorted_right_int"},
         "mean": {"mean"},
         "var": {"var"},
         "std": {"std"},
+        "nansum": {"nansum"},
+        "nanmean": {"nanmean"},
+        "nanvar": {"nanvar"},
+        "nanstd": {"nanstd"},
+        "nanmin": {"nanmin"},
+        "nanmax": {"nanmax"},
+        "nanargmin": {"nanargmin"},
+        "nanargmax": {"nanargmax"},
         "log2": {"log2"},
         "zeros": {"zeros_int", "zeros_real", "zeros_logical"},
         "ones": {"ones_int", "ones_real", "ones_logical"},
@@ -1315,6 +1325,272 @@ def runtime_helper_templates():
          var_1d = sum((x - mu)**2) / real(n - d, kind=dp)
       end function var_1d"""
 
+    bcnt_pub = (
+        "public :: bincount_int !@pyapi kind=function ret=integer(:) "
+        "args=x:integer(:):intent(in),minlength:integer:intent(in):optional desc=\"count occurrences of nonnegative integers\""
+    )
+    bcnt_blk = """      function bincount_int(x, minlength) result(c)
+         integer, intent(in) :: x(:)
+         integer, intent(in), optional :: minlength
+         integer, allocatable :: c(:)
+         integer :: i, nmax, nout, m
+         if (present(minlength)) then
+            m = max(0, minlength)
+         else
+            m = 0
+         end if
+         if (size(x) <= 0) then
+            nout = m
+            allocate(c(1:nout), source=0)
+            return
+         end if
+         if (any(x < 0)) error stop 'bincount_int: negative values are not supported'
+         nmax = maxval(x)
+         nout = max(nmax + 1, m)
+         allocate(c(1:nout), source=0)
+         do i = 1, size(x)
+            c(x(i) + 1) = c(x(i) + 1) + 1
+         end do
+      end function bincount_int"""
+
+    ssl_pub = (
+        "public :: searchsorted_left_int !@pyapi kind=function ret=integer(:) "
+        "args=a:integer(:):intent(in),v:integer(:):intent(in) desc=\"searchsorted left indices for integer vectors\""
+    )
+    ssl_blk = """      function searchsorted_left_int(a, v) result(idx)
+         integer, intent(in) :: a(:), v(:)
+         integer, allocatable :: idx(:)
+         integer :: i, lo, hi, mid, n
+         n = size(a)
+         allocate(idx(1:size(v)))
+         do i = 1, size(v)
+            lo = 1
+            hi = n + 1
+            do while (lo < hi)
+               mid = (lo + hi) / 2
+               if (mid <= n .and. a(mid) < v(i)) then
+                  lo = mid + 1
+               else
+                  hi = mid
+               end if
+            end do
+            idx(i) = lo - 1
+         end do
+      end function searchsorted_left_int"""
+
+    ssr_pub = (
+        "public :: searchsorted_right_int !@pyapi kind=function ret=integer(:) "
+        "args=a:integer(:):intent(in),v:integer(:):intent(in) desc=\"searchsorted right indices for integer vectors\""
+    )
+    ssr_blk = """      function searchsorted_right_int(a, v) result(idx)
+         integer, intent(in) :: a(:), v(:)
+         integer, allocatable :: idx(:)
+         integer :: i, lo, hi, mid, n
+         n = size(a)
+         allocate(idx(1:size(v)))
+         do i = 1, size(v)
+            lo = 1
+            hi = n + 1
+            do while (lo < hi)
+               mid = (lo + hi) / 2
+               if (mid <= n .and. a(mid) <= v(i)) then
+                  lo = mid + 1
+               else
+                  hi = mid
+               end if
+            end do
+            idx(i) = lo - 1
+         end do
+      end function searchsorted_right_int"""
+
+    nansum_pub = (
+        "public :: nansum !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp)(:):intent(in) desc=\"sum ignoring NaN values\""
+    )
+    nansum_blk = """      pure real(kind=dp) function nansum(x)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i
+         nansum = 0.0_dp
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) nansum = nansum + x(i)
+         end do
+      end function nansum"""
+
+    nanmean_pub = (
+        "public :: nanmean !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp)(:):intent(in) desc=\"mean ignoring NaN values\""
+    )
+    nanmean_blk = """      pure real(kind=dp) function nanmean(x)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value, ieee_quiet_nan
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i, cnt
+         nanmean = 0.0_dp
+         cnt = 0
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               nanmean = nanmean + x(i)
+               cnt = cnt + 1
+            end if
+         end do
+         if (cnt <= 0) then
+            nanmean = ieee_value(0.0_dp, ieee_quiet_nan)
+         else
+            nanmean = nanmean / real(cnt, kind=dp)
+         end if
+      end function nanmean"""
+
+    nanvar_pub = (
+        "public :: nanvar !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc=\"variance ignoring NaN values with optional ddof\""
+    )
+    nanvar_blk = """      pure real(kind=dp) function nanvar(x, ddof)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value, ieee_quiet_nan
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: ddof
+         integer :: i, cnt, d
+         real(kind=dp) :: mu, ss
+         if (present(ddof)) then
+            d = ddof
+         else
+            d = 0
+         end if
+         mu = nanmean(x)
+         if (ieee_is_nan(mu)) then
+            nanvar = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         cnt = 0
+         ss = 0.0_dp
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               cnt = cnt + 1
+               ss = ss + (x(i) - mu)**2
+            end if
+         end do
+         if (cnt - d <= 0) then
+            nanvar = ieee_value(0.0_dp, ieee_quiet_nan)
+         else
+            nanvar = ss / real(cnt - d, kind=dp)
+         end if
+      end function nanvar"""
+
+    nanstd_pub = (
+        "public :: nanstd !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc=\"standard deviation ignoring NaN values with optional ddof\""
+    )
+    nanstd_blk = """      pure real(kind=dp) function nanstd(x, ddof)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: ddof
+         if (present(ddof)) then
+            nanstd = sqrt(nanvar(x, ddof))
+         else
+            nanstd = sqrt(nanvar(x))
+         end if
+      end function nanstd"""
+
+    nanmin_pub = (
+        "public :: nanmin !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp)(:):intent(in) desc=\"minimum ignoring NaN values\""
+    )
+    nanmin_blk = """      pure real(kind=dp) function nanmin(x)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value, ieee_quiet_nan
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i
+         logical :: found
+         found = .false.
+         nanmin = ieee_value(0.0_dp, ieee_quiet_nan)
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  nanmin = x(i)
+                  found = .true.
+               else
+                  if (x(i) < nanmin) nanmin = x(i)
+               end if
+            end if
+         end do
+      end function nanmin"""
+
+    nanmax_pub = (
+        "public :: nanmax !@pyapi kind=function ret=real(dp) "
+        "args=x:real(dp)(:):intent(in) desc=\"maximum ignoring NaN values\""
+    )
+    nanmax_blk = """      pure real(kind=dp) function nanmax(x)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value, ieee_quiet_nan
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i
+         logical :: found
+         found = .false.
+         nanmax = ieee_value(0.0_dp, ieee_quiet_nan)
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  nanmax = x(i)
+                  found = .true.
+               else
+                  if (x(i) > nanmax) nanmax = x(i)
+               end if
+            end if
+         end do
+      end function nanmax"""
+
+    nanargmin_pub = (
+        "public :: nanargmin !@pyapi kind=function ret=integer "
+        "args=x:real(dp)(:):intent(in) desc=\"0-based argmin ignoring NaN values; -1 when all NaN\""
+    )
+    nanargmin_blk = """      pure integer function nanargmin(x)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i, best
+         logical :: found
+         found = .false.
+         best = -1
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  best = i
+                  found = .true.
+               else
+                  if (x(i) < x(best)) best = i
+               end if
+            end if
+         end do
+         if (found) then
+            nanargmin = best - 1
+         else
+            nanargmin = -1
+         end if
+      end function nanargmin"""
+
+    nanargmax_pub = (
+        "public :: nanargmax !@pyapi kind=function ret=integer "
+        "args=x:real(dp)(:):intent(in) desc=\"0-based argmax ignoring NaN values; -1 when all NaN\""
+    )
+    nanargmax_blk = """      pure integer function nanargmax(x)
+         use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
+         real(kind=dp), intent(in) :: x(:)
+         integer :: i, best
+         logical :: found
+         found = .false.
+         best = -1
+         do i = 1, size(x)
+            if (.not. ieee_is_nan(x(i))) then
+               if (.not. found) then
+                  best = i
+                  found = .true.
+               else
+                  if (x(i) > x(best)) best = i
+               end if
+            end if
+         end do
+         if (found) then
+            nanargmax = best - 1
+         else
+            nanargmax = -1
+         end if
+      end function nanargmax"""
+
     return {
         "isqrt_int": (isqrt_pub, isqrt_blk),
         "print_int_list": (pil_pub, pil_blk),
@@ -1331,6 +1607,17 @@ def runtime_helper_templates():
         "argsort": (argsort_pub, argsort_blk),
         "mean_1d": (mean_pub, mean_blk),
         "var_1d": (var_pub, var_blk),
+        "bincount_int": (bcnt_pub, bcnt_blk),
+        "searchsorted_left_int": (ssl_pub, ssl_blk),
+        "searchsorted_right_int": (ssr_pub, ssr_blk),
+        "nansum": (nansum_pub, nansum_blk),
+        "nanmean": (nanmean_pub, nanmean_blk),
+        "nanvar": (nanvar_pub, nanvar_blk),
+        "nanstd": (nanstd_pub, nanstd_blk),
+        "nanmin": (nanmin_pub, nanmin_blk),
+        "nanmax": (nanmax_pub, nanmax_blk),
+        "nanargmin": (nanargmin_pub, nanargmin_blk),
+        "nanargmax": (nanargmax_pub, nanargmax_blk),
     }
 
 
@@ -1339,6 +1626,8 @@ def ensure_runtime_helpers(runtime_path, needed_helpers):
     helper_deps = {
         "sort_vec": ["sort_real_vec", "sort_int_vec"],
         "argsort": ["argsort_real", "argsort_int"],
+        "nanstd": ["nanvar", "nanmean"],
+        "nanvar": ["nanmean"],
     }
 
     expanded = []
@@ -1621,9 +1910,12 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Attribute):
             if node.attr == "size" and isinstance(node.value, ast.Name):
                 return "int"
+            if node.attr in {"c_contiguous", "f_contiguous"}:
+                if isinstance(node.value, ast.Attribute) and node.value.attr == "flags":
+                    return "logical"
             if node.attr == "T":
                 return self._expr_kind(node.value)
-            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "pi":
+            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in {"pi", "nan", "inf", "NINF"}:
                 return "real"
             return None
         if isinstance(node, ast.UnaryOp):
@@ -1828,10 +2120,44 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"mean", "var", "std", "log2", "log10"}
+                and node.func.attr == "bincount"
+                and len(node.args) >= 1
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "searchsorted"
+                and len(node.args) >= 2
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "uniform"
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "integers"
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"mean", "var", "std", "log2", "log10", "nansum", "nanmean", "nanvar", "nanstd", "nanmin", "nanmax"}
                 and len(node.args) >= 1
             ):
                 return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"nanargmin", "nanargmax"}
+                and len(node.args) >= 1
+            ):
+                return "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -1859,8 +2185,24 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round"}
+                and node.func.attr in {"prod", "dot", "matmul", "clip", "diff", "full_like", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "abs", "fabs", "sign", "floor", "ceil", "round", "ascontiguousarray", "asfortranarray"}
                 and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "broadcast_to"
+                and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "take"
+                and len(node.args) >= 2
             ):
                 return self._expr_kind(node.args[0])
             if (
@@ -2020,7 +2362,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray"}
+                and node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "ascontiguousarray", "asfortranarray", "broadcast_to"}
                 and len(node.args) >= 1
             ):
                 return self._extent_expr(node.args[0])
@@ -2028,7 +2370,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan"}
+                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "ascontiguousarray", "asfortranarray", "broadcast_to"}
                 and len(node.args) >= 1
             ):
                 return self._extent_expr(node.args[0])
@@ -2085,6 +2427,48 @@ class translator(ast.NodeVisitor):
                         break
                 if axis_node is not None:
                     return f"size({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "bincount"
+                and len(node.args) >= 1
+            ):
+                return f"size({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "searchsorted"
+                and len(node.args) >= 2
+            ):
+                return f"size({self.expr(node.args[1])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "take"
+                and len(node.args) >= 2
+            ):
+                return f"size({self.expr(node.args[1])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"uniform", "integers"}
+            ):
+                size_node = None
+                for kw in node.keywords:
+                    if kw.arg == "size":
+                        size_node = kw.value
+                        break
+                if size_node is None:
+                    return None
+                if isinstance(size_node, (ast.Tuple, ast.List)):
+                    if len(size_node.elts) >= 1:
+                        if len(size_node.elts) == 1:
+                            return f"({self.expr(size_node.elts[0])})"
+                        return f"(({self.expr(size_node.elts[0])})*({self.expr(size_node.elts[1])}))"
+                    return None
+                return self.expr(size_node)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -2268,10 +2652,32 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient"} and len(node.args) >= 1:
+                if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient", "ascontiguousarray", "asfortranarray"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"pad", "roll", "flip"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
+                if node.func.attr == "take" and len(node.args) >= 2:
+                    return self._rank_expr(node.args[1])
+                if node.func.attr == "bincount" and len(node.args) >= 1:
+                    return 1
+                if node.func.attr == "searchsorted" and len(node.args) >= 2:
+                    return self._rank_expr(node.args[1])
+                if node.func.attr in {"uniform", "integers"}:
+                    size_node = None
+                    for kw in node.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if size_node is None:
+                        return 0
+                    if isinstance(size_node, (ast.Tuple, ast.List)):
+                        return max(1, len(size_node.elts))
+                    return 1
+                if node.func.attr == "broadcast_to" and len(node.args) >= 2:
+                    shp = node.args[1]
+                    if isinstance(shp, (ast.Tuple, ast.List)):
+                        return max(1, len(shp.elts))
+                    return max(1, self._rank_expr(node.args[0]))
                 if node.func.attr == "expand_dims" and len(node.args) >= 1:
                     return self._rank_expr(node.args[0]) + 1
                 if node.func.attr == "squeeze" and len(node.args) >= 1:
@@ -2336,7 +2742,7 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         return 0
                     return r0 if keepdims else max(0, r0 - 1)
-                if node.func.attr in {"mean", "var", "std"} and len(node.args) >= 1:
+                if node.func.attr in {"mean", "var", "std", "nanmean", "nanvar", "nanstd", "nanmin", "nanmax"} and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
                     axis_node = None
                     keepdims = False
@@ -2348,6 +2754,16 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         return 0
                     return r0 if keepdims else max(0, r0 - 1)
+                if node.func.attr in {"nanargmin", "nanargmax"} and len(node.args) >= 1:
+                    r0 = self._rank_expr(node.args[0])
+                    axis_node = None
+                    for kw in node.keywords:
+                        if kw.arg == "axis":
+                            axis_node = kw.value
+                            break
+                    if axis_node is None:
+                        return 0
+                    return max(0, r0 - 1)
                 if node.func.attr == "diag" and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
                     if r0 <= 1:
@@ -2407,6 +2823,21 @@ class translator(ast.NodeVisitor):
                 if len(node.args) >= 1:
                     return max(1, len(node.args))
                 return self._rank_expr(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"normal", "uniform", "integers"}:
+                size_node = None
+                if len(node.args) >= 1 and node.func.attr == "normal":
+                    size_node = node.args[0]
+                if len(node.args) >= 3 and node.func.attr in {"uniform", "integers"}:
+                    size_node = node.args[2]
+                for kw in node.keywords:
+                    if kw.arg == "size":
+                        size_node = kw.value
+                        break
+                if size_node is None:
+                    return 0
+                if isinstance(size_node, (ast.Tuple, ast.List)):
+                    return max(1, len(size_node.elts))
+                return 1
             if isinstance(node.func, ast.Attribute) and node.func.attr == "dot" and len(node.args) >= 1:
                 r1 = self._rank_expr(node.func.value)
                 r2 = self._rank_expr(node.args[0])
@@ -3029,6 +3460,14 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"ascontiguousarray", "asfortranarray"}
+                and len(node.args) >= 1
+            ):
+                return self.expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"array", "asarray"}
                 and len(node.args) >= 1
                 and isinstance(node.args[0], ast.List)
@@ -3092,6 +3531,28 @@ class translator(ast.NodeVisitor):
                     return f"maxval({a0})"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
                 reduced = f"maxval({a0}, dim={dim_expr})"
+                if keepdims:
+                    return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                return reduced
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "nanmax"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                axis_node = None
+                keepdims = False
+                for kw in node.keywords:
+                    if kw.arg == "axis":
+                        axis_node = kw.value
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                if axis_node is None:
+                    return f"nanmax(reshape({a0}, [size({a0})]))"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                reduced = f"maxval(merge({a0}, (-huge(1.0_dp)), (.not. ieee_is_nan({a0}))), dim={dim_expr})"
                 if keepdims:
                     return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
                 return reduced
@@ -3327,6 +3788,42 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "broadcast_to"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                r0 = self._rank_expr(node.args[0])
+                shp = node.args[1]
+                if not isinstance(shp, (ast.Tuple, ast.List)):
+                    raise NotImplementedError("np.broadcast_to shape must be tuple/list in this transpiler path")
+                dims = [self.expr(e) for e in shp.elts]
+                if len(dims) == 1:
+                    n0 = dims[0]
+                    if r0 == 0:
+                        return f"[( {a0}, i_bt = 1, ({n0}) )]"
+                    if r0 == 1:
+                        return f"{a0}(1:{n0})"
+                    return f"reshape({a0}, [{n0}])"
+                if len(dims) == 2:
+                    n0, n1 = dims[0], dims[1]
+                    if r0 == 0:
+                        return f"reshape([( {a0}, i_bt = 1, ({n0})*({n1}) )], [{n0}, {n1}])"
+                    if r0 == 1:
+                        if self._is_col2_expr(node.args[0]):
+                            return f"spread({a0}, dim=2, ncopies={n1})"
+                        return f"spread({a0}, dim=1, ncopies={n0})"
+                    if r0 == 2:
+                        return (
+                            f"merge("
+                            f"spread({a0}(1,:), dim=1, ncopies={n0}), "
+                            f"spread({a0}(:,1), dim=2, ncopies={n1}), "
+                            f"(size({a0},1) == 1))"
+                        )
+                raise NotImplementedError("np.broadcast_to currently supports target rank up to 2")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"dot", "matmul"}
                 and len(node.args) >= 2
             ):
@@ -3467,6 +3964,28 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "nanmin"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                axis_node = None
+                keepdims = False
+                for kw in node.keywords:
+                    if kw.arg == "axis":
+                        axis_node = kw.value
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                if axis_node is None:
+                    return f"nanmin(reshape({a0}, [size({a0})]))"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                reduced = f"minval(merge({a0}, huge(1.0_dp), (.not. ieee_is_nan({a0}))), dim={dim_expr})"
+                if keepdims:
+                    return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                return reduced
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"argmax", "argmin"}
                 and len(node.args) >= 1
             ):
@@ -3485,6 +4004,27 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"nanargmax", "nanargmin"}
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                axis_node = None
+                for kw in node.keywords:
+                    if kw.arg == "axis":
+                        axis_node = kw.value
+                        break
+                if axis_node is None:
+                    if node.func.attr == "nanargmax":
+                        return f"nanargmax(reshape({a0}, [size({a0})]))"
+                    return f"nanargmin(reshape({a0}, [size({a0})]))"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                if node.func.attr == "nanargmax":
+                    return f"(maxloc(merge({a0}, (-huge(1.0_dp)), (.not. ieee_is_nan({a0}))), dim={dim_expr}) - 1)"
+                return f"(minloc(merge({a0}, huge(1.0_dp), (.not. ieee_is_nan({a0}))), dim={dim_expr}) - 1)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"isfinite", "isinf", "isnan"}
                 and len(node.args) == 1
             ):
@@ -3494,6 +4034,29 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "isinf":
                     return f"((.not. ieee_is_finite({a0})) .and. (.not. ieee_is_nan({a0})))"
                 return f"ieee_is_nan({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "nansum"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                axis_node = None
+                keepdims = False
+                for kw in node.keywords:
+                    if kw.arg == "axis":
+                        axis_node = kw.value
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                arr = f"merge({a0}, 0.0_dp, (.not. ieee_is_nan({a0})))"
+                if axis_node is None:
+                    return f"sum({arr})"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                reduced = f"sum({arr}, dim={dim_expr})"
+                if keepdims:
+                    return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                return reduced
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3741,6 +4304,30 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "nanmean"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                axis_node = None
+                keepdims = False
+                for kw in node.keywords:
+                    if kw.arg == "axis":
+                        axis_node = kw.value
+                    elif kw.arg == "keepdims":
+                        keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
+                if axis_node is None:
+                    return f"nanmean(reshape({a0}, [size({a0})]))"
+                dim_expr = f"({self.expr(axis_node)} + 1)"
+                num = f"sum(merge({a0}, 0.0_dp, (.not. ieee_is_nan({a0}))), dim={dim_expr})"
+                den = f"max(1, count((.not. ieee_is_nan({a0})), dim={dim_expr}))"
+                reduced = f"({num} / real({den}, kind=dp))"
+                if keepdims:
+                    return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
+                return reduced
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "var"
                 and len(node.args) == 1
             ):
@@ -3756,6 +4343,25 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "nanvar"
+                and len(node.args) == 1
+            ):
+                ddof_node = None
+                axis_node = None
+                for kw in node.keywords:
+                    if kw.arg == "ddof":
+                        ddof_node = kw.value
+                    elif kw.arg == "axis":
+                        axis_node = kw.value
+                if axis_node is not None:
+                    raise NotImplementedError("np.nanvar(..., axis=...) not yet supported")
+                if ddof_node is None:
+                    return f"nanvar(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]))"
+                return f"nanvar(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]), {self.expr(ddof_node)})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "std"
                 and len(node.args) == 1
             ):
@@ -3767,6 +4373,25 @@ class translator(ast.NodeVisitor):
                 if ddof_node is None:
                     return f"std({self.expr(node.args[0])})"
                 return f"std({self.expr(node.args[0])}, {self.expr(ddof_node)})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "nanstd"
+                and len(node.args) == 1
+            ):
+                ddof_node = None
+                axis_node = None
+                for kw in node.keywords:
+                    if kw.arg == "ddof":
+                        ddof_node = kw.value
+                    elif kw.arg == "axis":
+                        axis_node = kw.value
+                if axis_node is not None:
+                    raise NotImplementedError("np.nanstd(..., axis=...) not yet supported")
+                if ddof_node is None:
+                    return f"nanstd(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]))"
+                return f"nanstd(reshape({self.expr(node.args[0])}, [size({self.expr(node.args[0])})]), {self.expr(ddof_node)})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3789,6 +4414,53 @@ class translator(ast.NodeVisitor):
                             break
                     return f"{node.func.attr}({a0}, int({reps}))"
                 return f"{node.func.attr}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "bincount"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                minlength = None
+                if len(node.args) >= 2:
+                    minlength = self.expr(node.args[1])
+                for kw in node.keywords:
+                    if kw.arg == "minlength":
+                        minlength = self.expr(kw.value)
+                        break
+                if minlength is None:
+                    return f"bincount_int({a0})"
+                return f"bincount_int({a0}, int({minlength}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "searchsorted"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                v0 = self.expr(node.args[1])
+                side = "left"
+                for kw in node.keywords:
+                    if kw.arg == "side" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                        side = kw.value.value.lower()
+                        break
+                if len(node.args) >= 3 and isinstance(node.args[2], ast.Constant) and isinstance(node.args[2].value, str):
+                    side = str(node.args[2].value).lower()
+                if side == "right":
+                    return f"searchsorted_right_int({a0}, {v0})"
+                return f"searchsorted_left_int({a0}, {v0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "take"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                idx = self.expr(node.args[1])
+                return f"{a0}({idx} + 1)"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3890,6 +4562,12 @@ class translator(ast.NodeVisitor):
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
+            if node.attr in {"c_contiguous", "f_contiguous"}:
+                if (
+                    isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "flags"
+                ):
+                    return ".true."
             if node.attr == "size":
                 return f"size({self.expr(node.value)})"
             if node.attr == "T":
@@ -3909,8 +4587,12 @@ class translator(ast.NodeVisitor):
                 return fstr("unknown")
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "pi":
                 return "acos(-1.0_dp)"
+            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "nan":
+                return "ieee_value(0.0_dp, ieee_quiet_nan)"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "inf":
                 return "huge(1.0_dp)"
+            if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "NINF":
+                return "(-huge(1.0_dp))"
             attr_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported attribute expr: {attr_txt}")
 
@@ -5437,6 +6119,127 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{t.id} = ({self.expr(scale_node)}) * {t.id}")
             return
 
+        # x = rng.uniform(low, high, size=...) / np.random.uniform(...)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "uniform"
+        ):
+            low_node = None
+            high_node = None
+            size_node = None
+            if len(v.args) >= 1:
+                low_node = v.args[0]
+            if len(v.args) >= 2:
+                high_node = v.args[1]
+            if len(v.args) >= 3:
+                size_node = v.args[2]
+            for kw in v.keywords:
+                if kw.arg in {"low", "loc"}:
+                    low_node = kw.value
+                elif kw.arg in {"high", "scale"}:
+                    high_node = kw.value
+                elif kw.arg == "size":
+                    size_node = kw.value
+            if low_node is None:
+                low_node = ast.Constant(value=0.0)
+            if high_node is None:
+                high_node = ast.Constant(value=1.0)
+            low_expr = self.expr(low_node)
+            high_expr = self.expr(high_node)
+            if size_node is None:
+                self.o.w(f"call random_number({t.id})")
+                self.o.w(f"{t.id} = ({low_expr}) + (({high_expr}) - ({low_expr})) * {t.id}")
+                return
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 2:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
+                elif len(size_node.elts) == 1:
+                    n0 = self.expr(size_node.elts[0])
+                    self.o.w(f"allocate({t.id}(1:{n0}))")
+                else:
+                    raise NotImplementedError("uniform size tuple rank > 2 not supported")
+            else:
+                n0 = self.expr(size_node)
+                self.o.w(f"allocate({t.id}(1:{n0}))")
+            self.o.w(f"call random_number({t.id})")
+            self.o.w(f"{t.id} = ({low_expr}) + (({high_expr}) - ({low_expr})) * {t.id}")
+            return
+
+        # z = rng.integers(low, high, size=...)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "integers"
+        ):
+            low_node = None
+            high_node = None
+            size_node = None
+            if len(v.args) >= 1:
+                low_node = v.args[0]
+            if len(v.args) >= 2:
+                high_node = v.args[1]
+            if len(v.args) >= 3:
+                size_node = v.args[2]
+            for kw in v.keywords:
+                if kw.arg == "low":
+                    low_node = kw.value
+                elif kw.arg == "high":
+                    high_node = kw.value
+                elif kw.arg == "size":
+                    size_node = kw.value
+            if low_node is None:
+                low_node = ast.Constant(value=0)
+            if high_node is None:
+                raise NotImplementedError("rng.integers requires high")
+            low_expr = self.expr(low_node)
+            high_expr = self.expr(high_node)
+            if size_node is None:
+                self.o.w("block")
+                self.o.push()
+                self.o.w("real(kind=dp) :: u_int")
+                self.o.w("call random_number(u_int)")
+                self.o.w(f"{t.id} = int({low_expr}) + int(u_int * real(max(1, int({high_expr}) - int({low_expr})), kind=dp))")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 2:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
+                elif len(size_node.elts) == 1:
+                    n0 = self.expr(size_node.elts[0])
+                    self.o.w(f"allocate({t.id}(1:{n0}))")
+                else:
+                    raise NotImplementedError("integers size tuple rank > 2 not supported")
+            else:
+                n0 = self.expr(size_node)
+                self.o.w(f"allocate({t.id}(1:{n0}))")
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: i_rng")
+            self.o.w("real(kind=dp), allocatable :: u_rng(:)")
+            self.o.w(f"allocate(u_rng(1:size({t.id})))")
+            self.o.w("call random_number(u_rng)")
+            self.o.w(f"do i_rng = 1, size({t.id})")
+            self.o.push()
+            self.o.w(
+                f"{t.id}(i_rng) = int({low_expr}) + int(u_rng(i_rng) * real(max(1, int({high_expr}) - int({low_expr})), kind=dp))"
+            )
+            self.o.pop()
+            self.o.w("end do")
+            self.o.w("if (allocated(u_rng)) deallocate(u_rng)")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         # z = rng.choice(2, size=n, p=w)
         if (
             isinstance(t, ast.Name)
@@ -5490,6 +6293,53 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
                 self.o.w(f"allocate({t.id}(1:{n_expr}))")
                 self.o.w(f"call random_choice_norep({npop_expr}, {n_expr}, {t.id})")
+                return
+            # replacement sampling (default replace=True)
+            if npop_node is not None and self._rank_expr(npop_node) > 0:
+                arr_expr = self.expr(npop_node)
+                arr_kind = self._expr_kind(npop_node)
+                self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+                self.o.w(f"allocate({t.id}(1:{n_expr}))")
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: i_ch, j_ch")
+                self.o.w("real(kind=dp) :: u_ch")
+                if arr_kind == "real":
+                    self.o.w("real(kind=dp), allocatable :: pool_ch(:)")
+                elif arr_kind == "logical":
+                    self.o.w("logical, allocatable :: pool_ch(:)")
+                else:
+                    self.o.w("integer, allocatable :: pool_ch(:)")
+                self.o.w(f"pool_ch = {arr_expr}")
+                self.o.w(f"do i_ch = 1, {n_expr}")
+                self.o.push()
+                self.o.w("call random_number(u_ch)")
+                self.o.w("j_ch = 1 + int(u_ch * real(size(pool_ch), kind=dp))")
+                self.o.w(f"if (j_ch < 1) j_ch = 1")
+                self.o.w("if (j_ch > size(pool_ch)) j_ch = size(pool_ch)")
+                self.o.w(f"{t.id}(i_ch) = pool_ch(j_ch)")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.w("if (allocated(pool_ch)) deallocate(pool_ch)")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            if npop_node is not None:
+                npop_expr = self.expr(npop_node)
+                self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+                self.o.w(f"allocate({t.id}(1:{n_expr}))")
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: i_ch")
+                self.o.w("real(kind=dp) :: u_ch")
+                self.o.w(f"do i_ch = 1, {n_expr}")
+                self.o.push()
+                self.o.w("call random_number(u_ch)")
+                self.o.w(f"{t.id}(i_ch) = int(u_ch * real(max(1, int({npop_expr})), kind=dp))")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
                 return
             raise NotImplementedError("unsupported rng.choice form")
 
@@ -6075,6 +6925,74 @@ class translator(ast.NodeVisitor):
         ):
             return
 
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Name)
+            and c.func.value.id == "np"
+            and c.func.attr == "put"
+            and len(c.args) >= 3
+        ):
+            arr = self.expr(c.args[0])
+            idx = self.expr(c.args[1])
+            vals = self.expr(c.args[2])
+            vals_rank = self._rank_expr(c.args[2])
+            vals_kind = self._expr_kind(c.args[2])
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: i_put, n_put")
+            if vals_rank > 0:
+                if vals_kind == "int":
+                    self.o.w("integer, allocatable :: vals_put(:)")
+                elif vals_kind == "logical":
+                    self.o.w("logical, allocatable :: vals_put(:)")
+                else:
+                    self.o.w("real(kind=dp), allocatable :: vals_put(:)")
+                self.o.w(f"vals_put = {vals}")
+            self.o.w(f"n_put = size({idx})")
+            if vals_rank > 0:
+                self.o.w("n_put = min(n_put, size(vals_put))")
+            self.o.w("do i_put = 1, n_put")
+            self.o.push()
+            if vals_rank > 0:
+                self.o.w(f"{arr}({idx}(i_put) + 1) = vals_put(i_put)")
+            else:
+                self.o.w(f"{arr}({idx}(i_put) + 1) = {vals}")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and c.func.attr == "shuffle"
+            and len(c.args) == 1
+            and isinstance(c.args[0], ast.Name)
+        ):
+            arr = self.expr(c.args[0])
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: i_sh, j_sh")
+            if self._expr_kind(c.args[0]) == "real":
+                self.o.w("real(kind=dp) :: tmp_sh")
+            else:
+                self.o.w("integer :: tmp_sh")
+            self.o.w("real(kind=dp) :: u_sh")
+            self.o.w(f"do i_sh = size({arr}), 2, -1")
+            self.o.push()
+            self.o.w("call random_number(u_sh)")
+            self.o.w("j_sh = 1 + int(u_sh * real(i_sh, kind=dp))")
+            self.o.w("if (j_sh < 1) j_sh = 1")
+            self.o.w("if (j_sh > i_sh) j_sh = i_sh")
+            self.o.w(f"tmp_sh = {arr}(i_sh)")
+            self.o.w(f"{arr}(i_sh) = {arr}(j_sh)")
+            self.o.w(f"{arr}(j_sh) = tmp_sh")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         if isinstance(c.func, ast.Name) and c.func.id == "print":
             if self.context == "compute":
                 raise NotImplementedError("print not allowed in compute procedure")
@@ -6554,6 +7472,10 @@ def _emit_local_function(
         if a.arg in dict_arg_names:
             continue
         rr = _pre_arg_rank(a.arg)
+        if local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
+            idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == a.arg), -1)
+            if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
+                rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
         if rr > 0:
             tr._mark_alloc_real(a.arg, rank=rr)
 
@@ -6906,14 +7828,34 @@ def _emit_local_function(
     o.w("")
 
 
-def _local_return_maps(local_funcs, params):
+def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None):
     tuple_out = {}
     scalar_or_array = {}
+    arg_rank_hints = arg_rank_hints or {}
+    arg_kind_hints = arg_kind_hints or {}
     for fn in (local_funcs or []):
         if fn.name in {"log_normal_pdf_1d", "normal_logpdf_1d"}:
             scalar_or_array[fn.name] = "alloc_real"
             continue
         tr = translator(emit(), params={}, context="flat", list_counts={}, function_result_name=f"{fn.name}_result")
+        # Seed argument rank/kind from call-site observations when available.
+        rr_h = arg_rank_hints.get(fn.name, [])
+        rk_h = arg_kind_hints.get(fn.name, [])
+        for i, a in enumerate(fn.args.args):
+            rr = rr_h[i] if i < len(rr_h) else 0
+            rk = rk_h[i] if i < len(rk_h) else None
+            if rr > 0:
+                if rk == "int":
+                    tr._mark_alloc_int(a.arg, rank=rr)
+                elif rk == "logical":
+                    tr._mark_alloc_log(a.arg, rank=rr)
+                else:
+                    tr._mark_alloc_real(a.arg, rank=rr)
+            else:
+                if rk == "int":
+                    tr._mark_int(a.arg)
+                elif rk == "real":
+                    tr._mark_real(a.arg)
         tr.prescan(fn.body)
         rets = [s for s in fn.body if isinstance(s, ast.Return) and s.value is not None]
         if not rets:
@@ -6986,10 +7928,40 @@ def generate_flat(
                     rr = max(rr, 2 if axis_present else 1)
         return rr
 
-    local_return_specs, tuple_return_out_kinds = _local_return_maps(local_funcs, params)
+    # Gather call-site rank/kind hints for local function arguments.
+    call_rank_hints = {fn.name: [0 for _ in fn.args.args] for fn in (local_funcs or [])}
+    call_kind_hints = {fn.name: [None for _ in fn.args.args] for fn in (local_funcs or [])}
+    if local_funcs:
+        tr_seed = translator(emit(), params=params, context="flat", list_counts=list_counts)
+        tr_seed.prescan(tree.body)
+        for st in tree.body:
+            for n in ast.walk(st):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in call_rank_hints):
+                    continue
+                rr = call_rank_hints[n.func.id]
+                rk = call_kind_hints[n.func.id]
+                for i, a in enumerate(n.args):
+                    if i >= len(rr):
+                        break
+                    rr[i] = max(rr[i], tr_seed._rank_expr(a))
+                    ak = tr_seed._expr_kind(a)
+                    if rk[i] is None and ak is not None:
+                        rk[i] = ak
+
+    local_return_specs, tuple_return_out_kinds = _local_return_maps(
+        local_funcs,
+        params,
+        arg_rank_hints=call_rank_hints,
+        arg_kind_hints=call_kind_hints,
+    )
     local_func_arg_ranks = {}
     for fn in (local_funcs or []):
-        local_func_arg_ranks[fn.name] = [_infer_arg_rank_in_fn(fn, a.arg) for a in fn.args.args]
+        base_ranks = [_infer_arg_rank_in_fn(fn, a.arg) for a in fn.args.args]
+        hint_ranks = call_rank_hints.get(fn.name, [])
+        local_func_arg_ranks[fn.name] = [
+            max(base_ranks[i], (hint_ranks[i] if i < len(hint_ranks) else 0))
+            for i in range(len(base_ranks))
+        ]
     dict_return_specs = {}
     dict_return_types = {}
     dict_type_components = {}
@@ -7554,7 +8526,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     ]
     used_main_unwrap = False
     effective_tree = tree
-    local_funcs = []
+    local_funcs = [s for s in tree.body if isinstance(s, ast.FunctionDef)]
 
     # If there is no direct top-level executable code but there is a canonical
     # main guard that calls main(), transpile the main() body as program body.
