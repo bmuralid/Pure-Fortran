@@ -777,14 +777,14 @@ def detect_needed_helpers(tree):
                 and node.func.value.id == "np"
                 and node.func.attr == "sort"
             ):
-                needed.add("sort_real_vec")
+                needed.add("sort_vec")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "argsort"
             ):
-                needed.add("argsort_real")
+                needed.add("argsort")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -926,6 +926,9 @@ def discover_runtime_exports(runtime_text):
         )
         if m:
             has_proc.add(m.group(2).lower())
+        m = re.match(r"^\s*interface\s+([a-zA-Z_]\w*)\b", line, flags=re.IGNORECASE)
+        if m:
+            has_proc.add(m.group(1).lower())
 
     if module_name is None:
         module_name = "python_mod"
@@ -1195,6 +1198,26 @@ def runtime_helper_templates():
          end do
       end subroutine sort_real_vec"""
 
+    srt_i_pub = (
+        "public :: sort_int_vec !@pyapi kind=subroutine "
+        "args=x:integer(:):intent(inout) desc=\"sort integer vector x in ascending order\""
+    )
+    srt_i_blk = """      subroutine sort_int_vec(x)
+         integer, intent(inout) :: x(:)
+         integer :: i, j, n, key
+         n = size(x)
+         do i = 2, n
+            key = x(i)
+            j = i - 1
+            do while (j >= 1)
+               if (x(j) <= key) exit
+               x(j+1) = x(j)
+               j = j - 1
+            end do
+            x(j+1) = key
+         end do
+      end subroutine sort_int_vec"""
+
     asrt_pub = (
         "public :: argsort_real !@pyapi kind=subroutine "
         "args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) desc=\"argsort indices (0-based) of real vector\""
@@ -1219,6 +1242,41 @@ def runtime_helper_templates():
             idx(j+1) = key
          end do
       end subroutine argsort_real"""
+
+    asrt_i_pub = (
+        "public :: argsort_int !@pyapi kind=subroutine "
+        "args=x:integer(:):intent(in),idx:integer(:):intent(out) desc=\"argsort indices (0-based) of integer vector\""
+    )
+    asrt_i_blk = """      subroutine argsort_int(x, idx)
+         integer, intent(in) :: x(:)
+         integer, intent(out) :: idx(:)
+         integer :: i, j, n, key
+         n = size(x)
+         if (size(idx) < n) stop "argsort_int: output array too small"
+         do i = 1, n
+            idx(i) = i - 1
+         end do
+         do i = 2, n
+            key = idx(i)
+            j = i - 1
+            do while (j >= 1)
+               if (x(idx(j)+1) <= x(key+1)) exit
+               idx(j+1) = idx(j)
+               j = j - 1
+            end do
+            idx(j+1) = key
+         end do
+      end subroutine argsort_int"""
+
+    sort_vec_pub = "public :: sort_vec"
+    sort_vec_blk = """      interface sort_vec
+         module procedure sort_real_vec, sort_int_vec
+      end interface sort_vec"""
+
+    argsort_pub = "public :: argsort"
+    argsort_blk = """      interface argsort
+         module procedure argsort_real, argsort_int
+      end interface argsort"""
 
     mean_pub = (
         "public :: mean_1d !@pyapi kind=function ret=real(dp) "
@@ -1266,7 +1324,11 @@ def runtime_helper_templates():
         "random_choice_norep": (rcnr_pub, rcnr_blk),
         "random_choice_prob": (rcp_pub, rcp_blk),
         "sort_real_vec": (srt_pub, srt_blk),
+        "sort_int_vec": (srt_i_pub, srt_i_blk),
+        "sort_vec": (sort_vec_pub, sort_vec_blk),
         "argsort_real": (asrt_pub, asrt_blk),
+        "argsort_int": (asrt_i_pub, asrt_i_blk),
+        "argsort": (argsort_pub, argsort_blk),
         "mean_1d": (mean_pub, mean_blk),
         "var_1d": (var_pub, var_blk),
     }
@@ -1274,6 +1336,23 @@ def runtime_helper_templates():
 
 def ensure_runtime_helpers(runtime_path, needed_helpers):
     helper_templates = runtime_helper_templates()
+    helper_deps = {
+        "sort_vec": ["sort_real_vec", "sort_int_vec"],
+        "argsort": ["argsort_real", "argsort_int"],
+    }
+
+    expanded = []
+    seen = set()
+    for h in needed_helpers:
+        hl = h.lower()
+        if hl not in seen:
+            expanded.append(hl)
+            seen.add(hl)
+        for dep in helper_deps.get(hl, []):
+            if dep not in seen:
+                expanded.append(dep)
+                seen.add(dep)
+    needed_helpers = expanded
 
     runtime_text = runtime_path.read_text(encoding="utf-8")
     module_name, exports, has_proc = discover_runtime_exports(runtime_text)
@@ -5579,7 +5658,7 @@ class translator(ast.NodeVisitor):
             self.o.w(f"if (allocated({name})) deallocate({name})")
             self.o.w(f"allocate({name}(1:size({a0})))")
             self.o.w(f"{name} = {a0}")
-            self.o.w(f"call sort_real_vec({name})")
+            self.o.w(f"call sort_vec({name})")
             return
 
         # x = np.argsort(a)
@@ -5596,7 +5675,7 @@ class translator(ast.NodeVisitor):
             a0 = self.expr(v.args[0])
             self.o.w(f"if (allocated({name})) deallocate({name})")
             self.o.w(f"allocate({name}(1:size({a0})))")
-            self.o.w(f"call argsort_real({a0}, {name})")
+            self.o.w(f"call argsort({a0}, {name})")
             return
 
         # x = np.argmax(a, axis=1) / np.argmin(a, axis=1)

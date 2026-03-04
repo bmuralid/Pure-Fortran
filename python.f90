@@ -15,7 +15,9 @@ public :: random_choice2 !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n
 public :: random_choice_norep !@pyapi kind=subroutine args=npop:integer:intent(in),nsamp:integer:intent(in),z:integer(:):intent(out) desc="sample nsamp unique labels from 0..npop-1 without replacement"
 public :: random_choice_prob !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in 0..size(p)-1 with probabilities p"
 public :: sort_real_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(inout) desc="sort real vector x in ascending order"
+public :: sort_int_vec !@pyapi kind=subroutine args=x:integer(:):intent(inout) desc="sort integer vector x in ascending order"
 public :: argsort_real !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of real vector"
+public :: argsort_int !@pyapi kind=subroutine args=x:integer(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of integer vector"
 public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="integer arange(start, stop, step)"
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
 public :: var_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
@@ -79,6 +81,8 @@ public :: diag
 public :: repeat
 public :: tile
 public :: unique
+public :: sort_vec
+public :: argsort
 
 interface cumsum
    module procedure cumsum_real, cumsum_int
@@ -109,6 +113,14 @@ end interface tile
 interface unique
    module procedure unique_real, unique_int
 end interface unique
+
+interface sort_vec
+   module procedure sort_real_vec, sort_int_vec
+end interface sort_vec
+
+interface argsort
+   module procedure argsort_real, argsort_int
+end interface argsort
 
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
@@ -282,6 +294,24 @@ contains
          end do
       end subroutine sort_real_vec
 
+      pure subroutine sort_int_vec(x)
+         ! sort integer vector x in ascending order
+         implicit none
+         integer, intent(inout) :: x(:)
+         integer :: i, j, n, key
+         n = size(x)
+         do i = 2, n
+            key = x(i)
+            j = i - 1
+            do while (j >= 1)
+               if (x(j) <= key) exit
+               x(j+1) = x(j)
+               j = j - 1
+            end do
+            x(j+1) = key
+         end do
+      end subroutine sort_int_vec
+
       subroutine argsort_real(x, idx)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(out) :: idx(:)
@@ -302,6 +332,27 @@ contains
             idx(j+1) = key
          end do
       end subroutine argsort_real
+
+      subroutine argsort_int(x, idx)
+         integer, intent(in) :: x(:)
+         integer, intent(out) :: idx(:)
+         integer :: i, j, n, key
+         n = size(x)
+         if (size(idx) < n) stop "argsort_int: output array too small"
+         do i = 1, n
+            idx(i) = i - 1
+         end do
+         do i = 2, n
+            key = idx(i)
+            j = i - 1
+            do while (j >= 1)
+               if (x(idx(j)+1) <= x(key+1)) exit
+               idx(j+1) = idx(j)
+               j = j - 1
+            end do
+            idx(j+1) = key
+         end do
+      end subroutine argsort_int
 
       function arange_int(start, stop, step) result(x)
          integer, intent(in) :: start, stop, step
