@@ -25,6 +25,7 @@ import difflib
 import io
 import tokenize
 from datetime import datetime
+import fortran_output as fout
 from fortran_scan import (
     coalesce_simple_declarations,
     remove_empty_if_blocks,
@@ -35,7 +36,7 @@ from fortran_scan import (
 )
 
 
-def run_capture(cmd, tee=False):
+def run_capture(cmd, tee=False, stream_line_filter=None):
     """
     Run command and capture output.
     When tee=True, stream combined stdout/stderr live while also capturing it.
@@ -55,7 +56,11 @@ def run_capture(cmd, tee=False):
     assert p.stdout is not None
     for ln in p.stdout:
         out_lines.append(ln)
-        print(ln, end="")
+        if stream_line_filter is not None:
+            out_ln = stream_line_filter(ln.rstrip("\r\n"))
+            print(out_ln)
+        else:
+            print(ln, end="")
     rc = p.wait()
     return rc, "".join(out_lines), "", True
 
@@ -1996,6 +2001,7 @@ class translator(ast.NodeVisitor):
         self.list_counts = list_counts  # map list var -> count var
         self.ints = set()
         self.reals = set()
+        self.complexes = set()
         self.logs = set()
         self.alloc_logs = set()
         self.alloc_ints = set()
@@ -2060,7 +2066,7 @@ class translator(ast.NodeVisitor):
 
     @staticmethod
     def _kind_family(k):
-        if k in {"int", "real"}:
+        if k in {"int", "real", "complex"}:
             return "numeric"
         if k == "logical":
             return "logical"
@@ -2175,7 +2181,7 @@ class translator(ast.NodeVisitor):
             return
         if name in self.params:
             return
-        if name in self.reals:
+        if name in self.reals or name in self.complexes:
             return
         if name in self.logs:
             return
@@ -2196,6 +2202,22 @@ class translator(ast.NodeVisitor):
             return
         self.reals.add(name)
         self.ints.discard(name)
+        self.complexes.discard(name)
+
+    def _mark_complex(self, name):
+        if name == "_":
+            return
+        if name in self.reserved_names:
+            return
+        if name in self.params:
+            return
+        if name in self.logs:
+            return
+        if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_reals or name in self.alloc_chars:
+            return
+        self.complexes.add(name)
+        self.ints.discard(name)
+        self.reals.discard(name)
 
     def _mark_log(self, name):
         if name == "_":
@@ -2209,6 +2231,7 @@ class translator(ast.NodeVisitor):
         self.logs.add(name)
         self.ints.discard(name)
         self.reals.discard(name)
+        self.complexes.discard(name)
 
     def _mark_alloc_int(self, name, rank=1):
         if name == "_":
@@ -2223,6 +2246,7 @@ class translator(ast.NodeVisitor):
         self.alloc_int_rank[name] = max(rank, self.alloc_int_rank.get(name, 1))
         self.ints.discard(name)
         self.reals.discard(name)
+        self.complexes.discard(name)
         self.logs.discard(name)
         self.alloc_logs.discard(name)
         self.alloc_log_rank.pop(name, None)
@@ -2244,6 +2268,7 @@ class translator(ast.NodeVisitor):
         self.alloc_real_rank[name] = max(rank, self.alloc_real_rank.get(name, 1))
         self.ints.discard(name)
         self.reals.discard(name)
+        self.complexes.discard(name)
         self.logs.discard(name)
         self.alloc_logs.discard(name)
         self.alloc_log_rank.pop(name, None)
@@ -2265,6 +2290,7 @@ class translator(ast.NodeVisitor):
         self.alloc_log_rank[name] = max(rank, self.alloc_log_rank.get(name, 1))
         self.ints.discard(name)
         self.reals.discard(name)
+        self.complexes.discard(name)
         self.logs.discard(name)
         self.alloc_ints.discard(name)
         self.alloc_int_rank.pop(name, None)
@@ -2286,6 +2312,7 @@ class translator(ast.NodeVisitor):
         self.alloc_char_rank[name] = max(rank, self.alloc_char_rank.get(name, 1))
         self.ints.discard(name)
         self.reals.discard(name)
+        self.complexes.discard(name)
         self.logs.discard(name)
         self.alloc_ints.discard(name)
         self.alloc_int_rank.pop(name, None)
@@ -2326,6 +2353,8 @@ class translator(ast.NodeVisitor):
                 return "int"
             if isinstance(node.value, float):
                 return "real"
+            if isinstance(node.value, complex):
+                return "complex"
             if isinstance(node.value, str):
                 return "char"
             return None
@@ -2337,6 +2366,8 @@ class translator(ast.NodeVisitor):
                 return None
             if nm in self.reals:
                 return "real"
+            if nm in self.complexes:
+                return "complex"
             if nm in self.ints:
                 return "int"
             if nm in self.logs:
@@ -2359,6 +2390,8 @@ class translator(ast.NodeVisitor):
                 return None
             if "real" in kinds:
                 return "real"
+            if "complex" in kinds:
+                return "complex"
             if kinds == {"int"}:
                 return "int"
             if kinds == {"logical"}:
@@ -2375,6 +2408,8 @@ class translator(ast.NodeVisitor):
                 return None
             if "real" in kinds:
                 return "real"
+            if "complex" in kinds:
+                return "complex"
             if kinds == {"int"}:
                 return "int"
             if kinds == {"logical"}:
@@ -2394,6 +2429,8 @@ class translator(ast.NodeVisitor):
                     return "logical"
             if node.attr == "T":
                 return self._expr_kind(node.value)
+            if node.attr in {"real", "imag"}:
+                return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in {"pi", "nan", "inf", "NINF"}:
                 return "real"
             return None
@@ -2401,11 +2438,17 @@ class translator(ast.NodeVisitor):
             return self._expr_kind(node.operand)
         if isinstance(node, ast.BinOp):
             if isinstance(node.op, ast.Div):
+                lk = self._expr_kind(node.left)
+                rk = self._expr_kind(node.right)
+                if lk == "complex" or rk == "complex":
+                    return "complex"
                 return "real"
             if isinstance(node.op, (ast.BitAnd, ast.BitOr)):
                 return "logical"
             lk = self._expr_kind(node.left)
             rk = self._expr_kind(node.right)
+            if lk == "complex" or rk == "complex":
+                return "complex"
             if lk == "real" or rk == "real":
                 return "real"
             if lk == "int" and rk == "int":
@@ -2416,6 +2459,8 @@ class translator(ast.NodeVisitor):
             ok = self._expr_kind(node.orelse)
             if bk == "real" or ok == "real":
                 return "real"
+            if bk == "complex" or ok == "complex":
+                return "complex"
             if bk == "int" and ok == "int":
                 return "int"
             return None
@@ -2484,6 +2529,8 @@ class translator(ast.NodeVisitor):
                     return "char"
             return None
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
+                return self._expr_kind(node.func.value)
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 tgt = self.vectorize_aliases[node.func.id]
                 if tgt in self.local_return_specs:
@@ -2536,6 +2583,11 @@ class translator(ast.NodeVisitor):
                         return "int"
                 if node.func.id in {"float"}:
                     return "real"
+                if node.func.id in {"abs"} and len(node.args) >= 1:
+                    ak = self._expr_kind(node.args[0])
+                    return "real" if ak == "complex" else ak
+                if node.func.id in {"complex"}:
+                    return "complex"
                 if node.func.id in {"int", "isqrt", "size", "len"}:
                     return "int"
             if (
@@ -3983,6 +4035,8 @@ class translator(ast.NodeVisitor):
                 return str(v)
             if isinstance(v, float):
                 return f"{repr(v)}_dp"
+            if isinstance(v, complex):
+                return f"({repr(v.real)}_dp, {repr(v.imag)}_dp)"
             if isinstance(v, str):
                 return fstr(v)
             if v is None:
@@ -4335,6 +4389,8 @@ class translator(ast.NodeVisitor):
                     args_nodes.append(kw.value)
                 args = ", ".join(self.expr(a) for a in args_nodes)
                 return f"{self.vectorize_aliases[node.func.id]}({args})"
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
+                return f"conjg({self.expr(node.func.value)})"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
                 return self.expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist" and len(node.args) == 0:
@@ -4501,6 +4557,12 @@ class translator(ast.NodeVisitor):
                 if is_const_str(node.args[0]) and str(node.args[0].value).lower() == "nan":
                     return "ieee_value(0.0_dp, ieee_quiet_nan)"
                 return f"real({self.expr(node.args[0])}, kind=dp)"
+            if isinstance(node.func, ast.Name) and node.func.id == "complex":
+                if len(node.args) == 2:
+                    return f"cmplx(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp), kind=dp)"
+                if len(node.args) == 1:
+                    return f"cmplx(real({self.expr(node.args[0])}, kind=dp), 0.0_dp, kind=dp)"
+                raise NotImplementedError("complex() expects one or two arguments")
             if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
                 # Print-oriented transpilation: treat str(x) as display no-op.
                 return self.expr(node.args[0])
@@ -6172,6 +6234,10 @@ class translator(ast.NodeVisitor):
                 return f"size({self.expr(node.value)})"
             if node.attr == "T":
                 return f"transpose({self.expr(node.value)})"
+            if node.attr == "real":
+                return f"real({self.expr(node.value)}, kind=dp)"
+            if node.attr == "imag":
+                return f"aimag({self.expr(node.value)})"
             if node.attr == "shape":
                 return f"shape({self.expr(node.value)})"
             if node.attr == "dtype":
@@ -6455,6 +6521,8 @@ class translator(ast.NodeVisitor):
                     k = self._expr_kind(v)
                     if k == "real":
                         self._mark_real(t.id)
+                    elif k == "complex":
+                        self._mark_complex(t.id)
                     elif k == "int":
                         self._mark_int(t.id)
                     elif k == "logical":
@@ -6602,6 +6670,9 @@ class translator(ast.NodeVisitor):
                     if ext is not None:
                         if k == "real":
                             self._mark_alloc_real(t.id, rank=rk)
+                        elif k == "complex":
+                            # Complex array allocation not yet modeled separately; keep real alloc fallback.
+                            self._mark_alloc_real(t.id, rank=rk)
                         elif k == "logical":
                             self._mark_alloc_log(t.id, rank=rk)
                         elif k == "int":
@@ -6612,6 +6683,8 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_real(t.id, rank=rk)
                     elif k == "real":
                         self._mark_real(t.id)
+                    elif k == "complex":
+                        self._mark_complex(t.id)
                     elif k == "int":
                         self._mark_int(t.id)
                     elif k == "logical":
@@ -6626,6 +6699,7 @@ class translator(ast.NodeVisitor):
                         and t.id not in self.alloc_logs
                         and t.id not in self.alloc_chars
                         and t.id not in self.logs
+                        and t.id not in self.complexes
                     ):
                         # Python numeric default is real; use as fallback when kind
                         # inference is inconclusive.
@@ -9816,10 +9890,11 @@ def _emit_local_function(
         alloc_reals_set -= set(out_names)
         alloc_chars_set -= set(out_names)
     remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names))
-    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
-    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
-    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
-    chars = sorted((getattr(tr, "chars", set()) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    complexes = sorted((tr.complexes - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
+    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
+    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
+    chars = sorted((getattr(tr, "chars", set()) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - set(complexes))
     alloc_logs = sorted(alloc_logs_set)
     alloc_ints = sorted(alloc_ints_set)
     alloc_chars = sorted(alloc_chars_set)
@@ -10060,6 +10135,8 @@ def _emit_local_function(
             o.w(f"{ret_decl} :: {ret_name}")
     if reals:
         o.w("real(kind=dp) :: " + ", ".join(reals))
+    if complexes:
+        o.w("complex(kind=dp) :: " + ", ".join(complexes))
     if ints:
         o.w("integer :: " + ", ".join(ints))
     if logs:
@@ -10412,16 +10489,20 @@ def generate_flat(
     alloc_ints_set = set(tr.alloc_ints)
     alloc_reals_set = set(tr.alloc_reals)
     alloc_chars_set = set(tr.alloc_chars)
+    complexes_set = set(tr.complexes)
     ints = sorted(
-        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set
+        ({*tr.ints, *set(list_counts.values())} - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - complexes_set
     )
-    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
-    logs = sorted((tr.logs - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    reals = sorted((tr.reals - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - complexes_set)
+    complexes = sorted((complexes_set - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set)
+    logs = sorted((tr.logs - set(params.keys())) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_chars_set - complexes_set)
     dict_type_vars = sorted(tr.dict_typed_vars.items())
     if ints:
         o.w("integer :: " + ", ".join(ints))
     if reals:
         o.w("real(kind=dp) :: " + ", ".join(reals))
+    if complexes:
+        o.w("complex(kind=dp) :: " + ", ".join(complexes))
     if logs:
         o.w("logical :: " + ", ".join(logs))
     for vname, tname in dict_type_vars:
@@ -11028,6 +11109,7 @@ def main():
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
     ap.add_argument("--run-both", action="store_true", help="run original Python and transpiled Fortran (no timing)")
     ap.add_argument("--run-diff", action="store_true", help="run Python and Fortran and compare outputs")
+    ap.add_argument("--pretty", action="store_true", help="pretty-format Fortran runtime output")
     ap.add_argument("--tee", action="store_true", help="stream output while running transpiled Fortran")
     ap.add_argument("--tee-both", action="store_true", help="stream output while running both Python and Fortran")
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
@@ -11051,6 +11133,12 @@ def main():
         args.time = True
     if args.time:
         args.run = True
+
+    def _pretty_text(text):
+        return fout.pretty_output_text(text, float_digits=None, trim=True) if args.pretty else text
+
+    def _pretty_line(line):
+        return fout.pretty_output_line(line, float_digits=None, trim=True) if args.pretty else line
 
     timings = {}
     t0_total = time.perf_counter()
@@ -11128,14 +11216,16 @@ def main():
         print("Build: PASS")
         if args.run:
             t0_run = time.perf_counter()
-            rp_rc, rp_out, rp_err, rp_live = run_capture([str(exe)], tee=args.tee)
+            rp_rc, rp_out, rp_err, rp_live = run_capture(
+                [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None
+            )
             timings["fortran_run"] = time.perf_counter() - t0_run
             if rp_rc != 0:
                 print(f"Run: FAIL (exit {rp_rc})")
                 if (not rp_live) and rp_out.strip():
-                    print(rp_out.rstrip())
+                    print(_pretty_text(rp_out).rstrip())
                 if (not rp_live) and rp_err.strip():
-                    print(rp_err.rstrip())
+                    print(_pretty_text(rp_err).rstrip())
                 # Automatic fallback: rebuild with debug checks/backtrace and rerun
                 dbg_flags = debug_flags_for_compiler(compiler_parts[0] if compiler_parts else "")
                 dbg_cmd = compiler_parts + dbg_flags + [*helper_files, str(out), "-o", str(exe)]
@@ -11149,21 +11239,23 @@ def main():
                         print(dbg_cp.stderr.rstrip())
                 else:
                     print("Debug rebuild: PASS")
-                    dbg_rc, dbg_out, dbg_err, dbg_live = run_capture([str(exe)], tee=args.tee)
+                    dbg_rc, dbg_out, dbg_err, dbg_live = run_capture(
+                        [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None
+                    )
                     if dbg_rc != 0:
                         print(f"Debug run: FAIL (exit {dbg_rc})")
                     else:
                         print("Debug run: PASS")
                     if (not dbg_live) and dbg_out.strip():
-                        print(dbg_out.rstrip())
+                        print(_pretty_text(dbg_out).rstrip())
                     if (not dbg_live) and dbg_err.strip():
-                        print(dbg_err.rstrip())
+                        print(_pretty_text(dbg_err).rstrip())
                 return rp_rc
             print("Run: PASS")
             if (not rp_live) and rp_out.strip():
-                print(rp_out.rstrip())
+                print(_pretty_text(rp_out).rstrip())
             if (not rp_live) and rp_err.strip():
-                print(rp_err.rstrip())
+                print(_pretty_text(rp_err).rstrip())
             rp = subprocess.CompletedProcess([str(exe)], rp_rc, rp_out, rp_err)
             if args.run_diff and py_run is not None:
                 def _norm(s):
