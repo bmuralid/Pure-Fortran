@@ -3118,9 +3118,13 @@ class translator(ast.NodeVisitor):
                 return 2
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype":
                 return self._rank_expr(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist":
+                return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
                 return 1
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
+                return self._rank_expr(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist" and len(node.args) == 0:
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "transpose":
                 if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
@@ -3579,6 +3583,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
                 return self.expr(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "tolist" and len(node.args) == 0:
+                return self.expr(node.func.value)
             # Method-call reductions: a.sum(), a.mean(), a.var(ddof=...)
             if (
                 isinstance(node.func, ast.Attribute)
@@ -3823,6 +3829,34 @@ class translator(ast.NodeVisitor):
                 if "int" in dtype_txt:
                     return f"int({src}(1:{cnt}))"
                 return f"{src}(1:{cnt})"
+            # Generic np.array(...) / np.asarray(...) fallback for scalar or
+            # non-list inputs. Preserve dtype coercion when explicitly set.
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"array", "asarray"}
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                dtype_txt = ""
+                for kw in node.keywords:
+                    if kw.arg == "dtype":
+                        if isinstance(kw.value, ast.Name):
+                            dtype_txt = kw.value.id.lower()
+                        elif (
+                            isinstance(kw.value, ast.Attribute)
+                            and isinstance(kw.value.value, ast.Name)
+                            and kw.value.value.id == "np"
+                        ):
+                            dtype_txt = kw.value.attr.lower()
+                if "float" in dtype_txt:
+                    return f"real({a0}, kind=dp)"
+                if "int" in dtype_txt:
+                    return f"int({a0})"
+                if "bool" in dtype_txt:
+                    return f"({a0} /= 0)"
+                return a0
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -7386,17 +7420,31 @@ class translator(ast.NodeVisitor):
 
     def visit_If(self, node):
         self._emit_comments_for(node)
+        def _is_seed_noop_call(c):
+            return (
+                isinstance(c, ast.Call)
+                and isinstance(c.func, ast.Attribute)
+                and (
+                    (
+                        isinstance(c.func.value, ast.Name)
+                        and c.func.value.id == "random"
+                        and c.func.attr == "seed"
+                    )
+                    or (
+                        isinstance(c.func.value, ast.Attribute)
+                        and isinstance(c.func.value.value, ast.Name)
+                        and c.func.value.value.id == "np"
+                        and c.func.value.attr == "random"
+                        and c.func.attr == "seed"
+                    )
+                )
+            )
+
         def _is_noop_stmt(s):
             if isinstance(s, ast.Pass):
                 return True
             if isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
-                c = s.value
-                if (
-                    isinstance(c.func, ast.Attribute)
-                    and isinstance(c.func.value, ast.Name)
-                    and c.func.value.id == "random"
-                    and c.func.attr == "seed"
-                ):
+                if _is_seed_noop_call(s.value):
                     return True
             return False
 
@@ -7553,6 +7601,16 @@ class translator(ast.NodeVisitor):
             isinstance(c.func, ast.Attribute)
             and isinstance(c.func.value, ast.Name)
             and c.func.value.id == "random"
+            and c.func.attr == "seed"
+        ):
+            return
+        # np.random.seed(...)
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Attribute)
+            and isinstance(c.func.value.value, ast.Name)
+            and c.func.value.value.id == "np"
+            and c.func.value.attr == "random"
             and c.func.attr == "seed"
         ):
             return
