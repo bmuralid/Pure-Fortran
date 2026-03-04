@@ -3891,6 +3891,19 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.targets[0], (ast.Tuple, ast.List))
                     and isinstance(node.value, ast.Call)
                     and isinstance(node.value.func, ast.Attribute)
+                    and isinstance(node.value.func.value, ast.Name)
+                    and node.value.func.value.id == "np"
+                    and node.value.func.attr == "meshgrid"
+                ):
+                    for e in node.targets[0].elts:
+                        if isinstance(e, ast.Name):
+                            self._mark_alloc_real(e.id, rank=2)
+                    continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
                     and isinstance(node.value.func.value, ast.Attribute)
                     and isinstance(node.value.func.value.value, ast.Name)
                     and node.value.func.value.value.id == "np"
@@ -3925,6 +3938,21 @@ class translator(ast.NodeVisitor):
                     elif k == "int":
                         self._mark_int(t.id)
                 if isinstance(t, ast.Name):
+                    if (
+                        isinstance(v, ast.Call)
+                        and isinstance(v.func, ast.Attribute)
+                        and isinstance(v.func.value, ast.Name)
+                        and v.func.value.id == "np"
+                        and v.func.attr == "diag"
+                    ):
+                        has_k = len(v.args) >= 2
+                        if not has_k:
+                            for kw in v.keywords:
+                                if kw.arg == "k":
+                                    has_k = True
+                                    break
+                        if has_k:
+                            self._mark_int("i_d")
                     if (
                         isinstance(v, ast.Call)
                         and isinstance(v.func, ast.Attribute)
@@ -4801,6 +4829,41 @@ class translator(ast.NodeVisitor):
             if v.func.attr == "svd" and len(v.args) >= 1 and len(outs) >= 3:
                 self.o.w(f"call linalg_svd({self.expr(v.args[0])}, {outs[0]}, {outs[1]}, {outs[2]})")
                 return
+        # tuple unpacking from np.meshgrid(x, y, indexing='xy'/'ij')
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr == "meshgrid"
+        ):
+            outs = []
+            for e in t.elts:
+                if not isinstance(e, ast.Name):
+                    raise NotImplementedError("tuple assignment targets must be names")
+                outs.append(e.id)
+            if len(outs) < 2 or len(v.args) < 2:
+                raise NotImplementedError("np.meshgrid assignment expects at least two outputs and two inputs")
+            xname = self.expr(v.args[0])
+            yname = self.expr(v.args[1])
+            indexing = "xy"
+            for kw in v.keywords:
+                if kw.arg == "indexing":
+                    if not is_const_str(kw.value):
+                        raise NotImplementedError("np.meshgrid indexing must be constant string")
+                    indexing = str(kw.value.value).lower()
+            if indexing not in {"xy", "ij"}:
+                raise NotImplementedError("np.meshgrid currently supports indexing='xy' or 'ij'")
+            xx = outs[0]
+            yy = outs[1]
+            if indexing == "xy":
+                self.o.w(f"{xx} = spread({xname}, dim=1, ncopies=size({yname}))")
+                self.o.w(f"{yy} = spread({yname}, dim=2, ncopies=size({xname}))")
+            else:
+                self.o.w(f"{xx} = spread({xname}, dim=2, ncopies=size({yname}))")
+                self.o.w(f"{yy} = spread({yname}, dim=1, ncopies=size({xname}))")
+            return
 
         # ignore module-level param assignment already emitted as parameter
         if isinstance(t, ast.Name) and t.id in self.params:
