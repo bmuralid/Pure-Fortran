@@ -863,6 +863,8 @@ def detect_needed_helpers(tree):
         "cov": {"cov2_real"},
         "corrcoef": {"corrcoef2_real"},
         "pad": {"pad2d_int", "pad2d_real"},
+        "polyval": {"polyval"},
+        "polyder": {"polyder"},
     }
     np_reduceat_helper_map = {
         "add": {"reduceat_add"},
@@ -1938,6 +1940,16 @@ class translator(ast.NodeVisitor):
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
         self.var_type_first_seen = {}
         self.reserved_names = {"dp"}
+        self.name_aliases = {}
+
+    def _aliased_name(self, name):
+        if name in self.name_aliases:
+            return self.name_aliases[name]
+        if name in self.reserved_names:
+            alias = f"{name}_v"
+            self.name_aliases[name] = alias
+            return alias
+        return name
 
     @staticmethod
     def _is_np_vectorize_call(node):
@@ -2011,11 +2023,12 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Constant) and isinstance(node.value, float):
             return "real64"
         if isinstance(node, ast.Name):
-            prev = self.var_type_first_seen.get(node.id)
+            nm = self._aliased_name(node.id)
+            prev = self.var_type_first_seen.get(nm)
             if prev is not None:
                 # tuple: (k, fam, rk, rkind, line)
                 return prev[3]
-            return "real64" if node.id in self.reals or node.id in self.alloc_reals else None
+            return "real64" if nm in self.reals or nm in self.alloc_reals else None
         if isinstance(node, ast.BinOp):
             l = self._expr_real_kind_tag(node.left)
             r = self._expr_real_kind_tag(node.right)
@@ -2230,21 +2243,22 @@ class translator(ast.NodeVisitor):
                 return "char"
             return None
         if isinstance(node, ast.Name):
-            if node.id in self.dict_typed_vars:
+            nm = self._aliased_name(node.id)
+            if nm in self.dict_typed_vars:
                 return None
-            if node.id in self.reals:
+            if nm in self.reals:
                 return "real"
-            if node.id in self.ints:
+            if nm in self.ints:
                 return "int"
-            if node.id in self.logs:
+            if nm in self.logs:
                 return "logical"
-            if node.id in self.alloc_reals:
+            if nm in self.alloc_reals:
                 return "real"
-            if node.id in self.alloc_ints:
+            if nm in self.alloc_ints:
                 return "int"
-            if node.id in self.alloc_logs:
+            if nm in self.alloc_logs:
                 return "logical"
-            if node.id in self.alloc_chars:
+            if nm in self.alloc_chars:
                 return "char"
             return None
         if isinstance(node, ast.List):
@@ -2420,6 +2434,22 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.id in {"int", "isqrt", "size", "len"}:
                     return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "polyval"
+                and len(node.args) >= 2
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "polyder"
+                and len(node.args) >= 1
+            ):
+                return "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3181,16 +3211,17 @@ class translator(ast.NodeVisitor):
 
     def _rank_expr(self, node):
         if isinstance(node, ast.Name):
-            if node.id in self.broadcast_row2 or node.id in self.broadcast_col2:
+            nm = self._aliased_name(node.id)
+            if nm in self.broadcast_row2 or nm in self.broadcast_col2:
                 return 2
-            if node.id in self.alloc_reals:
-                return self.alloc_real_rank.get(node.id, 1)
-            if node.id in self.alloc_ints:
-                return self.alloc_int_rank.get(node.id, 1)
-            if node.id in self.alloc_logs:
-                return self.alloc_log_rank.get(node.id, 1)
-            if node.id in self.alloc_chars:
-                return self.alloc_char_rank.get(node.id, 1)
+            if nm in self.alloc_reals:
+                return self.alloc_real_rank.get(nm, 1)
+            if nm in self.alloc_ints:
+                return self.alloc_int_rank.get(nm, 1)
+            if nm in self.alloc_logs:
+                return self.alloc_log_rank.get(nm, 1)
+            if nm in self.alloc_chars:
+                return self.alloc_char_rank.get(nm, 1)
             return 0
         if isinstance(node, ast.List):
             if node.elts and all(isinstance(e, ast.List) for e in node.elts):
@@ -3312,6 +3343,10 @@ class translator(ast.NodeVisitor):
             ):
                 if node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "array"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
+                if node.func.attr == "polyval" and len(node.args) >= 2:
+                    return self._rank_expr(node.args[1])
+                if node.func.attr == "polyder" and len(node.args) >= 1:
+                    return 1
                 if node.func.attr in {"minimum"} and len(node.args) >= 1:
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
                 if node.func.attr in {"add", "multiply", "maximum", "power", "logical_and", "logical_or", "logical_xor"} and len(node.args) >= 2:
@@ -3818,7 +3853,7 @@ class translator(ast.NodeVisitor):
             return f"[{vals}]"
 
         if isinstance(node, ast.Name):
-            return node.id
+            return self._aliased_name(node.id)
 
         if isinstance(node, ast.Constant):
             v = node.value
@@ -4574,6 +4609,31 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 return f"exp({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "polyval"
+                and len(node.args) >= 2
+            ):
+                return f"polyval(real({self.expr(node.args[0])}, kind=dp), real({self.expr(node.args[1])}, kind=dp))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "polyder"
+                and len(node.args) >= 1
+            ):
+                m_expr = None
+                if len(node.args) >= 2:
+                    m_expr = self.expr(node.args[1])
+                for kw in node.keywords:
+                    if kw.arg == "m":
+                        m_expr = self.expr(kw.value)
+                        break
+                if m_expr is not None:
+                    return f"polyder(real({self.expr(node.args[0])}, kind=dp), int({m_expr}))"
+                return f"polyder(real({self.expr(node.args[0])}, kind=dp))"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -6037,6 +6097,20 @@ class translator(ast.NodeVisitor):
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id in self.reserved_names
+                ):
+                    alias = self._aliased_name(node.targets[0].id)
+                    fake = ast.Assign(
+                        targets=[ast.Name(id=alias, ctx=node.targets[0].ctx)],
+                        value=node.value,
+                        lineno=getattr(node, "lineno", None),
+                        col_offset=getattr(node, "col_offset", None),
+                    )
+                    self.prescan([fake])
+                    continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
                 ):
                     vec_target = self._vectorize_target_name(node.value)
                     if vec_target is not None:
@@ -7078,15 +7152,14 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("multiple assignment not supported")
         t = node.targets[0]
         v = node.value
+        if isinstance(t, ast.Name) and t.id in self.reserved_names:
+            t = ast.Name(id=self._aliased_name(t.id), ctx=t.ctx)
         if isinstance(t, ast.Name):
             vec_target = self._vectorize_target_name(v)
             if vec_target is not None:
                 self.vectorize_aliases[t.id] = vec_target
                 translator.global_vectorize_aliases[t.id] = vec_target
                 return
-        if isinstance(t, ast.Name) and t.id in self.reserved_names:
-            # keep translator-owned kind parameters stable
-            return
 
         # Shape-intent marker rewrites from NumPy axis insertion:
         # x = x[:, None] or x = x[None, :]

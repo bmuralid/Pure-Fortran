@@ -80,6 +80,7 @@ public :: searchsorted_right_int_scalar !@pyapi kind=function ret=integer args=a
 public :: setdiff1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique values in a not in b"
 public :: intersect1d_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="sorted unique intersection of a and b"
 public :: unique_int_inv_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),inv:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with inverse and counts"
+public :: unique_int_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with counts"
 public :: lexsort2_int !@pyapi kind=function ret=integer(:) args=key0:integer(:):intent(in),key1:integer(:):intent(in) desc="lexsort((key0,key1)): sort by key1 then key0, return 0-based indices"
 public :: ravel_multi_index_2d !@pyapi kind=function ret=integer args=rc:integer(:):intent(in),shape:integer(:):intent(in) desc="2D ravel_multi_index"
 public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:intent(in),shape:integer(:):intent(in) desc="2D unravel_index"
@@ -103,6 +104,18 @@ public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):int
 public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="matrix inverse using LAPACK DGETRF/DGETRI"
 public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="right eigenpairs of real square matrix using LAPACK DGEEV (real-spectrum only)"
 public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="full SVD using LAPACK DGESVD"
+public :: tri_int !@pyapi kind=function ret=integer(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
+public :: tri_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
+public :: moveaxis3_int !@pyapi kind=function ret=integer(:,:,:) args=a:integer(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 integer arrays (NumPy-style indices)"
+public :: moveaxis3_real !@pyapi kind=function ret=real(dp)(:,:,:) args=a:real(dp)(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 real arrays (NumPy-style indices)"
+public :: moveaxis3_logical !@pyapi kind=function ret=logical(:,:,:) args=a:logical(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 logical arrays (NumPy-style indices)"
+public :: pad2d_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:integer:intent(in) desc="2D constant pad for integer matrix"
+public :: pad2d_real !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:real(dp):intent(in) desc="2D constant pad for real matrix"
+public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="2x2 covariance matrix for two real vectors"
+public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
+public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
+public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
+public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional desc="m-th derivative coefficients for descending-order polynomial"
 
 public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
 public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
@@ -130,6 +143,8 @@ public :: reduceat_add
 public :: reduceat_mul
 public :: reduceat_min
 public :: reduceat_max
+public :: polyval
+public :: polyder
 
 interface cumsum
    module procedure cumsum_real, cumsum_int
@@ -188,6 +203,14 @@ end interface reduceat_min
 interface reduceat_max
    module procedure reduceat_max_real, reduceat_max_int
 end interface reduceat_max
+
+interface polyval
+   module procedure polyval_real_scalar, polyval_real_vec
+end interface polyval
+
+interface polyder
+   module procedure polyder_real
+end interface polyder
 
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
@@ -2240,5 +2263,243 @@ contains
             nanargmax = -1
          end if
       end function nanargmax
+
+      subroutine unique_int_counts(a, u, cnt)
+         integer, intent(in) :: a(:)
+         integer, allocatable, intent(out) :: u(:), cnt(:)
+         integer :: i, j
+         u = unique_int(a)
+         allocate(cnt(size(u)))
+         cnt = 0
+         do i = 1, size(a)
+            do j = 1, size(u)
+               if (a(i) == u(j)) then
+                  cnt(j) = cnt(j) + 1
+                  exit
+               end if
+            end do
+         end do
+      end subroutine unique_int_counts
+
+      function tri_int(n, m, k) result(t)
+         integer, intent(in) :: n, m
+         integer, intent(in), optional :: k
+         integer, allocatable :: t(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         allocate(t(n, m))
+         t = 0
+         do i = 1, n
+            do j = 1, m
+               if (j <= i + kk) t(i, j) = 1
+            end do
+         end do
+      end function tri_int
+
+      function tri_real(n, m, k) result(t)
+         integer, intent(in) :: n, m
+         integer, intent(in), optional :: k
+         real(kind=dp), allocatable :: t(:,:)
+         integer :: i, j, kk
+         kk = 0
+         if (present(k)) kk = k
+         allocate(t(n, m))
+         t = 0.0_dp
+         do i = 1, n
+            do j = 1, m
+               if (j <= i + kk) t(i, j) = 1.0_dp
+            end do
+         end do
+      end function tri_real
+
+      function moveaxis3_int(a, src, dst) result(b)
+         integer, intent(in) :: a(:,:,:)
+         integer, intent(in) :: src, dst
+         integer, allocatable :: b(:,:,:)
+         integer :: s, d
+         s = src; d = dst
+         if (s < 0) s = s + 3
+         if (d < 0) d = d + 3
+         if (s == 0 .and. d == 2) then
+            allocate(b(size(a,2), size(a,3), size(a,1)))
+            b = reshape(a, [size(a,2), size(a,3), size(a,1)], order=[2,3,1])
+         elseif (s == 2 .and. d == 0) then
+            allocate(b(size(a,3), size(a,1), size(a,2)))
+            b = reshape(a, [size(a,3), size(a,1), size(a,2)], order=[3,1,2])
+         else
+            allocate(b(size(a,1), size(a,2), size(a,3)))
+            b = a
+         end if
+      end function moveaxis3_int
+
+      function moveaxis3_real(a, src, dst) result(b)
+         real(kind=dp), intent(in) :: a(:,:,:)
+         integer, intent(in) :: src, dst
+         real(kind=dp), allocatable :: b(:,:,:)
+         integer :: s, d
+         s = src; d = dst
+         if (s < 0) s = s + 3
+         if (d < 0) d = d + 3
+         if (s == 0 .and. d == 2) then
+            allocate(b(size(a,2), size(a,3), size(a,1)))
+            b = reshape(a, [size(a,2), size(a,3), size(a,1)], order=[2,3,1])
+         elseif (s == 2 .and. d == 0) then
+            allocate(b(size(a,3), size(a,1), size(a,2)))
+            b = reshape(a, [size(a,3), size(a,1), size(a,2)], order=[3,1,2])
+         else
+            allocate(b(size(a,1), size(a,2), size(a,3)))
+            b = a
+         end if
+      end function moveaxis3_real
+
+      function moveaxis3_logical(a, src, dst) result(b)
+         logical, intent(in) :: a(:,:,:)
+         integer, intent(in) :: src, dst
+         logical, allocatable :: b(:,:,:)
+         integer :: s, d
+         s = src; d = dst
+         if (s < 0) s = s + 3
+         if (d < 0) d = d + 3
+         if (s == 0 .and. d == 2) then
+            allocate(b(size(a,2), size(a,3), size(a,1)))
+            b = reshape(a, [size(a,2), size(a,3), size(a,1)], order=[2,3,1])
+         elseif (s == 2 .and. d == 0) then
+            allocate(b(size(a,3), size(a,1), size(a,2)))
+            b = reshape(a, [size(a,3), size(a,1), size(a,2)], order=[3,1,2])
+         else
+            allocate(b(size(a,1), size(a,2), size(a,3)))
+            b = a
+         end if
+      end function moveaxis3_logical
+
+      function pad2d_int(a, pt, pb, pl, pr, c) result(out)
+         integer, intent(in) :: a(:,:)
+         integer, intent(in) :: pt, pb, pl, pr, c
+         integer, allocatable :: out(:,:)
+         integer :: n0, n1
+         n0 = size(a,1); n1 = size(a,2)
+         allocate(out(n0 + pt + pb, n1 + pl + pr))
+         out = c
+         out(pt+1:pt+n0, pl+1:pl+n1) = a
+      end function pad2d_int
+
+      function pad2d_real(a, pt, pb, pl, pr, c) result(out)
+         real(kind=dp), intent(in) :: a(:,:)
+         integer, intent(in) :: pt, pb, pl, pr
+         real(kind=dp), intent(in) :: c
+         real(kind=dp), allocatable :: out(:,:)
+         integer :: n0, n1
+         n0 = size(a,1); n1 = size(a,2)
+         allocate(out(n0 + pt + pb, n1 + pl + pr))
+         out = c
+         out(pt+1:pt+n0, pl+1:pl+n1) = a
+      end function pad2d_real
+
+      function cov2_real(x, y, ddof) result(c)
+         real(kind=dp), intent(in) :: x(:), y(:)
+         integer, intent(in), optional :: ddof
+         real(kind=dp), allocatable :: c(:,:)
+         real(kind=dp) :: mx, my, vxx, vyy, vxy, den
+         integer :: n, d
+         n = min(size(x), size(y))
+         d = 1
+         if (present(ddof)) d = ddof
+         mx = sum(x(1:n)) / real(n, kind=dp)
+         my = sum(y(1:n)) / real(n, kind=dp)
+         den = real(max(1, n - d), kind=dp)
+         vxx = sum((x(1:n) - mx)**2) / den
+         vyy = sum((y(1:n) - my)**2) / den
+         vxy = sum((x(1:n) - mx) * (y(1:n) - my)) / den
+         allocate(c(2,2))
+         c(1,1) = vxx; c(1,2) = vxy
+         c(2,1) = vxy; c(2,2) = vyy
+      end function cov2_real
+
+      function corrcoef2_real(x, y) result(r)
+         real(kind=dp), intent(in) :: x(:), y(:)
+         real(kind=dp), allocatable :: r(:,:)
+         real(kind=dp), allocatable :: c(:,:)
+         real(kind=dp) :: sx, sy
+         c = cov2_real(x, y, 1)
+         sx = sqrt(max(c(1,1), 0.0_dp))
+         sy = sqrt(max(c(2,2), 0.0_dp))
+         allocate(r(2,2))
+         if (sx <= tiny(1.0_dp) .or. sy <= tiny(1.0_dp)) then
+            r = 0.0_dp
+            r(1,1) = 1.0_dp
+            r(2,2) = 1.0_dp
+         else
+            r(1,1) = 1.0_dp
+            r(2,2) = 1.0_dp
+            r(1,2) = c(1,2) / (sx * sy)
+            r(2,1) = r(1,2)
+         end if
+      end function corrcoef2_real
+
+      pure real(kind=dp) function polyval_real_scalar(p, x) result(y)
+         real(kind=dp), intent(in) :: p(:)
+         real(kind=dp), intent(in) :: x
+         integer :: i
+         if (size(p) <= 0) then
+            y = 0.0_dp
+            return
+         end if
+         y = p(1)
+         do i = 2, size(p)
+            y = y * x + p(i)
+         end do
+      end function polyval_real_scalar
+
+      pure function polyval_real_vec(p, x) result(y)
+         real(kind=dp), intent(in) :: p(:)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: y(:)
+         integer :: i
+         allocate(y(size(x)))
+         do i = 1, size(x)
+            y(i) = polyval_real_scalar(p, x(i))
+         end do
+      end function polyval_real_vec
+
+      pure function polyder_real(p, m) result(dpcoef)
+         real(kind=dp), intent(in) :: p(:)
+         integer, intent(in), optional :: m
+         real(kind=dp), allocatable :: dpcoef(:)
+         real(kind=dp), allocatable :: cur(:), nxt(:)
+         integer :: i, k, order, ncur
+         if (present(m)) then
+            order = m
+         else
+            order = 1
+         end if
+         if (order <= 0) then
+            allocate(dpcoef(size(p)))
+            dpcoef = p
+            return
+         end if
+         if (size(p) <= 1 .or. order >= size(p)) then
+            allocate(dpcoef(1))
+            dpcoef = 0.0_dp
+            return
+         end if
+         allocate(cur(size(p)))
+         cur = p
+         do k = 1, order
+            ncur = size(cur) - 1
+            if (ncur <= 0) then
+               allocate(dpcoef(1))
+               dpcoef = 0.0_dp
+               return
+            end if
+            allocate(nxt(ncur))
+            do i = 1, ncur
+               nxt(i) = cur(i) * real(ncur - i + 1, kind=dp)
+            end do
+            call move_alloc(nxt, cur)
+         end do
+         allocate(dpcoef(size(cur)))
+         dpcoef = cur
+      end function polyder_real
 
 end module python_mod
