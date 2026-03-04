@@ -748,14 +748,17 @@ contains
          ! Source: Alan Miller, amiller_mirror/random.f90 (negative binomial sampler).
          real(kind=dp), intent(in) :: sk, p
          real(kind=dp), parameter :: h = 0.7_dp
-         real(kind=dp) :: q, x, st, uln, v, r, s, y, g
+         real(kind=dp) :: p_alg, q, x, st, uln, v, r, s, y, g
          integer :: k, i, n
          if (sk <= 0.0_dp .or. p <= 0.0_dp .or. p >= 1.0_dp) stop "random_neg_binomial: invalid params"
-         q = 1.0_dp - p
+         ! NumPy parameterization: p is success probability.
+         ! Alan Miller routine expects the opposite probability in its recurrence.
+         p_alg = 1.0_dp - p
+         q = 1.0_dp - p_alg
          x = 0.0_dp
          st = sk
-         if (p > h) then
-            v = 1.0_dp / log(p)
+         if (p_alg > h) then
+            v = 1.0_dp / log(p_alg)
             k = int(st)
             do i = 1, k
                do
@@ -777,7 +780,7 @@ contains
             if (y > r) exit
             r = r - y
             s = s + 1.0_dp
-            y = y * p * g / s
+            y = y * p_alg * g / s
             g = g + 1.0_dp
          end do
          random_neg_binomial = int(x + s + 0.5_dp)

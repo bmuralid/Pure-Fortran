@@ -8698,10 +8698,10 @@ class translator(ast.NodeVisitor):
                 self.o.pop()
                 self.o.w("end block")
             else:
-                if (not is_standard) and loc_node is not None:
-                    self.o.w(f"{t.id} = {t.id} + ({self.expr(loc_node)})")
                 if (not is_standard) and scale_node is not None:
                     self.o.w(f"{t.id} = ({self.expr(scale_node)}) * {t.id}")
+                if (not is_standard) and loc_node is not None:
+                    self.o.w(f"{t.id} = {t.id} + ({self.expr(loc_node)})")
             return
 
         # x = np.random.{exponential,gamma,beta,lognormal,chisquare}(..., size=...)
@@ -10942,6 +10942,7 @@ def _emit_local_function(
     dict_return_types=None,
     local_return_specs=None,
     tuple_return_out_kinds=None,
+    tuple_return_funcs=None,
     dict_type_components=None,
     dict_arg_types=None,
     local_func_arg_ranks=None,
@@ -11071,6 +11072,7 @@ def _emit_local_function(
         list_counts=local_list_counts,
         function_result_name=ret_name,
         comment_map=comment_map,
+        tuple_return_funcs=tuple_return_funcs,
         dict_return_types=dict_return_types,
         local_return_specs=local_return_specs,
         tuple_return_out_kinds=tuple_return_out_kinds,
@@ -11896,6 +11898,7 @@ def generate_flat(
                 dict_return_types=dict_return_types,
                 local_return_specs=local_return_specs,
                 tuple_return_out_kinds=tuple_return_out_kinds,
+                tuple_return_funcs=tuple_return_funcs,
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
                 local_func_arg_ranks=local_func_arg_ranks,
