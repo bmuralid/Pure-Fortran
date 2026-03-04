@@ -805,6 +805,10 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_det")
                 elif node.func.attr == "inv":
                     needed.add("linalg_inv")
+                elif node.func.attr == "eig":
+                    needed.add("linalg_eig")
+                elif node.func.attr == "svd":
+                    needed.add("linalg_svd")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3773,6 +3777,26 @@ class translator(ast.NodeVisitor):
                         else:
                             self._mark_int(e.id)
                     continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and isinstance(node.value.func.value, ast.Attribute)
+                    and isinstance(node.value.func.value.value, ast.Name)
+                    and node.value.func.value.value.id == "np"
+                    and node.value.func.value.attr == "linalg"
+                ):
+                    outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
+                    if node.value.func.attr == "eig" and len(outs) >= 2:
+                        self._mark_alloc_real(outs[0], rank=1)
+                        self._mark_alloc_real(outs[1], rank=2)
+                        continue
+                    if node.value.func.attr == "svd" and len(outs) >= 3:
+                        self._mark_alloc_real(outs[0], rank=2)
+                        self._mark_alloc_real(outs[1], rank=1)
+                        self._mark_alloc_real(outs[2], rank=2)
+                        continue
                 if len(node.targets) != 1:
                     continue
                 t = node.targets[0]
@@ -4637,6 +4661,29 @@ class translator(ast.NodeVisitor):
             args = [self.expr(a) for a in args_nodes] + outs
             self.o.w(f"call {v.func.id}(" + ", ".join(args) + ")")
             return
+        # tuple unpacking from supported numpy.linalg calls:
+        #   w, v = np.linalg.eig(a)
+        #   u, s, vt = np.linalg.svd(a)
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Attribute)
+            and isinstance(v.func.value.value, ast.Name)
+            and v.func.value.value.id == "np"
+            and v.func.value.attr == "linalg"
+        ):
+            outs = []
+            for e in t.elts:
+                if not isinstance(e, ast.Name):
+                    raise NotImplementedError("tuple assignment targets must be names")
+                outs.append(e.id)
+            if v.func.attr == "eig" and len(v.args) >= 1 and len(outs) >= 2:
+                self.o.w(f"call linalg_eig({self.expr(v.args[0])}, {outs[0]}, {outs[1]})")
+                return
+            if v.func.attr == "svd" and len(v.args) >= 1 and len(outs) >= 3:
+                self.o.w(f"call linalg_svd({self.expr(v.args[0])}, {outs[0]}, {outs[1]}, {outs[2]})")
+                return
 
         # ignore module-level param assignment already emitted as parameter
         if isinstance(t, ast.Name) and t.id in self.params:
@@ -7145,7 +7192,7 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
             missing_modules.append((mod, ""))
 
     # LAPACK linkage support for numpy.linalg wrappers in python_mod.
-    if re.search(r"\blinalg_(solve|det|inv)\s*\(", src, flags=re.IGNORECASE):
+    if re.search(r"\blinalg_(solve|det|inv|eig|svd)\s*\(", src, flags=re.IGNORECASE):
         lapack_src = Path("lapack_d.f90")
         lapack_s = str(lapack_src)
         if lapack_src.exists():
