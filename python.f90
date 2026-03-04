@@ -16,8 +16,15 @@ public :: random_choice_norep !@pyapi kind=subroutine args=npop:integer:intent(i
 public :: random_choice_prob !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in 0..size(p)-1 with probabilities p"
 public :: sort_real_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(inout) desc="sort real vector x in ascending order"
 public :: argsort_real !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),idx:integer(:):intent(out) desc="argsort indices (0-based) of real vector"
+public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:intent(in),stop:integer:intent(in),step:integer:intent(in) desc="integer arange(start, stop, step)"
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
 public :: var_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
+public :: zeros_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 0"
+public :: ones_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 1"
+public :: zeros_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) desc="allocate and return length-n integer array initialized to 0"
+public :: ones_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) desc="allocate and return length-n integer array initialized to 1"
+public :: zeros_logical !@pyapi kind=function ret=logical(:) args=n:integer:intent(in) desc="allocate and return length-n logical array initialized to .false."
+public :: ones_logical !@pyapi kind=function ret=logical(:) args=n:integer:intent(in) desc="allocate and return length-n logical array initialized to .true."
 public :: strvec_t !@pyapi kind=type desc="string vector helper type"
 public :: to_lower !@pyapi kind=function ret=character args=s:character:intent(in) desc="lowercase string"
 public :: to_upper !@pyapi kind=function ret=character args=s:character:intent(in) desc="uppercase string"
@@ -36,6 +43,63 @@ public :: str_isdigit !@pyapi kind=function ret=logical args=s:character:intent(
 public :: str_isalpha !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are letters"
 public :: str_isalnum !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are alnum"
 public :: str_isspace !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are whitespace"
+
+public :: cumsum_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative sum of real vector"
+public :: unique_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="sorted unique values of integer vector"
+public :: tile_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="tile integer vector reps times"
+public :: diag_from_vec_int !@pyapi kind=function ret=integer(:,:) args=v:integer(:):intent(in) desc="return diagonal matrix from integer vector"
+public :: cumprod_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative product of integer vector"
+public :: repeat_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),reps:integer:intent(in) desc="repeat each integer element reps times"
+public :: diag_from_mat_real !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) desc="return main diagonal of real matrix"
+public :: cumsum_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative sum of integer vector"
+public :: diag_from_vec_real !@pyapi kind=function ret=real(dp)(:,:) args=v:real(dp)(:):intent(in) desc="return diagonal matrix from real vector"
+public :: repeat_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="repeat each real element reps times"
+public :: diag_from_mat_int !@pyapi kind=function ret=integer(:) args=a:integer(:,:):intent(in) desc="return main diagonal of integer matrix"
+public :: tile_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="tile real vector reps times"
+public :: eye_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in):optional desc="return n x m identity-like matrix (default m=n)"
+public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="sorted unique values of real vector"
+public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
+
+public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
+public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
+public :: std !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="standard deviation of 1D real vector with optional ddof (numpy-style)"
+public :: log2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="base-2 logarithm"
+public :: cumsum
+public :: cumprod
+public :: eye
+public :: diag
+public :: repeat
+public :: tile
+public :: unique
+
+interface cumsum
+   module procedure cumsum_real, cumsum_int
+end interface cumsum
+
+interface cumprod
+   module procedure cumprod_real, cumprod_int
+end interface cumprod
+
+interface eye
+   module procedure eye_real
+end interface eye
+
+interface diag
+   module procedure diag_from_vec_real, diag_from_mat_real
+   module procedure diag_from_vec_int, diag_from_mat_int
+end interface diag
+
+interface repeat
+   module procedure repeat_real, repeat_int
+end interface repeat
+
+interface tile
+   module procedure tile_real, tile_int
+end interface tile
+
+interface unique
+   module procedure unique_real, unique_int
+end interface unique
 
 contains
 
@@ -226,6 +290,31 @@ contains
          end do
       end subroutine argsort_real
 
+      function arange_int(start, stop, step) result(x)
+         integer, intent(in) :: start, stop, step
+         integer, allocatable :: x(:)
+         integer :: n, i, s
+         s = step
+         if (s == 0) error stop 'arange_int: step cannot be zero'
+         if (s > 0) then
+            if (stop <= start) then
+               n = 0
+            else
+               n = (stop - start + s - 1) / s
+            end if
+         else
+            if (stop >= start) then
+               n = 0
+            else
+               n = (start - stop + (-s) - 1) / (-s)
+            end if
+         end if
+         allocate(x(n))
+         do i = 1, n
+            x(i) = start + (i - 1) * s
+         end do
+      end function arange_int
+
       pure real(kind=dp) function mean_1d(x)
          real(kind=dp), intent(in) :: x(:)
          if (size(x) <= 0) then
@@ -253,6 +342,48 @@ contains
          mu = mean_1d(x)
          var_1d = sum((x - mu)**2) / real(n - d, kind=dp)
       end function var_1d
+
+      function zeros_real(n) result(x)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: x(:)
+         if (n < 0) error stop 'zeros_real: n must be >= 0'
+         allocate(x(n), source=0.0_dp)
+      end function zeros_real
+
+      function ones_real(n) result(x)
+         integer, intent(in) :: n
+         real(kind=dp), allocatable :: x(:)
+         if (n < 0) error stop 'ones_real: n must be >= 0'
+         allocate(x(n), source=1.0_dp)
+      end function ones_real
+
+      function zeros_int(n) result(x)
+         integer, intent(in) :: n
+         integer, allocatable :: x(:)
+         if (n < 0) error stop 'zeros_int: n must be >= 0'
+         allocate(x(n), source=0)
+      end function zeros_int
+
+      function ones_int(n) result(x)
+         integer, intent(in) :: n
+         integer, allocatable :: x(:)
+         if (n < 0) error stop 'ones_int: n must be >= 0'
+         allocate(x(n), source=1)
+      end function ones_int
+
+      function zeros_logical(n) result(x)
+         integer, intent(in) :: n
+         logical, allocatable :: x(:)
+         if (n < 0) error stop 'zeros_logical: n must be >= 0'
+         allocate(x(n), source=.false.)
+      end function zeros_logical
+
+      function ones_logical(n) result(x)
+         integer, intent(in) :: n
+         logical, allocatable :: x(:)
+         if (n < 0) error stop 'ones_logical: n must be >= 0'
+         allocate(x(n), source=.true.)
+      end function ones_logical
 
       pure character(len=len(s)) function to_lower(s)
          character(len=*), intent(in) :: s
@@ -604,5 +735,284 @@ contains
          end do
          str_isspace = .true.
       end function str_isspace
+
+      function cumsum_real(x) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: y(:)
+         integer :: i, n
+         n = size(x)
+         allocate(y(1:n))
+         if (n >= 1) then
+            y(1) = x(1)
+            do i = 2, n
+               y(i) = y(i-1) + x(i)
+            end do
+         end if
+      end function cumsum_real
+
+      function unique_int(x) result(y)
+         integer, intent(in) :: x(:)
+         integer, allocatable :: y(:)
+         integer, allocatable :: tmp(:)
+         integer :: i, j, n, m, key
+         n = size(x)
+         allocate(tmp(1:n))
+         tmp = x
+         do i = 2, n
+            key = tmp(i)
+            j = i - 1
+            do while (j >= 1 .and. tmp(j) > key)
+               tmp(j+1) = tmp(j)
+               j = j - 1
+            end do
+            tmp(j+1) = key
+         end do
+         m = 0
+         do i = 1, n
+            if (i == 1 .or. tmp(i) /= tmp(i-1)) m = m + 1
+         end do
+         allocate(y(1:m))
+         m = 0
+         do i = 1, n
+            if (i == 1 .or. tmp(i) /= tmp(i-1)) then
+               m = m + 1
+               y(m) = tmp(i)
+            end if
+         end do
+         deallocate(tmp)
+      end function unique_int
+
+      function tile_int(x, reps) result(y)
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: reps
+         integer, allocatable :: y(:)
+         integer :: n, r, k, i1, i2
+         n = size(x)
+         r = max(0, reps)
+         allocate(y(1:n*r))
+         do k = 1, r
+            i1 = (k - 1) * n + 1
+            i2 = k * n
+            y(i1:i2) = x
+         end do
+      end function tile_int
+
+      function diag_from_vec_int(v) result(x)
+         integer, intent(in) :: v(:)
+         integer, allocatable :: x(:,:)
+         integer :: i, n
+         n = size(v)
+         allocate(x(1:n,1:n), source=0)
+         do i = 1, n
+            x(i,i) = v(i)
+         end do
+      end function diag_from_vec_int
+
+      function cumprod_int(x) result(y)
+         integer, intent(in) :: x(:)
+         integer, allocatable :: y(:)
+         integer :: i, n
+         n = size(x)
+         allocate(y(1:n))
+         if (n >= 1) then
+            y(1) = x(1)
+            do i = 2, n
+               y(i) = y(i-1) * x(i)
+            end do
+         end if
+      end function cumprod_int
+
+      function repeat_int(x, reps) result(y)
+         integer, intent(in) :: x(:)
+         integer, intent(in) :: reps
+         integer, allocatable :: y(:)
+         integer :: i, j, n, r, k
+         n = size(x)
+         r = max(0, reps)
+         allocate(y(1:n*r))
+         k = 0
+         do i = 1, n
+            do j = 1, r
+               k = k + 1
+               y(k) = x(i)
+            end do
+         end do
+      end function repeat_int
+
+      function diag_from_mat_real(a) result(v)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable :: v(:)
+         integer :: i, n
+         n = min(size(a,1), size(a,2))
+         allocate(v(1:n))
+         do i = 1, n
+            v(i) = a(i,i)
+         end do
+      end function diag_from_mat_real
+
+      function cumsum_int(x) result(y)
+         integer, intent(in) :: x(:)
+         integer, allocatable :: y(:)
+         integer :: i, n
+         n = size(x)
+         allocate(y(1:n))
+         if (n >= 1) then
+            y(1) = x(1)
+            do i = 2, n
+               y(i) = y(i-1) + x(i)
+            end do
+         end if
+      end function cumsum_int
+
+      function diag_from_vec_real(v) result(x)
+         real(kind=dp), intent(in) :: v(:)
+         real(kind=dp), allocatable :: x(:,:)
+         integer :: i, n
+         n = size(v)
+         allocate(x(1:n,1:n), source=0.0_dp)
+         do i = 1, n
+            x(i,i) = v(i)
+         end do
+      end function diag_from_vec_real
+
+      function repeat_real(x, reps) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: reps
+         real(kind=dp), allocatable :: y(:)
+         integer :: i, j, n, r, k
+         n = size(x)
+         r = max(0, reps)
+         allocate(y(1:n*r))
+         k = 0
+         do i = 1, n
+            do j = 1, r
+               k = k + 1
+               y(k) = x(i)
+            end do
+         end do
+      end function repeat_real
+
+      function diag_from_mat_int(a) result(v)
+         integer, intent(in) :: a(:,:)
+         integer, allocatable :: v(:)
+         integer :: i, n
+         n = min(size(a,1), size(a,2))
+         allocate(v(1:n))
+         do i = 1, n
+            v(i) = a(i,i)
+         end do
+      end function diag_from_mat_int
+
+      function tile_real(x, reps) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in) :: reps
+         real(kind=dp), allocatable :: y(:)
+         integer :: n, r, k, i1, i2
+         n = size(x)
+         r = max(0, reps)
+         allocate(y(1:n*r))
+         do k = 1, r
+            i1 = (k - 1) * n + 1
+            i2 = k * n
+            y(i1:i2) = x
+         end do
+      end function tile_real
+
+      function eye_real(n, m) result(x)
+         integer, intent(in) :: n
+         integer, intent(in), optional :: m
+         real(kind=dp), allocatable :: x(:,:)
+         integer :: mm, i, k
+         mm = n
+         if (present(m)) mm = m
+         if (n < 0 .or. mm < 0) error stop "eye_real: dimensions must be >= 0"
+         allocate(x(1:n,1:mm), source=0.0_dp)
+         k = min(n, mm)
+         do i = 1, k
+            x(i,i) = 1.0_dp
+         end do
+      end function eye_real
+
+      function unique_real(x) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: y(:)
+         real(kind=dp), allocatable :: tmp(:)
+         integer :: i, n, m
+         n = size(x)
+         allocate(tmp(1:n))
+         tmp = x
+         call sort_real_vec(tmp)
+         m = 0
+         do i = 1, n
+            if (i == 1 .or. tmp(i) /= tmp(i-1)) m = m + 1
+         end do
+         allocate(y(1:m))
+         m = 0
+         do i = 1, n
+            if (i == 1 .or. tmp(i) /= tmp(i-1)) then
+               m = m + 1
+               y(m) = tmp(i)
+            end if
+         end do
+         deallocate(tmp)
+      end function unique_real
+
+      function cumprod_real(x) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), allocatable :: y(:)
+         integer :: i, n
+         n = size(x)
+         allocate(y(1:n))
+         if (n >= 1) then
+            y(1) = x(1)
+            do i = 2, n
+               y(i) = y(i-1) * x(i)
+            end do
+         end if
+      end function cumprod_real
+
+      pure real(kind=dp) function var(x, ddof)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: ddof
+         integer :: n, d
+         real(kind=dp) :: mu
+         n = size(x)
+         if (present(ddof)) then
+            d = ddof
+         else
+            d = 0
+         end if
+         if (n <= d .or. n <= 0) then
+            var = 0.0_dp
+            return
+         end if
+         mu = mean(x)
+         var = sum((x - mu)**2) / real(n - d, kind=dp)
+      end function var
+
+      pure real(kind=dp) function mean(x)
+         real(kind=dp), intent(in) :: x(:)
+         if (size(x) <= 0) then
+            mean = 0.0_dp
+         else
+            mean = sum(x) / real(size(x), kind=dp)
+         end if
+      end function mean
+
+      pure real(kind=dp) function std(x, ddof)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: ddof
+         if (present(ddof)) then
+            std = sqrt(var(x, ddof))
+         else
+            std = sqrt(var(x))
+         end if
+      end function std
+
+      pure elemental real(kind=dp) function log2(x)
+         real(kind=dp), intent(in) :: x
+         real(kind=dp), parameter :: log2_base = log(2.0_dp)
+         log2 = log(x) / log2_base
+      end function log2
 
 end module python_mod
