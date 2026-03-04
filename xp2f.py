@@ -1517,6 +1517,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.BinOp):
             if isinstance(node.op, ast.Div):
                 return "real"
+            if isinstance(node.op, (ast.BitAnd, ast.BitOr)):
+                return "logical"
             lk = self._expr_kind(node.left)
             rk = self._expr_kind(node.right)
             if lk == "real" or rk == "real":
@@ -2439,7 +2441,18 @@ class translator(ast.NodeVisitor):
 
         if isinstance(node, ast.BinOp):
             op = type(node.op)
-            opmap = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/", ast.FloorDiv: "/", ast.Mod: "mod", ast.Pow: "**", ast.MatMult: "matmul"}
+            opmap = {
+                ast.Add: "+",
+                ast.Sub: "-",
+                ast.Mult: "*",
+                ast.Div: "/",
+                ast.FloorDiv: "/",
+                ast.Mod: "mod",
+                ast.Pow: "**",
+                ast.MatMult: "matmul",
+                ast.BitAnd: ".and.",
+                ast.BitOr: ".or.",
+            }
             if op not in opmap:
                 raise NotImplementedError("unsupported binop")
             a0 = self.expr(node.left)
