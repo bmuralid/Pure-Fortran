@@ -794,6 +794,19 @@ def detect_needed_helpers(tree):
                 needed.update(np_helper_map[node.func.attr])
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "linalg"
+            ):
+                if node.func.attr == "solve":
+                    needed.add("linalg_solve")
+                elif node.func.attr == "det":
+                    needed.add("linalg_det")
+                elif node.func.attr == "inv":
+                    needed.add("linalg_inv")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "trace"
@@ -2188,6 +2201,12 @@ class translator(ast.NodeVisitor):
                     if (r1 == 2 and r2 == 1) or (r1 == 1 and r2 == 2):
                         return 1
                     return 0
+                if node.func.attr == "solve" and len(node.args) >= 2:
+                    return self._rank_expr(node.args[1])
+                if node.func.attr == "det" and len(node.args) >= 1:
+                    return 0
+                if node.func.attr == "inv" and len(node.args) >= 1:
+                    return 2
                 if node.func.attr == "trace" and len(node.args) >= 1:
                     return 0
                 if node.func.attr == "outer" and len(node.args) >= 2:
@@ -2260,6 +2279,19 @@ class translator(ast.NodeVisitor):
                     if axis_node is None:
                         return 0
                     return r0 if keepdims else max(0, r0 - 1)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "linalg"
+            ):
+                if node.func.attr == "solve" and len(node.args) >= 2:
+                    return self._rank_expr(node.args[1])
+                if node.func.attr == "det" and len(node.args) >= 1:
+                    return 0
+                if node.func.attr == "inv" and len(node.args) >= 1:
+                    return 2
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3184,6 +3216,36 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "dot" and self._rank_expr(node.args[0]) == 1 and self._rank_expr(node.args[1]) == 1:
                     return f"dot_product({a0}, {a1})"
                 return f"matmul({a0}, {a1})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "solve"
+                and len(node.args) >= 2
+            ):
+                return f"linalg_solve({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "det"
+                and len(node.args) >= 1
+            ):
+                return f"linalg_det({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "inv"
+                and len(node.args) >= 1
+            ):
+                return f"linalg_inv({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -7081,6 +7143,17 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
                 missing_modules.append((mod, str(cand)))
         else:
             missing_modules.append((mod, ""))
+
+    # LAPACK linkage support for numpy.linalg wrappers in python_mod.
+    if re.search(r"\blinalg_(solve|det|inv)\s*\(", src, flags=re.IGNORECASE):
+        lapack_src = Path("lapack_d.f90")
+        lapack_s = str(lapack_src)
+        if lapack_src.exists():
+            if lapack_s not in helper_files:
+                helper_files.append(lapack_s)
+                auto_added.append(lapack_s)
+        else:
+            missing_modules.append(("lapack_d_external", lapack_s))
     return helper_files, auto_added, missing_modules
 
 
