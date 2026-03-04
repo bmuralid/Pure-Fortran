@@ -1887,6 +1887,8 @@ class translator(ast.NodeVisitor):
                 return None
             if isinstance(node.func, ast.Name) and node.func.id in {"reshape", "spread"} and len(node.args) >= 1:
                 return f"size({self.expr(node.args[0])})"
+            if isinstance(node.func, ast.Name) and node.func.id in {"real", "int", "float"} and len(node.args) >= 1:
+                return self._extent_expr(node.args[0])
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id in self.local_return_specs
@@ -2081,6 +2083,12 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "identity":
                     return 2
                 if node.func.attr in {"zeros", "ones"}:
+                    if len(node.args) >= 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
+                        return max(1, len(node.args[0].elts))
+                    return 1
+                if node.func.attr == "full" and len(node.args) >= 1:
+                    if isinstance(node.args[0], (ast.Tuple, ast.List)):
+                        return max(1, len(node.args[0].elts))
                     return 1
                 if node.func.attr in {"zeros_like", "ones_like"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
@@ -3258,6 +3266,19 @@ class translator(ast.NodeVisitor):
                 return f"size({self.expr(node.value)})"
             if node.attr == "T":
                 return f"transpose({self.expr(node.value)})"
+            if node.attr == "shape":
+                return f"shape({self.expr(node.value)})"
+            if node.attr == "dtype":
+                # Approximate NumPy dtype text from inferred symbol kind.
+                if isinstance(node.value, ast.Name):
+                    nm = node.value.id
+                    if nm in self.alloc_ints or nm in self.ints:
+                        return fstr("int")
+                    if nm in self.alloc_reals or nm in self.reals:
+                        return fstr("float")
+                    if nm in self.alloc_logs:
+                        return fstr("bool")
+                return fstr("unknown")
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "pi":
                 return "acos(-1.0_dp)"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "inf":
@@ -3378,6 +3399,16 @@ class translator(ast.NodeVisitor):
                     ext = self._extent_expr(v)
                     k = self._expr_kind(v)
                     rk = max(1, self._rank_expr(v))
+                    if self._rank_expr(v) > 0:
+                        if k == "real":
+                            self._mark_alloc_real(t.id, rank=rk)
+                        elif k == "logical":
+                            self._mark_alloc_log(t.id, rank=rk)
+                        elif k == "int":
+                            self._mark_alloc_int(t.id, rank=rk)
+                        else:
+                            self._mark_alloc_real(t.id, rank=rk)
+                        continue
                     if ext is not None:
                         if k == "real":
                             self._mark_alloc_real(t.id, rank=rk)
@@ -3521,11 +3552,11 @@ class translator(ast.NodeVisitor):
                             ):
                                 dtype_txt = kw.value.attr.lower()
                     if "bool" in dtype_txt:
-                        self._mark_alloc_log(t.id)
+                        self._mark_alloc_log(t.id, rank=rank_hint)
                     elif "float" in dtype_txt:
                         self._mark_alloc_real(t.id, rank=rank_hint)
                     else:
-                        self._mark_alloc_int(t.id)
+                        self._mark_alloc_int(t.id, rank=rank_hint)
 
                 # np.full(shape, value, dtype=...)
                 if (
@@ -3538,6 +3569,9 @@ class translator(ast.NodeVisitor):
                     and len(v.args) >= 2
                 ):
                     dtype_txt = ""
+                    rank_hint = 1
+                    if isinstance(v.args[0], (ast.Tuple, ast.List)):
+                        rank_hint = max(1, len(v.args[0].elts))
                     for kw in v.keywords:
                         if kw.arg == "dtype":
                             if isinstance(kw.value, ast.Name):
@@ -3550,19 +3584,19 @@ class translator(ast.NodeVisitor):
                                 dtype_txt = kw.value.attr.lower()
                     if dtype_txt:
                         if "float" in dtype_txt:
-                            self._mark_alloc_real(t.id)
+                            self._mark_alloc_real(t.id, rank=rank_hint)
                         elif "bool" in dtype_txt:
-                            self._mark_alloc_log(t.id)
+                            self._mark_alloc_log(t.id, rank=rank_hint)
                         else:
-                            self._mark_alloc_int(t.id)
+                            self._mark_alloc_int(t.id, rank=rank_hint)
                     else:
                         kfill = self._expr_kind(v.args[1])
                         if kfill == "real":
-                            self._mark_alloc_real(t.id)
+                            self._mark_alloc_real(t.id, rank=rank_hint)
                         elif kfill == "logical":
-                            self._mark_alloc_log(t.id)
+                            self._mark_alloc_log(t.id, rank=rank_hint)
                         else:
-                            self._mark_alloc_int(t.id)
+                            self._mark_alloc_int(t.id, rank=rank_hint)
 
                 # np.eye(...)
                 if (
@@ -3597,21 +3631,26 @@ class translator(ast.NodeVisitor):
                     and v.func.attr in {"zeros", "ones", "zeros_like", "ones_like"}
                 ):
                     dtype_txt = self._np_dtype_text(v)
+                    rank_hint = 1
+                    if v.func.attr in {"zeros", "ones"} and len(v.args) >= 1 and isinstance(v.args[0], (ast.Tuple, ast.List)):
+                        rank_hint = max(1, len(v.args[0].elts))
+                    elif v.func.attr in {"zeros_like", "ones_like"} and len(v.args) >= 1:
+                        rank_hint = max(1, self._rank_expr(v.args[0]))
                     if v.func.attr in {"zeros_like", "ones_like"} and len(v.args) >= 1 and not dtype_txt:
                         k0 = self._expr_kind(v.args[0])
                         if k0 == "int":
-                            self._mark_alloc_int(t.id)
+                            self._mark_alloc_int(t.id, rank=rank_hint)
                         elif k0 == "logical":
-                            self._mark_alloc_log(t.id)
+                            self._mark_alloc_log(t.id, rank=rank_hint)
                         else:
-                            self._mark_alloc_real(t.id)
+                            self._mark_alloc_real(t.id, rank=rank_hint)
                     else:
                         if "int" in dtype_txt:
-                            self._mark_alloc_int(t.id)
+                            self._mark_alloc_int(t.id, rank=rank_hint)
                         elif "bool" in dtype_txt:
-                            self._mark_alloc_log(t.id)
+                            self._mark_alloc_log(t.id, rank=rank_hint)
                         else:
-                            self._mark_alloc_real(t.id)
+                            self._mark_alloc_real(t.id, rank=rank_hint)
 
                 # np.triu(...) / np.tril(...)
                 if (
@@ -4603,6 +4642,40 @@ class translator(ast.NodeVisitor):
             else:
                 dims = f"1:{self.expr(shp)}"
             self.o.w(f"allocate({name}({dims}))")
+            return
+
+        # np.zeros(shape, dtype=...) / np.ones(shape, dtype=...)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr in {"zeros", "ones"}
+            and len(v.args) >= 1
+        ):
+            name = t.id
+            shp = v.args[0]
+            fill_expr = "0"
+            dtype_txt = self._np_dtype_text(v)
+            if "float" in dtype_txt or (name in self.alloc_reals):
+                fill_expr = "0.0_dp"
+            elif "bool" in dtype_txt:
+                fill_expr = ".false."
+            if v.func.attr == "ones":
+                if "float" in dtype_txt or (name in self.alloc_reals):
+                    fill_expr = "1.0_dp"
+                elif "bool" in dtype_txt:
+                    fill_expr = ".true."
+                else:
+                    fill_expr = "1"
+            self.o.w(f"if (allocated({name})) deallocate({name})")
+            if isinstance(shp, (ast.Tuple, ast.List)):
+                dims = ", ".join(f"1:{self.expr(e)}" for e in shp.elts)
+            else:
+                dims = f"1:{self.expr(shp)}"
+            self.o.w(f"allocate({name}({dims}))")
+            self.o.w(f"{name} = {fill_expr}")
             return
 
         # np.full(shape, value, dtype=...)
@@ -5834,9 +5907,13 @@ def _emit_local_function(
                 dims = ",".join(":" for _ in range(rr))
                 o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_ints:
-                o.w(f"integer, allocatable, intent(out) :: {nm}(:)")
+                rr = max(1, tr.alloc_int_rank.get(nm, 1))
+                dims = ",".join(":" for _ in range(rr))
+                o.w(f"integer, allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_logs:
-                o.w(f"logical, allocatable, intent(out) :: {nm}(:)")
+                rr = max(1, tr.alloc_log_rank.get(nm, 1))
+                dims = ",".join(":" for _ in range(rr))
+                o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.reals:
                 o.w(f"real(kind=dp), intent(out) :: {nm}")
             else:
