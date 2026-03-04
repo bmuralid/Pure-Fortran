@@ -11,6 +11,7 @@ import glob
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -28,7 +29,16 @@ def _has_glob_meta(s: str) -> bool:
     return any(ch in s for ch in "*?[]")
 
 
-def _expand_inputs(items: List[str]) -> List[Path]:
+def _is_generated_typed_file(p: Path) -> bool:
+    stem = p.stem.lower()
+    if stem.endswith("_typed"):
+        return True
+    if "_typed_typed" in stem:
+        return True
+    return False
+
+
+def _expand_inputs(items: List[str], *, exclude_generated_typed: bool = False) -> List[Path]:
     out: List[Path] = []
     seen = set()
     for it in items:
@@ -49,6 +59,8 @@ def _expand_inputs(items: List[str]) -> List[Path]:
             if p.suffix.lower() != ".py":
                 continue
             if p.exists():
+                if exclude_generated_typed and _is_generated_typed_file(p):
+                    continue
                 k = str(p.resolve()).lower()
                 if k not in seen:
                     seen.add(k)
@@ -57,6 +69,7 @@ def _expand_inputs(items: List[str]) -> List[Path]:
 
 
 def main() -> int:
+    t0 = time.perf_counter()
     ap = argparse.ArgumentParser(
         description="Run xp2f.py on multiple Python files/globs (transpile + run each)."
     )
@@ -73,14 +86,16 @@ def main() -> int:
         help='Compiler command forwarded to xp2f.py --compiler.',
     )
     ap.add_argument("--flat", action="store_true", help="Forward --flat to xp2f.py.")
+    ap.add_argument("--type", action="store_true", help="Forward --type to xp2f.py.")
     ap.add_argument("--comment", action="store_true", help="Forward --comment to xp2f.py.")
     ap.add_argument("--run-diff", action="store_true", help="Forward --run-diff to xp2f.py.")
     ap.add_argument("--time-both", action="store_true", help="Forward --time-both to xp2f.py.")
+    ap.add_argument("--pretty", action="store_true", help="Forward --pretty to xp2f.py.")
     ap.add_argument("--maxfail", type=int, default=0, help="Stop after this many failures (0 = no limit).")
     ap.add_argument("--verbose", action="store_true", help="Print full xp2f output for PASS cases too.")
     args = ap.parse_args()
 
-    py_files = _expand_inputs(args.inputs)
+    py_files = _expand_inputs(args.inputs, exclude_generated_typed=args.type)
     if not py_files:
         print("No Python files matched the provided inputs.")
         return 1
@@ -99,12 +114,16 @@ def main() -> int:
         cmd = [sys.executable, str(xp2f_path), rel, *args.helpers, "--run", "--compiler", args.compiler]
         if args.flat:
             cmd.append("--flat")
+        if args.type:
+            cmd.append("--type")
         if args.comment:
             cmd.append("--comment")
         if args.run_diff:
             cmd.append("--run-diff")
         if args.time_both:
             cmd.append("--time-both")
+        if args.pretty:
+            cmd.append("--pretty")
 
         print(f"[{i}/{total}] {rel}")
         cp = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="ignore")
@@ -134,12 +153,18 @@ def main() -> int:
 
     print("")
     print("Summary:")
-    print("source\tstatus\trc")
+    src_w = max(len("source"), *(len(r.source) for r in results)) if results else len("source")
+    st_w = max(len("status"), *(len(r.status) for r in results)) if results else len("status")
+    rc_w = max(len("rc"), *(len(str(r.rc)) for r in results)) if results else len("rc")
+    header = f"{'source':<{src_w}}  {'status':<{st_w}}  {'rc':>{rc_w}}"
+    print(header)
     for r in results:
-        print(f"{r.source}\t{r.status}\t{r.rc}")
+        print(f"{r.source:<{src_w}}  {r.status:<{st_w}}  {r.rc:>{rc_w}}")
     n_pass = sum(1 for r in results if r.ok)
     n_fail = len(results) - n_pass
     print(f"Totals: {len(results)} files, {n_pass} pass, {n_fail} fail")
+    elapsed = time.perf_counter() - t0
+    print(f"Elapsed: {elapsed:.3f} s")
     return 0 if n_fail == 0 else 1
 
 
