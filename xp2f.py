@@ -3308,6 +3308,41 @@ class translator(ast.NodeVisitor):
                     return self._shape_anchor_2d(c)
         return self.expr(node)
 
+    def _reshape_dims_exprs(self, arr_expr, dim_nodes):
+        """
+        Build Fortran shape expressions for reshape(...), supporting one
+        NumPy-style inferred dimension (-1).
+        """
+        dims = []
+        infer_pos = []
+        def _is_infer_minus_one(n):
+            if isinstance(n, ast.Constant) and isinstance(n.value, int) and int(n.value) == -1:
+                return True
+            return (
+                isinstance(n, ast.UnaryOp)
+                and isinstance(n.op, ast.USub)
+                and isinstance(n.operand, ast.Constant)
+                and isinstance(n.operand.value, int)
+                and int(n.operand.value) == 1
+            )
+        for i, dn in enumerate(dim_nodes):
+            if _is_infer_minus_one(dn):
+                dims.append(None)
+                infer_pos.append(i)
+            else:
+                dims.append(self.expr(dn))
+        if len(infer_pos) > 1:
+            raise NotImplementedError("reshape supports at most one inferred (-1) dimension")
+        if len(infer_pos) == 1:
+            others = [d for d in dims if d is not None]
+            if others:
+                denom = " * ".join(f"int({d})" for d in others)
+                inferred = f"(size({arr_expr}) / ({denom}))"
+            else:
+                inferred = f"size({arr_expr})"
+            dims[infer_pos[0]] = inferred
+        return dims
+
     def _decl_rank_expr(self, node):
         """Rank from declarations/allocs only (ignores broadcast row/col markers)."""
         if isinstance(node, ast.Name):
@@ -4048,6 +4083,22 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "reshape"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                if isinstance(node.args[1], (ast.Tuple, ast.List)):
+                    dim_nodes = list(node.args[1].elts)
+                else:
+                    dim_nodes = list(node.args[1:])
+                if not dim_nodes:
+                    raise NotImplementedError("np.reshape requires shape arguments")
+                dims = ", ".join(self._reshape_dims_exprs(a0, dim_nodes))
+                return f"reshape({a0}, [{dims}])"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr in {"zeros", "ones"}
                 and len(node.args) >= 1
             ):
@@ -4712,10 +4763,10 @@ class translator(ast.NodeVisitor):
                 arr = self.expr(node.func.value)
                 if node.func.attr == "reshape":
                     if len(node.args) == 1 and isinstance(node.args[0], (ast.Tuple, ast.List)):
-                        dims = ", ".join(self.expr(e) for e in node.args[0].elts)
+                        dims = ", ".join(self._reshape_dims_exprs(arr, list(node.args[0].elts)))
                         return f"reshape({arr}, [{dims}])"
                     if len(node.args) >= 1:
-                        dims = ", ".join(self.expr(e) for e in node.args)
+                        dims = ", ".join(self._reshape_dims_exprs(arr, list(node.args)))
                         return f"reshape({arr}, [{dims}])"
                     raise NotImplementedError("reshape requires shape arguments")
                 if node.func.attr == "astype":
