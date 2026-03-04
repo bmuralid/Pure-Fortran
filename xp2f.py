@@ -1798,6 +1798,8 @@ class translator(ast.NodeVisitor):
                 if "int" in dtype_txt:
                     return "int"
                 return self._expr_kind(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
+                return self._expr_kind(node.func.value)
             if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
                 if node.func.attr == "copy" and len(node.args) == 0:
                     return self._expr_kind(node.func.value)
@@ -1889,6 +1891,8 @@ class translator(ast.NodeVisitor):
                 return f"size({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id in {"real", "int", "float"} and len(node.args) >= 1:
                 return self._extent_expr(node.args[0])
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
+                return f"size({self.expr(node.func.value)})"
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id in self.local_return_specs
@@ -2182,6 +2186,8 @@ class translator(ast.NodeVisitor):
                 return self._rank_expr(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "astype":
                 return self._rank_expr(node.func.value)
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
+                return 1
         return 0
 
     def _is_row2_expr(self, node):
@@ -2533,6 +2539,9 @@ class translator(ast.NodeVisitor):
                     return f"{base}(:, ({self.expr(a1)} + 1))"
                 if full1 and (not full0) and (not none0):
                     return f"{base}(({self.expr(a0)} + 1), :)"
+                # Scalar 2D indexing: a[i, j] -> a(i+1, j+1)
+                if (not isinstance(a0, ast.Slice)) and (not isinstance(a1, ast.Slice)) and (not none0) and (not none1):
+                    return f"{base}(({self.expr(a0)} + 1), ({self.expr(a1)} + 1))"
                 raise NotImplementedError("only [None,:] and [:,None] tuple subscripts are supported")
             # Python emitters in this project use 0-based forms like (i)-1;
             # map those back to natural Fortran 1-based indexing.
@@ -2609,6 +2618,8 @@ class translator(ast.NodeVisitor):
                         return f"var_1d({base_expr})"
                     return f"var_1d({base_expr}, {self.expr(ddof_node)})"
                 if attr == "ravel":
+                    return f"reshape({base_expr}, [size({base_expr})])"
+                if attr == "flatten":
                     return f"reshape({base_expr}, [size({base_expr})])"
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
