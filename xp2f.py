@@ -2270,7 +2270,10 @@ class translator(ast.NodeVisitor):
                 if node.func.attr in {"triu", "tril"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "stack" and len(node.args) >= 1:
-                    return max(1, self._rank_expr(node.args[0]))
+                    seq = node.args[0]
+                    if isinstance(seq, (ast.Tuple, ast.List)) and len(seq.elts) >= 1:
+                        return max(1, self._rank_expr(seq.elts[0]) + 1)
+                    return max(1, self._rank_expr(node.args[0]) + 1)
                 if node.func.attr in {"sum", "max", "min"} and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
                     axis_node = None
@@ -3124,11 +3127,35 @@ class translator(ast.NodeVisitor):
                 vals = ", ".join(self.expr(e) for e in seq.elts)
                 n = len(seq.elts)
                 first = self.expr(seq.elts[0])
-                if axis == 1:
+                r0 = self._rank_expr(seq.elts[0])
+                if r0 <= 1:
+                    if axis < 0:
+                        axis = axis + 2
+                    if axis < 0 or axis > 1:
+                        raise NotImplementedError("np.stack axis out of range for 1D inputs")
+                    if axis == 1:
+                        return f"reshape([{vals}], [size({first}), {n}])"
                     return f"transpose(reshape([{vals}], [size({first}), {n}]))"
-                if axis == 0:
-                    return f"reshape([{vals}], [size({first}), {n}])"
-                raise NotImplementedError("np.stack currently supports axis 0 or 1")
+                # rank>=2: build stacked-last array then permute axis with RESHAPE order
+                if axis < 0:
+                    axis = axis + (r0 + 1)
+                if axis < 0 or axis > r0:
+                    raise NotImplementedError("np.stack axis out of range")
+                src_shape = ", ".join([f"size({first},{i})" for i in range(1, r0 + 1)] + [str(n)])
+                src = f"reshape([{vals}], [{src_shape}])"
+                if axis == r0:
+                    return src
+                perm = list(range(1, r0 + 1))
+                perm.insert(axis, r0 + 1)
+                tgt_shape_parts = []
+                for p in perm:
+                    if p == r0 + 1:
+                        tgt_shape_parts.append(str(n))
+                    else:
+                        tgt_shape_parts.append(f"size({first},{p})")
+                tgt_shape = ", ".join(tgt_shape_parts)
+                ordp = ", ".join(str(p) for p in perm)
+                return f"reshape({src}, [{tgt_shape}], order=[{ordp}])"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
