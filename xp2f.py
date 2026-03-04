@@ -1065,6 +1065,87 @@ def collect_vectorize_aliases(tree, local_funcs=None):
     return aliases
 
 
+def collect_structured_dtype_info(tree):
+    """Collect simple structured dtypes and arrays built from them."""
+    dtype_vars = {}
+    struct_types = {}
+    struct_arrays = {}
+    struct_dtype_strings = {}
+
+    def _kind_from_dtype_node(n):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "np":
+            a = n.attr.lower()
+            if "int" in a:
+                return "int"
+            if "float" in a or "double" in a:
+                return "real"
+            if "bool" in a:
+                return "logical"
+        if isinstance(n, ast.Name):
+            a = n.id.lower()
+            if "int" in a:
+                return "int"
+            if "float" in a or a == "double":
+                return "real"
+            if "bool" in a:
+                return "logical"
+        return None
+
+    def _parse_dtype_list(lst_node):
+        if not isinstance(lst_node, (ast.List, ast.Tuple)):
+            return None
+        fields = []
+        for e in lst_node.elts:
+            if not (isinstance(e, (ast.Tuple, ast.List)) and len(e.elts) >= 2):
+                return None
+            k = e.elts[0]
+            t = e.elts[1]
+            if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
+                return None
+            kk = _kind_from_dtype_node(t)
+            if kk is None:
+                return None
+            fields.append((k.value, kk))
+        return fields
+
+    for node in getattr(tree, "body", []):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+            continue
+        tname = node.targets[0].id
+        v = node.value
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr == "dtype"
+            and len(v.args) >= 1
+        ):
+            fields = _parse_dtype_list(v.args[0])
+            if fields:
+                type_name = f"{tname}_dtype_t"
+                dtype_vars[tname] = type_name
+                struct_types[type_name] = fields
+                spec_txt = ", ".join(f"{n}:{k}" for n, k in fields)
+                struct_dtype_strings[type_name] = f"structured[{spec_txt}]"
+            continue
+        if (
+            isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr == "array"
+        ):
+            dtype_var = None
+            for kw in v.keywords:
+                if kw.arg == "dtype" and isinstance(kw.value, ast.Name):
+                    dtype_var = kw.value.id
+                    break
+            if dtype_var is not None and dtype_var in dtype_vars:
+                struct_arrays[tname] = dtype_vars[dtype_var]
+    return struct_types, struct_arrays, struct_dtype_strings
+
+
 def detect_scalar_outputs(tree, params):
     # scalars appearing in f-strings in prints in the else-branch
     outs = set()
@@ -1904,6 +1985,9 @@ class translator(ast.NodeVisitor):
         tuple_return_out_kinds=None,
         dict_type_components=None,
         local_func_arg_ranks=None,
+        structured_type_components=None,
+        structured_array_types=None,
+        structured_dtype_strings=None,
     ):
         # context: "flat" | "compute" | "run_print"
         self.o = out
@@ -1935,6 +2019,9 @@ class translator(ast.NodeVisitor):
         self.dict_aliases = {}
         self.dict_type_components = dict(dict_type_components or {})
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
+        self.structured_type_components = dict(structured_type_components or {})
+        self.structured_array_types = dict(structured_array_types or {})
+        self.structured_dtype_strings = dict(structured_dtype_strings or {})
         self.dict_var_components = {}
         self.synthetic_slices = dict(translator.global_synthetic_slices)
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
@@ -2246,6 +2333,8 @@ class translator(ast.NodeVisitor):
             nm = self._aliased_name(node.id)
             if nm in self.dict_typed_vars:
                 return None
+            if nm in self.structured_array_types:
+                return None
             if nm in self.reals:
                 return "real"
             if nm in self.ints:
@@ -2294,6 +2383,10 @@ class translator(ast.NodeVisitor):
                 return "char"
             return None
         if isinstance(node, ast.Attribute):
+            if node.attr == "dtype" and isinstance(node.value, ast.Name):
+                nm = self._aliased_name(node.value.id)
+                if nm in self.structured_array_types:
+                    return "char"
             if node.attr == "size" and isinstance(node.value, ast.Name):
                 return "int"
             if node.attr in {"c_contiguous", "f_contiguous"}:
@@ -2331,6 +2424,17 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.BoolOp):
             return "logical"
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Name)
+                and self._aliased_name(node.value.id) in self.structured_array_types
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            ):
+                anm = self._aliased_name(node.value.id)
+                tnm = self.structured_array_types.get(anm, "")
+                for fnm, fkind in self.structured_type_components.get(tnm, []):
+                    if fnm == node.slice.value:
+                        return fkind
             if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.synthetic_slices
@@ -2930,6 +3034,13 @@ class translator(ast.NodeVisitor):
             return self._extent_expr(node.orelse)
         if isinstance(node, ast.Subscript):
             if (
+                isinstance(node.value, ast.Name)
+                and self._aliased_name(node.value.id) in self.structured_array_types
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            ):
+                return f"{self.expr(node.value)}%{node.slice.value}"
+            if (
                 isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
                 and isinstance(node.value.func.value, ast.Name)
@@ -3212,6 +3323,8 @@ class translator(ast.NodeVisitor):
     def _rank_expr(self, node):
         if isinstance(node, ast.Name):
             nm = self._aliased_name(node.id)
+            if nm in self.structured_array_types:
+                return 1
             if nm in self.broadcast_row2 or nm in self.broadcast_col2:
                 return 2
             if nm in self.alloc_reals:
@@ -3232,6 +3345,13 @@ class translator(ast.NodeVisitor):
                 return 2
             return 1
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Name)
+                and self._aliased_name(node.value.id) in self.structured_array_types
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            ):
+                return 1
             if (
                 isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
@@ -4050,6 +4170,13 @@ class translator(ast.NodeVisitor):
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Name)
+                and self._aliased_name(node.value.id) in self.structured_array_types
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)
+            ):
+                return f"{self.expr(node.value)}%{node.slice.value}"
             if (
                 isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
@@ -6030,6 +6157,11 @@ class translator(ast.NodeVisitor):
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
+            if node.attr == "dtype" and isinstance(node.value, ast.Name):
+                anm = self._aliased_name(node.value.id)
+                if anm in self.structured_array_types:
+                    tnm = self.structured_array_types[anm]
+                    return fstr(self.structured_dtype_strings.get(tnm, f"structured[{tnm}]"))
             if node.attr in {"c_contiguous", "f_contiguous"}:
                 if (
                     isinstance(node.value, ast.Attribute)
@@ -6045,7 +6177,7 @@ class translator(ast.NodeVisitor):
             if node.attr == "dtype":
                 # Approximate NumPy dtype text from inferred symbol kind.
                 if isinstance(node.value, ast.Name):
-                    nm = node.value.id
+                    nm = self._aliased_name(node.value.id)
                     if nm in self.alloc_ints or nm in self.ints:
                         return fstr("int")
                     if nm in self.alloc_reals or nm in self.reals:
@@ -6112,11 +6244,29 @@ class translator(ast.NodeVisitor):
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
                 ):
+                    if (
+                        isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Attribute)
+                        and isinstance(node.value.func.value, ast.Name)
+                        and node.value.func.value.id == "np"
+                        and node.value.func.attr == "dtype"
+                    ):
+                        continue
                     vec_target = self._vectorize_target_name(node.value)
                     if vec_target is not None:
                         alias = node.targets[0].id
                         self.vectorize_aliases[alias] = vec_target
                         translator.global_vectorize_aliases[alias] = vec_target
+                        continue
+                    anm = self._aliased_name(node.targets[0].id)
+                    if (
+                        anm in self.structured_array_types
+                        and isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Attribute)
+                        and isinstance(node.value.func.value, ast.Name)
+                        and node.value.func.value.id == "np"
+                        and node.value.func.attr == "array"
+                    ):
                         continue
                 if (
                     len(node.targets) == 1
@@ -7160,6 +7310,42 @@ class translator(ast.NodeVisitor):
                 self.vectorize_aliases[t.id] = vec_target
                 translator.global_vectorize_aliases[t.id] = vec_target
                 return
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr == "dtype"
+        ):
+            return
+        if (
+            isinstance(t, ast.Name)
+            and t.id in self.structured_array_types
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr == "array"
+        ):
+            if not v.args:
+                raise NotImplementedError("structured np.array requires initializer")
+            init = v.args[0]
+            if not isinstance(init, (ast.List, ast.Tuple)):
+                raise NotImplementedError("structured np.array currently requires literal list/tuple initializer")
+            tnm = self.structured_array_types[t.id]
+            fields = self.structured_type_components.get(tnm, [])
+            n = len(init.elts)
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            self.o.w(f"allocate({t.id}(1:{n}))")
+            for i, row in enumerate(init.elts, start=1):
+                if not isinstance(row, (ast.Tuple, ast.List)):
+                    raise NotImplementedError("structured np.array rows must be tuples/lists")
+                if len(row.elts) != len(fields):
+                    raise NotImplementedError("structured np.array row width does not match dtype")
+                for j, (fname, _fkind) in enumerate(fields):
+                    self.o.w(f"{t.id}({i})%{fname} = {self.expr(row.elts[j])}")
+            return
 
         # Shape-intent marker rewrites from NumPy axis insertion:
         # x = x[:, None] or x = x[None, :]
@@ -10026,7 +10212,8 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
 
 
 def generate_flat(
-    tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None
+    tree, stem, helper_uses, params, needed_helpers, list_counts, local_funcs=None, no_comment=False, known_pure_calls=None, comment_map=None,
+    structured_type_components=None, structured_array_types=None, structured_dtype_strings=None
 ):
     top_level_comment_map = _comment_map_for_top_level(tree, comment_map)
     def _infer_arg_rank_in_fn(fn, nm):
@@ -10166,6 +10353,21 @@ def generate_flat(
                 o.w(f"integer :: {cname}")
         o.pop()
         o.w(f"end type {tname}")
+    for tname, fields in sorted((structured_type_components or {}).items()):
+        if tname in emitted_types:
+            continue
+        emitted_types.add(tname)
+        o.w(f"type :: {tname}")
+        o.push()
+        for fname, fkind in fields:
+            if fkind == "real":
+                o.w(f"real(kind=dp) :: {fname}")
+            elif fkind == "logical":
+                o.w(f"logical :: {fname}")
+            else:
+                o.w(f"integer :: {fname}")
+        o.pop()
+        o.w(f"end type {tname}")
 
     for name, val in sorted(params.items()):
         o.w(f"integer, parameter :: {name} = {val} ! {const_comment(name, tree)}")
@@ -10182,6 +10384,9 @@ def generate_flat(
         tuple_return_out_kinds=tuple_return_out_kinds,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
+        structured_type_components=structured_type_components,
+        structured_array_types=structured_array_types,
+        structured_dtype_strings=structured_dtype_strings,
     )
     tr.prescan(tree.body)
     for st in tree.body:
@@ -10221,6 +10426,8 @@ def generate_flat(
         o.w("logical :: " + ", ".join(logs))
     for vname, tname in dict_type_vars:
         o.w(f"type({tname}) :: {vname}")
+    for vname, tname in sorted((structured_array_types or {}).items()):
+        o.w(f"type({tname}), allocatable :: {vname}(:)")
     for name in sorted(alloc_logs_set):
         rr = max(1, tr.alloc_log_rank.get(name, 1))
         dims = ",".join(":" for _ in range(rr))
@@ -10729,6 +10936,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
 
     params = find_parameters(effective_tree)
     translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
+    structured_type_components, structured_array_types, structured_dtype_strings = collect_structured_dtype_info(effective_tree)
     helper_scan_tree = effective_tree
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
@@ -10753,6 +10961,9 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
             no_comment=no_comment,
             known_pure_calls=pure_helpers,
             comment_map=comment_map,
+            structured_type_components=structured_type_components,
+            structured_array_types=structured_array_types,
+            structured_dtype_strings=structured_dtype_strings,
         )
         used_flat_fallback = False
     else:
@@ -10775,6 +10986,9 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
                 no_comment=no_comment,
                 known_pure_calls=pure_helpers,
                 comment_map=comment_map,
+                structured_type_components=structured_type_components,
+                structured_array_types=structured_array_types,
+                structured_dtype_strings=structured_dtype_strings,
             )
             used_flat_fallback = True
 
