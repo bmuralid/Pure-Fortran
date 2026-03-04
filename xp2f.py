@@ -745,6 +745,14 @@ def detect_needed_helpers(tree):
         "ones_like": {"ones_int", "ones_real", "ones_logical"},
         "full": {"arange_int"},
     }
+    np_reduceat_helper_map = {
+        "add": {"reduceat_add"},
+        "multiply": {"reduceat_mul"},
+        "minimum": {"reduceat_min"},
+        "maximum": {"reduceat_max"},
+        "logical_and": {"reduceat_logical_and"},
+        "logical_or": {"reduceat_logical_or"},
+    }
 
     class scan(ast.NodeVisitor):
         def visit_Call(self, node):
@@ -802,6 +810,15 @@ def detect_needed_helpers(tree):
                 and node.func.attr in np_helper_map
             ):
                 needed.update(np_helper_map[node.func.attr])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "reduceat"
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr in np_reduceat_helper_map
+            ):
+                needed.update(np_reduceat_helper_map[node.func.value.attr])
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
@@ -2134,6 +2151,17 @@ class translator(ast.NodeVisitor):
                 return "int"
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "reduceat"
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and len(node.args) >= 1
+            ):
+                if node.func.value.attr in {"logical_and", "logical_or"}:
+                    return "logical"
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "uniform"
             ):
                 return "real"
@@ -2445,6 +2473,15 @@ class translator(ast.NodeVisitor):
                 return f"size({self.expr(node.args[1])})"
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "reduceat"
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and len(node.args) >= 2
+            ):
+                return f"size({self.expr(node.args[1])})"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "take"
@@ -2661,6 +2698,14 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "bincount" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "searchsorted" and len(node.args) >= 2:
+                    return self._rank_expr(node.args[1])
+                if (
+                    node.func.attr == "reduceat"
+                    and isinstance(node.func.value, ast.Attribute)
+                    and isinstance(node.func.value.value, ast.Name)
+                    and node.func.value.value.id == "np"
+                    and len(node.args) >= 2
+                ):
                     return self._rank_expr(node.args[1])
                 if node.func.attr in {"uniform", "integers"}:
                     size_node = None
@@ -4451,6 +4496,28 @@ class translator(ast.NodeVisitor):
                 if side == "right":
                     return f"searchsorted_right_int({a0}, {v0})"
                 return f"searchsorted_left_int({a0}, {v0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "reduceat"
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and len(node.args) >= 2
+            ):
+                op = node.func.value.attr
+                helper = {
+                    "add": "reduceat_add",
+                    "multiply": "reduceat_mul",
+                    "minimum": "reduceat_min",
+                    "maximum": "reduceat_max",
+                    "logical_and": "reduceat_logical_and",
+                    "logical_or": "reduceat_logical_or",
+                }.get(op)
+                if helper is None:
+                    raise NotImplementedError(f"np.{op}.reduceat not supported")
+                a0 = self.expr(node.args[0])
+                i0 = self.expr(node.args[1])
+                return f"{helper}({a0}, {i0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
