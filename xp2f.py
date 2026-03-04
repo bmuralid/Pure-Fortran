@@ -2191,6 +2191,8 @@ class translator(ast.NodeVisitor):
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
+                if node.func.attr in {"pad", "roll", "flip"} and len(node.args) >= 1:
+                    return self._rank_expr(node.args[0])
                 if node.func.attr == "expand_dims" and len(node.args) >= 1:
                     return self._rank_expr(node.args[0]) + 1
                 if node.func.attr == "squeeze" and len(node.args) >= 1:
@@ -3709,6 +3711,77 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "roll"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                sh = "0"
+                if len(node.args) >= 2:
+                    sh = self.expr(node.args[1])
+                for kw in node.keywords:
+                    if kw.arg == "shift":
+                        sh = self.expr(kw.value)
+                        break
+                return f"cshift({a0}, int({sh}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "flip"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                return f"{a0}(size({a0}):1:-1)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "pad"
+                and len(node.args) >= 2
+            ):
+                # Narrow reusable subset:
+                # 1D arrays, mode='constant', pad_width int or (left,right),
+                # constant_values scalar or (left,right).
+                a0 = self.expr(node.args[0])
+                r0 = self._rank_expr(node.args[0])
+                if r0 > 1:
+                    raise NotImplementedError("np.pad currently supports only 1D arrays")
+                mode_txt = "constant"
+                cv_left = "0"
+                cv_right = "0"
+                pad_left = None
+                pad_right = None
+                pw = node.args[1]
+                if isinstance(pw, ast.Constant) and isinstance(pw.value, int):
+                    pad_left = self.expr(pw)
+                    pad_right = self.expr(pw)
+                elif isinstance(pw, (ast.Tuple, ast.List)) and len(pw.elts) == 2:
+                    pad_left = self.expr(pw.elts[0])
+                    pad_right = self.expr(pw.elts[1])
+                else:
+                    raise NotImplementedError("np.pad pad_width must be int or 2-tuple for 1D")
+                for kw in node.keywords:
+                    if kw.arg == "mode":
+                        if is_const_str(kw.value):
+                            mode_txt = str(kw.value.value).lower()
+                    elif kw.arg == "constant_values":
+                        cv = kw.value
+                        if isinstance(cv, (ast.Tuple, ast.List)) and len(cv.elts) == 2:
+                            cv_left = self.expr(cv.elts[0])
+                            cv_right = self.expr(cv.elts[1])
+                        else:
+                            cv_left = self.expr(cv)
+                            cv_right = self.expr(cv)
+                if mode_txt != "constant":
+                    raise NotImplementedError("np.pad currently supports only mode='constant'")
+                return (
+                    f"[(({cv_left}), i_pad = 1, int({pad_left})), {a0}, "
+                    f"(({cv_right}), i_pad = 1, int({pad_right}))]"
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "math"
                 and node.func.attr == "sqrt"
                 and len(node.args) == 1
@@ -3852,6 +3925,14 @@ class translator(ast.NodeVisitor):
                     elif k == "int":
                         self._mark_int(t.id)
                 if isinstance(t, ast.Name):
+                    if (
+                        isinstance(v, ast.Call)
+                        and isinstance(v.func, ast.Attribute)
+                        and isinstance(v.func.value, ast.Name)
+                        and v.func.value.id == "np"
+                        and v.func.attr == "pad"
+                    ):
+                        self._mark_int("i_pad")
                     # rng.choice(..., size=..., p=...) / rng.choice(..., size=..., replace=False)
                     if (
                         isinstance(v, ast.Call)
