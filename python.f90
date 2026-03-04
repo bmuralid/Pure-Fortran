@@ -66,6 +66,8 @@ public :: unique_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):i
 public :: bincount_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),minlength:integer:intent(in):optional desc="count occurrences of nonnegative integers"
 public :: searchsorted_left_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted left indices for integer vectors"
 public :: searchsorted_right_int !@pyapi kind=function ret=integer(:) args=a:integer(:):intent(in),v:integer(:):intent(in) desc="searchsorted right indices for integer vectors"
+public :: searchsorted_left_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) desc="searchsorted left index for scalar integer query"
+public :: searchsorted_right_int_scalar !@pyapi kind=function ret=integer args=a:integer(:):intent(in),v:integer:intent(in) desc="searchsorted right index for scalar integer query"
 public :: histogram_real_edges !@pyapi kind=subroutine args=x:real(dp)(:):intent(in),bins:real(dp)(:):intent(in),h:integer(:):intent(out),edges:real(dp)(:):intent(out) desc="1D histogram with explicit real bin edges"
 public :: histogram_int_edges !@pyapi kind=subroutine args=x:integer(:):intent(in),bins:integer(:):intent(in),h:integer(:):intent(out),edges:integer(:):intent(out) desc="1D histogram with explicit integer bin edges"
 public :: reduceat_add_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),idx:integer(:):intent(in) desc="np.add.reduceat for real vector"
@@ -493,6 +495,42 @@ contains
             idx(i) = lo - 1
          end do
       end function searchsorted_right_int
+
+      function searchsorted_left_int_scalar(a, v) result(idx)
+         integer, intent(in) :: a(:), v
+         integer :: idx
+         integer :: lo, hi, mid, n
+         n = size(a)
+         lo = 1
+         hi = n + 1
+         do while (lo < hi)
+            mid = (lo + hi) / 2
+            if (mid <= n .and. a(mid) < v) then
+               lo = mid + 1
+            else
+               hi = mid
+            end if
+         end do
+         idx = lo - 1
+      end function searchsorted_left_int_scalar
+
+      function searchsorted_right_int_scalar(a, v) result(idx)
+         integer, intent(in) :: a(:), v
+         integer :: idx
+         integer :: lo, hi, mid, n
+         n = size(a)
+         lo = 1
+         hi = n + 1
+         do while (lo < hi)
+            mid = (lo + hi) / 2
+            if (mid <= n .and. a(mid) <= v) then
+               lo = mid + 1
+            else
+               hi = mid
+            end if
+         end do
+         idx = lo - 1
+      end function searchsorted_right_int_scalar
 
       subroutine histogram_real_edges(x, bins, h, edges)
          real(kind=dp), intent(in) :: x(:), bins(:)
