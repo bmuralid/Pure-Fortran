@@ -12,6 +12,67 @@ end type strvec_t
 public :: isqrt_int       !@pyapi kind=function ret=integer args=x:integer:intent(in) desc="integer square root: return floor(sqrt(x)) for x >= 0"
 public :: print_int_list  !@pyapi kind=subroutine args=a:integer(:):intent(in),n:integer:intent(in) desc="print integer list a(1:n) in python-style [..] format"
 public :: random_normal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out) desc="fill x with N(0,1) variates using Box-Muller"
+public :: random_exponential !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional desc="sample scalar exponential with scale (default 1)"
+public :: random_exponential_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional desc="fill x with exponential samples with scale (default 1)"
+public :: random_gamma !@pyapi kind=function ret=real(dp) args=shape:real(dp):intent(in),scale:real(dp):intent(in):optional desc="sample scalar gamma(shape, scale), shape>0"
+public :: random_gamma_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),shape:real(dp):intent(in),scale:real(dp):intent(in):optional desc="fill x with gamma samples"
+public :: random_student_t !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in) desc="sample scalar Student t(df)"
+public :: random_student_t_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in) desc="fill x with Student t(df) samples"
+public :: random_f !@pyapi kind=function ret=real(dp) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in) desc="sample scalar F(dfnum,dfden)"
+public :: random_f_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),dfnum:real(dp):intent(in),dfden:real(dp):intent(in) desc="fill x with F samples"
+public :: random_poisson !@pyapi kind=function ret=integer args=mu:real(dp):intent(in) desc="sample scalar Poisson(mu)"
+public :: random_poisson_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),mu:real(dp):intent(in) desc="fill x with Poisson(mu) samples"
+public :: random_geometric !@pyapi kind=function ret=integer args=p:real(dp):intent(in) desc="sample scalar Geometric(p), support on {1,2,...}"
+public :: random_geometric_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),p:real(dp):intent(in) desc="fill x with Geometric(p) samples"
+public :: random_binomial !@pyapi kind=function ret=integer args=n:integer:intent(in),p:real(dp):intent(in) desc="sample scalar Binomial(n,p)"
+public :: random_binomial_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),n:integer:intent(in),p:real(dp):intent(in) desc="fill x with Binomial(n,p) samples"
+public :: random_hypergeometric !@pyapi kind=function ret=integer args=ngood:integer:intent(in),nbad:integer:intent(in),nsample:integer:intent(in) desc="sample scalar Hypergeometric(ngood,nbad,nsample)"
+public :: random_hypergeometric_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),ngood:integer:intent(in),nbad:integer:intent(in),nsample:integer:intent(in) desc="fill x with hypergeometric samples"
+public :: random_zipf !@pyapi kind=function ret=integer args=a:real(dp):intent(in) desc="sample scalar Zipf(a), a>1"
+public :: random_zipf_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),a:real(dp):intent(in) desc="fill x with Zipf(a) samples"
+public :: random_weibull !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) desc="sample scalar Weibull(a)"
+public :: random_weibull_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) desc="fill x with Weibull(a) samples"
+public :: random_neg_binomial !@pyapi kind=function ret=integer args=sk:real(dp):intent(in),p:real(dp):intent(in) desc="sample scalar negative binomial failures before sk successes"
+public :: random_neg_binomial_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),sk:real(dp):intent(in),p:real(dp):intent(in) desc="fill x with negative binomial samples"
+public :: random_von_mises !@pyapi kind=function ret=real(dp) args=kappa:real(dp):intent(in) desc="sample scalar von Mises with concentration kappa"
+public :: random_von_mises_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),kappa:real(dp):intent(in) desc="fill x with von Mises samples"
+public :: random_pareto !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) desc="sample scalar Pareto(a) in NumPy convention"
+public :: random_pareto_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) desc="fill x with Pareto(a) samples"
+public :: random_power !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in) desc="sample scalar Power(a) in NumPy convention"
+public :: random_power_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in) desc="fill x with Power(a) samples"
+public :: random_rayleigh !@pyapi kind=function ret=real(dp) args=scale:real(dp):intent(in):optional desc="sample scalar Rayleigh(scale), default scale=1"
+public :: random_rayleigh_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),scale:real(dp):intent(in):optional desc="fill x with Rayleigh samples"
+public :: random_gumbel !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Gumbel(loc,scale)"
+public :: random_gumbel_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Gumbel samples"
+public :: random_wald !@pyapi kind=function ret=real(dp) args=mean:real(dp):intent(in),scale:real(dp):intent(in) desc="sample scalar Wald(mean,scale)"
+public :: random_wald_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),mean:real(dp):intent(in),scale:real(dp):intent(in) desc="fill x with Wald samples"
+public :: random_noncentral_chisquare !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in),nonc:real(dp):intent(in) desc="sample scalar noncentral chisquare(df,nonc)"
+public :: random_noncentral_chisquare_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in),nonc:real(dp):intent(in) desc="fill x with noncentral chisquare samples"
+public :: random_noncentral_f !@pyapi kind=function ret=real(dp) args=dfnum:real(dp):intent(in),dfden:real(dp):intent(in),nonc:real(dp):intent(in) desc="sample scalar noncentral F(dfnum,dfden,nonc)"
+public :: random_noncentral_f_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),dfnum:real(dp):intent(in),dfden:real(dp):intent(in),nonc:real(dp):intent(in) desc="fill x with noncentral F samples"
+public :: random_triangular !@pyapi kind=function ret=real(dp) args=left:real(dp):intent(in),mode:real(dp):intent(in),right:real(dp):intent(in) desc="sample scalar triangular(left,mode,right)"
+public :: random_triangular_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),left:real(dp):intent(in),mode:real(dp):intent(in),right:real(dp):intent(in) desc="fill x with triangular samples"
+public :: random_logseries !@pyapi kind=function ret=integer args=p:real(dp):intent(in) desc="sample scalar logarithmic-series(p)"
+public :: random_logseries_vec !@pyapi kind=subroutine args=x:integer(:):intent(out),p:real(dp):intent(in) desc="fill x with logarithmic-series samples"
+public :: random_dirichlet !@pyapi kind=subroutine args=alpha:real(dp)(:):intent(in),x:real(dp)(:):intent(out) desc="sample one Dirichlet(alpha) vector"
+public :: random_dirichlet_samples !@pyapi kind=subroutine args=alpha:real(dp)(:):intent(in),x:real(dp)(:,:):intent(out) desc="fill rows of x with Dirichlet(alpha) samples"
+public :: random_multinomial !@pyapi kind=subroutine args=n:integer:intent(in),p:real(dp)(:):intent(in),x:integer(:):intent(out) desc="sample one Multinomial(n,p) count vector"
+public :: random_multinomial_samples !@pyapi kind=subroutine args=n:integer:intent(in),p:real(dp)(:):intent(in),x:integer(:,:):intent(out) desc="fill rows of x with Multinomial(n,p) samples"
+public :: random_multivariate_hypergeometric !@pyapi kind=subroutine args=ngood:integer(:):intent(in),nsample:integer:intent(in),x:integer(:):intent(out) desc="sample one multivariate hypergeometric count vector"
+public :: random_multivariate_hypergeometric_samples !@pyapi kind=subroutine args=ngood:integer(:):intent(in),nsample:integer:intent(in),x:integer(:,:):intent(out) desc="fill rows of x with multivariate hypergeometric samples"
+public :: random_beta !@pyapi kind=function ret=real(dp) args=a:real(dp):intent(in),b:real(dp):intent(in) desc="sample scalar beta(a,b), a,b>0"
+public :: random_beta_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),a:real(dp):intent(in),b:real(dp):intent(in) desc="fill x with beta samples"
+public :: random_lognormal !@pyapi kind=function ret=real(dp) args=meanlog:real(dp):intent(in):optional,sdlog:real(dp):intent(in):optional desc="sample scalar lognormal exp(N(meanlog,sdlog^2))"
+public :: random_lognormal_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),meanlog:real(dp):intent(in):optional,sdlog:real(dp):intent(in):optional desc="fill x with lognormal samples"
+public :: random_chisquare !@pyapi kind=function ret=real(dp) args=df:real(dp):intent(in) desc="sample scalar chi-square(df)"
+public :: random_chisquare_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),df:real(dp):intent(in) desc="fill x with chi-square samples"
+public :: random_laplace !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Laplace(loc,scale)"
+public :: random_laplace_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Laplace samples"
+public :: random_logistic !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Logistic(loc,scale)"
+public :: random_logistic_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Logistic samples"
+public :: random_cauchy !@pyapi kind=function ret=real(dp) args=loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="sample scalar Cauchy(loc,scale)"
+public :: random_cauchy_vec !@pyapi kind=subroutine args=x:real(dp)(:):intent(out),loc:real(dp):intent(in):optional,scale:real(dp):intent(in):optional desc="fill x with Cauchy samples"
+public :: random_mvn_samples !@pyapi kind=subroutine args=mean:real(dp)(:):intent(in),cov:real(dp)(:,:):intent(in),x:real(dp)(:,:):intent(out) desc="fill x(nsamp,ndim) with multivariate-normal samples using Cholesky factorization"
 public :: random_choice2 !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in {0,1} with probabilities p(1:2)"
 public :: random_choice_norep !@pyapi kind=subroutine args=npop:integer:intent(in),nsamp:integer:intent(in),z:integer(:):intent(out) desc="sample nsamp unique labels from 0..npop-1 without replacement"
 public :: random_choice_prob !@pyapi kind=subroutine args=p:real(dp)(:):intent(in),n:integer:intent(in),z:integer(:):intent(out) desc="sample n labels in 0..size(p)-1 with probabilities p"
@@ -112,6 +173,7 @@ public :: moveaxis3_logical !@pyapi kind=function ret=logical(:,:,:) args=a:logi
 public :: pad2d_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:integer:intent(in) desc="2D constant pad for integer matrix"
 public :: pad2d_real !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in),pt:integer:intent(in),pb:integer:intent(in),pl:integer:intent(in),pr:integer:intent(in),c:real(dp):intent(in) desc="2D constant pad for real matrix"
 public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="2x2 covariance matrix for two real vectors"
+public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional desc="covariance matrix for observations in rows (numpy rowvar=False)"
 public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
 public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
@@ -275,6 +337,898 @@ contains
             i = i + 2
          end do
       end subroutine random_normal_vec
+
+      real(kind=dp) function random_exponential(scale)
+         real(kind=dp), intent(in), optional :: scale
+         real(kind=dp) :: u, s
+         s = 1.0_dp
+         if (present(scale)) s = scale
+         call random_number(u)
+         if (u <= tiny(1.0_dp)) u = tiny(1.0_dp)
+         random_exponential = -log(u) * s
+      end function random_exponential
+
+      subroutine random_exponential_vec(x, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in), optional :: scale
+         integer :: i
+         do i = 1, size(x)
+            if (present(scale)) then
+               x(i) = random_exponential(scale)
+            else
+               x(i) = random_exponential()
+            end if
+         end do
+      end subroutine random_exponential_vec
+
+      recursive real(kind=dp) function random_gamma(shape, scale) result(g)
+         real(kind=dp), intent(in) :: shape
+         real(kind=dp), intent(in), optional :: scale
+         real(kind=dp) :: sc, d, c, u, v, z
+         real(kind=dp) :: tmpn(1)
+         if (shape <= 0.0_dp) stop "random_gamma: shape must be > 0"
+         sc = 1.0_dp
+         if (present(scale)) sc = scale
+         if (sc <= 0.0_dp) stop "random_gamma: scale must be > 0"
+         if (shape < 1.0_dp) then
+            call random_number(u)
+            if (u <= tiny(1.0_dp)) u = tiny(1.0_dp)
+            g = random_gamma(shape + 1.0_dp, sc) * u**(1.0_dp / shape)
+            return
+         end if
+         d = shape - 1.0_dp / 3.0_dp
+         c = 1.0_dp / sqrt(9.0_dp * d)
+         do
+            call random_normal_vec(tmpn)
+            z = tmpn(1)
+            v = (1.0_dp + c * z)**3
+            if (v <= 0.0_dp) cycle
+            call random_number(u)
+            if (u <= tiny(1.0_dp)) u = tiny(1.0_dp)
+            if (log(u) < 0.5_dp * z**2 + d - d * v + d * log(v)) then
+               g = d * v * sc
+               return
+            end if
+         end do
+      end function random_gamma
+
+      subroutine random_gamma_vec(x, shape, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: shape
+         real(kind=dp), intent(in), optional :: scale
+         integer :: i
+         do i = 1, size(x)
+            if (present(scale)) then
+               x(i) = random_gamma(shape, scale)
+            else
+               x(i) = random_gamma(shape)
+            end if
+         end do
+      end subroutine random_gamma_vec
+
+      real(kind=dp) function random_student_t(df)
+         real(kind=dp), intent(in) :: df
+         real(kind=dp) :: z(1), v
+         if (df <= 0.0_dp) stop "random_student_t: df must be > 0"
+         call random_normal_vec(z)
+         v = random_gamma(df / 2.0_dp, 2.0_dp)
+         random_student_t = z(1) / sqrt(v / df)
+      end function random_student_t
+
+      subroutine random_student_t_vec(x, df)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: df
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_student_t(df)
+         end do
+      end subroutine random_student_t_vec
+
+      real(kind=dp) function random_f(dfnum, dfden)
+         real(kind=dp), intent(in) :: dfnum, dfden
+         real(kind=dp) :: x1, x2
+         if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp) stop "random_f: dfs must be > 0"
+         x1 = random_gamma(dfnum / 2.0_dp, 2.0_dp) / dfnum
+         x2 = random_gamma(dfden / 2.0_dp, 2.0_dp) / dfden
+         random_f = x1 / x2
+      end function random_f
+
+      subroutine random_f_vec(x, dfnum, dfden)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: dfnum, dfden
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_f(dfnum, dfden)
+         end do
+      end subroutine random_f_vec
+
+      integer function random_poisson(mu)
+         real(kind=dp), intent(in) :: mu
+         real(kind=dp) :: l, p, u
+         integer :: k
+         if (mu < 0.0_dp) stop "random_poisson: mu must be >= 0"
+         l = exp(-mu)
+         k = 0
+         p = 1.0_dp
+         do
+            k = k + 1
+            call random_number(u)
+            p = p * u
+            if (p <= l) exit
+         end do
+         random_poisson = k - 1
+      end function random_poisson
+
+      subroutine random_poisson_vec(x, mu)
+         integer, intent(out) :: x(:)
+         real(kind=dp), intent(in) :: mu
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_poisson(mu)
+         end do
+      end subroutine random_poisson_vec
+
+      integer function random_geometric(p)
+         ! Source: John Burkardt, prob.f90, geometric_sample/geometric_cdf_inv.
+         real(kind=dp), intent(in) :: p
+         real(kind=dp) :: u
+         if (p < 0.0_dp .or. p > 1.0_dp) stop "random_geometric: p must be in [0,1]"
+         if (p == 1.0_dp) then
+            random_geometric = 1
+            return
+         end if
+         if (p == 0.0_dp) then
+            random_geometric = huge(1)
+            return
+         end if
+         call random_number(u)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         random_geometric = 1 + int(log(1.0_dp - u) / log(1.0_dp - p))
+      end function random_geometric
+
+      subroutine random_geometric_vec(x, p)
+         integer, intent(out) :: x(:)
+         real(kind=dp), intent(in) :: p
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_geometric(p)
+         end do
+      end subroutine random_geometric_vec
+
+      integer function random_binomial(n, p)
+         integer, intent(in) :: n
+         real(kind=dp), intent(in) :: p
+         integer :: i
+         real(kind=dp) :: u
+         if (n < 0) stop "random_binomial: n must be >= 0"
+         if (p < 0.0_dp .or. p > 1.0_dp) stop "random_binomial: p must be in [0,1]"
+         random_binomial = 0
+         do i = 1, n
+            call random_number(u)
+            if (u < p) random_binomial = random_binomial + 1
+         end do
+      end function random_binomial
+
+      subroutine random_binomial_vec(x, n, p)
+         integer, intent(out) :: x(:)
+         integer, intent(in) :: n
+         real(kind=dp), intent(in) :: p
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_binomial(n, p)
+         end do
+      end subroutine random_binomial_vec
+
+      integer function random_hypergeometric(ngood, nbad, nsample)
+         integer, intent(in) :: ngood, nbad, nsample
+         integer :: gg, nn, i
+         real(kind=dp) :: pr, u
+         if (ngood < 0 .or. nbad < 0 .or. nsample < 0) stop "random_hypergeometric: args must be >= 0"
+         if (nsample > ngood + nbad) stop "random_hypergeometric: nsample too large"
+         gg = ngood
+         nn = ngood + nbad
+         random_hypergeometric = 0
+         do i = 1, nsample
+            if (gg <= 0) exit
+            pr = real(gg, kind=dp) / real(nn, kind=dp)
+            call random_number(u)
+            if (u < pr) then
+               random_hypergeometric = random_hypergeometric + 1
+               gg = gg - 1
+            end if
+            nn = nn - 1
+         end do
+      end function random_hypergeometric
+
+      subroutine random_hypergeometric_vec(x, ngood, nbad, nsample)
+         integer, intent(out) :: x(:)
+         integer, intent(in) :: ngood, nbad, nsample
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_hypergeometric(ngood, nbad, nsample)
+         end do
+      end subroutine random_hypergeometric_vec
+
+      integer function random_zipf(a)
+         real(kind=dp), intent(in) :: a
+         real(kind=dp) :: b, const, t, u, v
+         real(kind=dp), parameter :: one = 1.0_dp
+         if (a <= 1.0_dp) stop "random_zipf: a must be > 1"
+         b = 2.0_dp**(a - one)
+         const = -one / (a - one)
+         do
+            call random_number(u)
+            call random_number(v)
+            random_zipf = int(floor(u**const))
+            if (random_zipf < 1) cycle
+            t = (one + one / real(random_zipf, kind=dp))**(a - one)
+            if (v * real(random_zipf, kind=dp) * (t - one) / (b - one) <= t / b) exit
+         end do
+      end function random_zipf
+
+      subroutine random_zipf_vec(x, a)
+         integer, intent(out) :: x(:)
+         real(kind=dp), intent(in) :: a
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_zipf(a)
+         end do
+      end subroutine random_zipf_vec
+
+      real(kind=dp) function random_beta(a, b)
+         real(kind=dp), intent(in) :: a, b
+         real(kind=dp) :: x1, x2
+         if (a <= 0.0_dp .or. b <= 0.0_dp) stop "random_beta: a,b must be > 0"
+         x1 = random_gamma(a, 1.0_dp)
+         x2 = random_gamma(b, 1.0_dp)
+         random_beta = x1 / (x1 + x2)
+      end function random_beta
+
+      subroutine random_beta_vec(x, a, b)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: a, b
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_beta(a, b)
+         end do
+      end subroutine random_beta_vec
+
+      real(kind=dp) function random_lognormal(meanlog, sdlog)
+         real(kind=dp), intent(in), optional :: meanlog, sdlog
+         real(kind=dp) :: mu, sig, z(1)
+         mu = 0.0_dp
+         sig = 1.0_dp
+         if (present(meanlog)) mu = meanlog
+         if (present(sdlog)) sig = sdlog
+         call random_normal_vec(z)
+         random_lognormal = exp(mu + sig * z(1))
+      end function random_lognormal
+
+      subroutine random_lognormal_vec(x, meanlog, sdlog)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in), optional :: meanlog, sdlog
+         integer :: i
+         do i = 1, size(x)
+            if (present(meanlog) .and. present(sdlog)) then
+               x(i) = random_lognormal(meanlog, sdlog)
+            elseif (present(meanlog)) then
+               x(i) = random_lognormal(meanlog=meanlog)
+            elseif (present(sdlog)) then
+               x(i) = random_lognormal(sdlog=sdlog)
+            else
+               x(i) = random_lognormal()
+            end if
+         end do
+      end subroutine random_lognormal_vec
+
+      real(kind=dp) function random_chisquare(df)
+         real(kind=dp), intent(in) :: df
+         if (df <= 0.0_dp) stop "random_chisquare: df must be > 0"
+         random_chisquare = random_gamma(df / 2.0_dp, 2.0_dp)
+      end function random_chisquare
+
+      subroutine random_chisquare_vec(x, df)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: df
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_chisquare(df)
+         end do
+      end subroutine random_chisquare_vec
+
+      real(kind=dp) function random_laplace(loc, scale)
+         real(kind=dp), intent(in), optional :: loc, scale
+         real(kind=dp) :: u, mu, b
+         mu = 0.0_dp
+         b = 1.0_dp
+         if (present(loc)) mu = loc
+         if (present(scale)) b = scale
+         if (b <= 0.0_dp) stop "random_laplace: scale must be > 0"
+         call random_number(u)
+         if (u < 0.5_dp) then
+            random_laplace = mu + b * log(max(2.0_dp * u, tiny(1.0_dp)))
+         else
+            random_laplace = mu - b * log(max(2.0_dp * (1.0_dp - u), tiny(1.0_dp)))
+         end if
+      end function random_laplace
+
+      subroutine random_laplace_vec(x, loc, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in), optional :: loc, scale
+         integer :: i
+         do i = 1, size(x)
+            if (present(loc) .and. present(scale)) then
+               x(i) = random_laplace(loc, scale)
+            elseif (present(loc)) then
+               x(i) = random_laplace(loc=loc)
+            elseif (present(scale)) then
+               x(i) = random_laplace(scale=scale)
+            else
+               x(i) = random_laplace()
+            end if
+         end do
+      end subroutine random_laplace_vec
+
+      real(kind=dp) function random_logistic(loc, scale)
+         real(kind=dp), intent(in), optional :: loc, scale
+         real(kind=dp) :: u, mu, s
+         mu = 0.0_dp
+         s = 1.0_dp
+         if (present(loc)) mu = loc
+         if (present(scale)) s = scale
+         if (s <= 0.0_dp) stop "random_logistic: scale must be > 0"
+         call random_number(u)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         random_logistic = mu + s * log(u / (1.0_dp - u))
+      end function random_logistic
+
+      subroutine random_logistic_vec(x, loc, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in), optional :: loc, scale
+         integer :: i
+         do i = 1, size(x)
+            if (present(loc) .and. present(scale)) then
+               x(i) = random_logistic(loc, scale)
+            elseif (present(loc)) then
+               x(i) = random_logistic(loc=loc)
+            elseif (present(scale)) then
+               x(i) = random_logistic(scale=scale)
+            else
+               x(i) = random_logistic()
+            end if
+         end do
+      end subroutine random_logistic_vec
+
+      real(kind=dp) function random_cauchy(loc, scale)
+         real(kind=dp), intent(in), optional :: loc, scale
+         real(kind=dp) :: u, mu, s
+         mu = 0.0_dp
+         s = 1.0_dp
+         if (present(loc)) mu = loc
+         if (present(scale)) s = scale
+         if (s <= 0.0_dp) stop "random_cauchy: scale must be > 0"
+         call random_number(u)
+         random_cauchy = mu + s * tan(acos(-1.0_dp) * (u - 0.5_dp))
+      end function random_cauchy
+
+      subroutine random_cauchy_vec(x, loc, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in), optional :: loc, scale
+         integer :: i
+         do i = 1, size(x)
+            if (present(loc) .and. present(scale)) then
+               x(i) = random_cauchy(loc, scale)
+            elseif (present(loc)) then
+               x(i) = random_cauchy(loc=loc)
+            elseif (present(scale)) then
+               x(i) = random_cauchy(scale=scale)
+            else
+               x(i) = random_cauchy()
+            end if
+         end do
+      end subroutine random_cauchy_vec
+
+      real(kind=dp) function random_weibull(a)
+         ! Source: Alan Miller, amiller_mirror/random.f90 (Weibull sampler).
+         real(kind=dp), intent(in) :: a
+         if (a <= 0.0_dp) stop "random_weibull: a must be > 0"
+         random_weibull = random_exponential()**(1.0_dp / a)
+      end function random_weibull
+
+      subroutine random_weibull_vec(x, a)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: a
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_weibull(a)
+         end do
+      end subroutine random_weibull_vec
+
+      integer function random_neg_binomial(sk, p)
+         ! Source: Alan Miller, amiller_mirror/random.f90 (negative binomial sampler).
+         real(kind=dp), intent(in) :: sk, p
+         real(kind=dp), parameter :: h = 0.7_dp
+         real(kind=dp) :: q, x, st, uln, v, r, s, y, g
+         integer :: k, i, n
+         if (sk <= 0.0_dp .or. p <= 0.0_dp .or. p >= 1.0_dp) stop "random_neg_binomial: invalid params"
+         q = 1.0_dp - p
+         x = 0.0_dp
+         st = sk
+         if (p > h) then
+            v = 1.0_dp / log(p)
+            k = int(st)
+            do i = 1, k
+               do
+                  call random_number(r)
+                  if (r > 0.0_dp) exit
+               end do
+               n = int(v * log(r))
+               x = x + real(n, kind=dp)
+            end do
+            st = st - real(k, kind=dp)
+         end if
+         s = 0.0_dp
+         uln = -log(tiny(1.0_dp))
+         if (st > -uln / log(q)) stop "random_neg_binomial: p too large for sk"
+         y = q**st
+         g = st
+         call random_number(r)
+         do
+            if (y > r) exit
+            r = r - y
+            s = s + 1.0_dp
+            y = y * p * g / s
+            g = g + 1.0_dp
+         end do
+         random_neg_binomial = int(x + s + 0.5_dp)
+      end function random_neg_binomial
+
+      subroutine random_neg_binomial_vec(x, sk, p)
+         integer, intent(out) :: x(:)
+         real(kind=dp), intent(in) :: sk, p
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_neg_binomial(sk, p)
+         end do
+      end subroutine random_neg_binomial_vec
+
+      real(kind=dp) function random_von_mises(kappa)
+         ! Source: Alan Miller, amiller_mirror/random.f90 (von Mises sampler).
+         real(kind=dp), intent(in) :: kappa
+         integer :: j, n, nk
+         real(kind=dp) :: sump, r, th, lambda, rlast
+         real(kind=dp), save :: p(20), theta(0:20)
+         real(kind=dp), save :: last_kappa = -1.0_dp
+         logical, save :: initialized = .false.
+         if (kappa < 0.0_dp) stop "random_von_mises: kappa must be >= 0"
+         if ((.not. initialized) .or. abs(kappa - last_kappa) > 0.0_dp) then
+            nk = int(kappa + kappa + 1.0_dp)
+            if (nk > 20) stop "random_von_mises: kappa too large for table"
+            theta(0) = 0.0_dp
+            if (kappa > 0.5_dp) then
+               sump = 0.0_dp
+               do j = 1, nk
+                  if (j < nk) then
+                     theta(j) = acos(1.0_dp - real(j, kind=dp) / kappa)
+                  else
+                     theta(nk) = acos(-1.0_dp)
+                  end if
+                  call vm_integral(theta(j-1), theta(j), p(j), kappa)
+                  sump = sump + p(j)
+               end do
+               p(1:nk) = p(1:nk) / sump
+            else
+               p(1) = 1.0_dp
+               theta(1) = acos(-1.0_dp)
+               nk = 1
+            end if
+            last_kappa = kappa
+            initialized = .true.
+         else
+            nk = int(kappa + kappa + 1.0_dp)
+            if (kappa <= 0.5_dp) nk = 1
+         end if
+         call random_number(r)
+         do j = 1, nk
+            r = r - p(j)
+            if (r < 0.0_dp) exit
+         end do
+         r = -r / p(j)
+         do
+            th = theta(j-1) + r * (theta(j) - theta(j-1))
+            lambda = kappa - real(j, kind=dp) + 1.0_dp - kappa * cos(th)
+            n = 1
+            rlast = lambda
+            do
+               call random_number(r)
+               if (r > rlast) exit
+               n = n + 1
+               rlast = r
+            end do
+            if (mod(n, 2) /= 0) exit
+            call random_number(r)
+         end do
+         random_von_mises = sign(th, (r - rlast) / (1.0_dp - rlast) - 0.5_dp)
+      end function random_von_mises
+
+      subroutine random_von_mises_vec(x, kappa)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: kappa
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_von_mises(kappa)
+         end do
+      end subroutine random_von_mises_vec
+
+      real(kind=dp) function random_pareto(a)
+         ! Source: John Burkardt, prob.f90, pareto_sample/pareto_cdf_inv.
+         ! NumPy convention: support x >= 0 with shape a.
+         real(kind=dp), intent(in) :: a
+         real(kind=dp) :: u
+         if (a <= 0.0_dp) stop "random_pareto: a must be > 0"
+         call random_number(u)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         random_pareto = (1.0_dp - u)**(-1.0_dp / a) - 1.0_dp
+      end function random_pareto
+
+      subroutine random_pareto_vec(x, a)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: a
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_pareto(a)
+         end do
+      end subroutine random_pareto_vec
+
+      real(kind=dp) function random_power(a)
+         ! Source: John Burkardt, prob.f90, power_sample/power_cdf_inv.
+         ! NumPy convention on [0,1], shape a.
+         real(kind=dp), intent(in) :: a
+         real(kind=dp) :: u
+         if (a <= 0.0_dp) stop "random_power: a must be > 0"
+         call random_number(u)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         random_power = u**(1.0_dp / a)
+      end function random_power
+
+      subroutine random_power_vec(x, a)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: a
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_power(a)
+         end do
+      end subroutine random_power_vec
+
+      real(kind=dp) function random_rayleigh(scale)
+         ! Source: John Burkardt, prob.f90, rayleigh_sample/rayleigh_cdf_inv.
+         real(kind=dp), intent(in), optional :: scale
+         real(kind=dp) :: s, u
+         s = 1.0_dp
+         if (present(scale)) s = scale
+         if (s <= 0.0_dp) stop "random_rayleigh: scale must be > 0"
+         call random_number(u)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         random_rayleigh = s * sqrt(-2.0_dp * log(1.0_dp - u))
+      end function random_rayleigh
+
+      subroutine random_rayleigh_vec(x, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in), optional :: scale
+         integer :: i
+         do i = 1, size(x)
+            if (present(scale)) then
+               x(i) = random_rayleigh(scale)
+            else
+               x(i) = random_rayleigh()
+            end if
+         end do
+      end subroutine random_rayleigh_vec
+
+      real(kind=dp) function random_gumbel(loc, scale)
+         ! Source: John Burkardt, prob.f90, gumbel_sample/gumbel_cdf_inv.
+         real(kind=dp), intent(in), optional :: loc, scale
+         real(kind=dp) :: mu, b, u
+         mu = 0.0_dp
+         b = 1.0_dp
+         if (present(loc)) mu = loc
+         if (present(scale)) b = scale
+         if (b <= 0.0_dp) stop "random_gumbel: scale must be > 0"
+         call random_number(u)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         random_gumbel = mu - b * log(-log(u))
+      end function random_gumbel
+
+      subroutine random_gumbel_vec(x, loc, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in), optional :: loc, scale
+         integer :: i
+         do i = 1, size(x)
+            if (present(loc) .and. present(scale)) then
+               x(i) = random_gumbel(loc, scale)
+            elseif (present(loc)) then
+               x(i) = random_gumbel(loc=loc)
+            elseif (present(scale)) then
+               x(i) = random_gumbel(scale=scale)
+            else
+               x(i) = random_gumbel()
+            end if
+         end do
+      end subroutine random_gumbel_vec
+
+      real(kind=dp) function random_wald(mean, scale)
+         ! Source: John Burkardt, prob.f90, inverse_gaussian_sample.
+         real(kind=dp), intent(in) :: mean, scale
+         real(kind=dp) :: phi, z(1), y, t, u
+         if (mean <= 0.0_dp .or. scale <= 0.0_dp) stop "random_wald: mean,scale must be > 0"
+         phi = scale / mean
+         call random_normal_vec(z)
+         y = z(1) * z(1)
+         t = 1.0_dp + 0.5_dp * (y - sqrt(4.0_dp * phi * y + y * y)) / phi
+         call random_number(u)
+         if (u * (1.0_dp + t) <= 1.0_dp) then
+            random_wald = mean * t
+         else
+            random_wald = mean / t
+         end if
+      end function random_wald
+
+      subroutine random_wald_vec(x, mean, scale)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: mean, scale
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_wald(mean, scale)
+         end do
+      end subroutine random_wald_vec
+
+      real(kind=dp) function random_noncentral_chisquare(df, nonc)
+         ! Source: John Burkardt, prob.f90, chi_square_noncentral_sample.
+         real(kind=dp), intent(in) :: df, nonc
+         real(kind=dp) :: x1, x2n(1), mu
+         if (df < 1.0_dp .or. nonc < 0.0_dp) stop "random_noncentral_chisquare: invalid parameters"
+         x1 = random_chisquare(df - 1.0_dp)
+         call random_normal_vec(x2n)
+         mu = sqrt(max(nonc, 0.0_dp))
+         random_noncentral_chisquare = x1 + (mu + x2n(1))**2
+      end function random_noncentral_chisquare
+
+      subroutine random_noncentral_chisquare_vec(x, df, nonc)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: df, nonc
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_noncentral_chisquare(df, nonc)
+         end do
+      end subroutine random_noncentral_chisquare_vec
+
+      real(kind=dp) function random_noncentral_f(dfnum, dfden, nonc)
+         real(kind=dp), intent(in) :: dfnum, dfden, nonc
+         real(kind=dp) :: xn, xd
+         if (dfnum <= 0.0_dp .or. dfden <= 0.0_dp .or. nonc < 0.0_dp) stop "random_noncentral_f: invalid parameters"
+         xn = random_noncentral_chisquare(dfnum, nonc) / dfnum
+         xd = random_chisquare(dfden) / dfden
+         random_noncentral_f = xn / xd
+      end function random_noncentral_f
+
+      subroutine random_noncentral_f_vec(x, dfnum, dfden, nonc)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: dfnum, dfden, nonc
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_noncentral_f(dfnum, dfden, nonc)
+         end do
+      end subroutine random_noncentral_f_vec
+
+      real(kind=dp) function random_triangular(left, mode, right)
+         ! Source: John Burkardt, prob.f90, triangle_sample/triangle_cdf_inv.
+         real(kind=dp), intent(in) :: left, mode, right
+         real(kind=dp) :: u, cut
+         if (left > mode .or. mode > right .or. left == right) stop "random_triangular: require left<=mode<=right and left<right"
+         call random_number(u)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         cut = (mode - left) / (right - left)
+         if (u <= cut) then
+            random_triangular = left + sqrt(u * (right - left) * (mode - left))
+         else
+            random_triangular = right - sqrt((1.0_dp - u) * (right - left) * (right - mode))
+         end if
+      end function random_triangular
+
+      subroutine random_triangular_vec(x, left, mode, right)
+         real(kind=dp), intent(out) :: x(:)
+         real(kind=dp), intent(in) :: left, mode, right
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_triangular(left, mode, right)
+         end do
+      end subroutine random_triangular_vec
+
+      integer function random_logseries(p)
+         ! Source: John Burkardt, prob.f90, log_series_sample.
+         real(kind=dp), intent(in) :: p
+         real(kind=dp) :: u, v
+         if (p <= 0.0_dp .or. p >= 1.0_dp) stop "random_logseries: p must be in (0,1)"
+         call random_number(u)
+         call random_number(v)
+         u = min(max(u, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         v = min(max(v, tiny(1.0_dp)), 1.0_dp - tiny(1.0_dp))
+         random_logseries = int(1.0_dp + log(v) / log(1.0_dp - (1.0_dp - p)**u))
+      end function random_logseries
+
+      subroutine random_logseries_vec(x, p)
+         integer, intent(out) :: x(:)
+         real(kind=dp), intent(in) :: p
+         integer :: i
+         do i = 1, size(x)
+            x(i) = random_logseries(p)
+         end do
+      end subroutine random_logseries_vec
+
+      subroutine random_dirichlet(alpha, x)
+         ! Source: John Burkardt, prob.f90, dirichlet_sample.
+         real(kind=dp), intent(in) :: alpha(:)
+         real(kind=dp), intent(out) :: x(:)
+         integer :: i, n
+         real(kind=dp) :: s
+         n = size(alpha)
+         if (size(x) /= n) stop "random_dirichlet: size mismatch"
+         do i = 1, n
+            if (alpha(i) <= 0.0_dp) stop "random_dirichlet: alpha entries must be > 0"
+            x(i) = random_gamma(alpha(i), 1.0_dp)
+         end do
+         s = sum(x)
+         if (s <= tiny(1.0_dp)) stop "random_dirichlet: invalid sample sum"
+         x = x / s
+      end subroutine random_dirichlet
+
+      subroutine random_dirichlet_samples(alpha, x)
+         real(kind=dp), intent(in) :: alpha(:)
+         real(kind=dp), intent(out) :: x(:,:)
+         integer :: i
+         if (size(x, 2) /= size(alpha)) stop "random_dirichlet_samples: second dim must equal len(alpha)"
+         do i = 1, size(x, 1)
+            call random_dirichlet(alpha, x(i, :))
+         end do
+      end subroutine random_dirichlet_samples
+
+      subroutine random_multinomial(n, p, x)
+         ! Source: John Burkardt, prob.f90, multinomial_sample.
+         integer, intent(in) :: n
+         real(kind=dp), intent(in) :: p(:)
+         integer, intent(out) :: x(:)
+         integer :: b, ifactor, ntot
+         real(kind=dp), allocatable :: q(:)
+         real(kind=dp) :: sum2, prob
+         b = size(p)
+         if (size(x) /= b) stop "random_multinomial: size mismatch"
+         if (n < 0) stop "random_multinomial: n must be >= 0"
+         allocate(q(1:b))
+         q = max(p, 0.0_dp)
+         sum2 = sum(q)
+         if (sum2 <= tiny(1.0_dp)) stop "random_multinomial: probabilities must sum to > 0"
+         q = q / sum2
+         x = 0
+         ntot = n
+         sum2 = 1.0_dp
+         do ifactor = 1, b - 1
+            if (ntot <= 0) exit
+            prob = q(ifactor) / sum2
+            prob = min(max(prob, 0.0_dp), 1.0_dp)
+            x(ifactor) = random_binomial(ntot, prob)
+            ntot = ntot - x(ifactor)
+            sum2 = sum2 - q(ifactor)
+            if (sum2 <= tiny(1.0_dp)) exit
+         end do
+         x(b) = ntot
+       end subroutine random_multinomial
+
+      subroutine random_multinomial_samples(n, p, x)
+         integer, intent(in) :: n
+         real(kind=dp), intent(in) :: p(:)
+         integer, intent(out) :: x(:,:)
+         integer :: i
+         if (size(x, 2) /= size(p)) stop "random_multinomial_samples: second dim must equal len(p)"
+         do i = 1, size(x, 1)
+            call random_multinomial(n, p, x(i, :))
+         end do
+      end subroutine random_multinomial_samples
+
+      subroutine random_multivariate_hypergeometric(ngood, nsample, x)
+         ! Source: reduction to sequential univariate hypergeometric draws.
+         integer, intent(in) :: ngood(:)
+         integer, intent(in) :: nsample
+         integer, intent(out) :: x(:)
+         integer :: i, k, rem_draw, rem_total, rem_bad
+         k = size(ngood)
+         if (size(x) /= k) stop "random_multivariate_hypergeometric: size mismatch"
+         if (k <= 0) stop "random_multivariate_hypergeometric: ngood must be nonempty"
+         if (any(ngood < 0)) stop "random_multivariate_hypergeometric: ngood entries must be >= 0"
+         rem_total = sum(ngood)
+         if (nsample < 0 .or. nsample > rem_total) stop "random_multivariate_hypergeometric: invalid nsample"
+         rem_draw = nsample
+         x = 0
+         do i = 1, k - 1
+            rem_bad = rem_total - ngood(i)
+            if (rem_draw <= 0) then
+               x(i) = 0
+            else
+               x(i) = random_hypergeometric(ngood(i), rem_bad, rem_draw)
+            end if
+            rem_draw = rem_draw - x(i)
+            rem_total = rem_total - ngood(i)
+         end do
+         x(k) = rem_draw
+      end subroutine random_multivariate_hypergeometric
+
+      subroutine random_multivariate_hypergeometric_samples(ngood, nsample, x)
+         integer, intent(in) :: ngood(:)
+         integer, intent(in) :: nsample
+         integer, intent(out) :: x(:,:)
+         integer :: i
+         if (size(x,2) /= size(ngood)) stop "random_multivariate_hypergeometric_samples: second dim mismatch"
+         do i = 1, size(x,1)
+            call random_multivariate_hypergeometric(ngood, nsample, x(i,:))
+         end do
+      end subroutine random_multivariate_hypergeometric_samples
+
+      subroutine vm_integral(a, b, result, dk)
+         ! Source: Alan Miller, amiller_mirror/random.f90 (quadrature helper for von Mises).
+         real(kind=dp), intent(in) :: a, b, dk
+         real(kind=dp), intent(out) :: result
+         real(kind=dp) :: xmid, range, x1, x2
+         real(kind=dp), parameter :: x(3) = (/ &
+            0.238619186083197_dp, 0.661209386466265_dp, 0.932469514203152_dp /)
+         real(kind=dp), parameter :: w(3) = (/ &
+            0.467913934572691_dp, 0.360761573048139_dp, 0.171324492379170_dp /)
+         integer :: i
+         xmid = 0.5_dp * (a + b)
+         range = 0.5_dp * (b - a)
+         result = 0.0_dp
+         do i = 1, 3
+            x1 = xmid + range * x(i)
+            x2 = xmid - range * x(i)
+            result = result + w(i) * (exp(dk * cos(x1)) + exp(dk * cos(x2)))
+         end do
+         result = result * range
+      end subroutine vm_integral
+
+      subroutine random_mvn_samples(mean, cov, x)
+         real(kind=dp), intent(in) :: mean(:)
+         real(kind=dp), intent(in) :: cov(:,:)
+         real(kind=dp), intent(out) :: x(:,:)
+         integer :: n, p, i, j, info
+         real(kind=dp), allocatable :: l(:,:), z(:,:), y(:,:)
+         interface
+            subroutine dpotrf(uplo, n, a, lda, info)
+               character(len=1), intent(in) :: uplo
+               integer, intent(in) :: n, lda
+               double precision, intent(inout) :: a(lda,*)
+               integer, intent(out) :: info
+            end subroutine dpotrf
+         end interface
+         n = size(x, 1)
+         p = size(mean)
+         if (size(x, 2) /= p) stop "random_mvn_samples: output shape mismatch"
+         if (size(cov, 1) /= p .or. size(cov, 2) /= p) stop "random_mvn_samples: covariance shape mismatch"
+         allocate(l(p, p))
+         l = cov
+         call dpotrf('L', p, l, p, info)
+         if (info /= 0) stop "random_mvn_samples: covariance not positive definite"
+         do i = 1, p
+            do j = i + 1, p
+               l(i, j) = 0.0_dp
+            end do
+         end do
+         allocate(z(p, n), y(p, n))
+         do i = 1, n
+            call random_normal_vec(z(:, i))
+         end do
+         y = matmul(l, z)
+         do i = 1, n
+            x(i, :) = mean + y(:, i)
+         end do
+      end subroutine random_mvn_samples
 
       subroutine random_choice2(p, n, z)
          ! sample n labels in {0,1} with probabilities p(1:2)
@@ -2415,6 +3369,27 @@ contains
          c(1,1) = vxx; c(1,2) = vxy
          c(2,1) = vxy; c(2,2) = vyy
       end function cov2_real
+
+      function cov_matrix_rows_real(x, ddof) result(c)
+         real(kind=dp), intent(in) :: x(:,:)
+         integer, intent(in), optional :: ddof
+         real(kind=dp), allocatable :: c(:,:)
+         real(kind=dp), allocatable :: xc(:,:), mu(:)
+         integer :: n, p, d
+         n = size(x, 1)
+         p = size(x, 2)
+         d = 1
+         if (present(ddof)) d = ddof
+         allocate(c(p, p))
+         if (n <= 0 .or. p <= 0) then
+            c = 0.0_dp
+            return
+         end if
+         allocate(mu(p), xc(n, p))
+         mu = sum(x, dim=1) / real(n, kind=dp)
+         xc = x - spread(mu, dim=1, ncopies=n)
+         c = matmul(transpose(xc), xc) / real(max(1, n - d), kind=dp)
+      end function cov_matrix_rows_real
 
       function corrcoef2_real(x, y) result(r)
          real(kind=dp), intent(in) :: x(:), y(:)

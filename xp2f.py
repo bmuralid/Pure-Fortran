@@ -865,7 +865,7 @@ def detect_needed_helpers(tree):
         "union1d": {"unique_int"},
         "tri": {"tri_int", "tri_real"},
         "moveaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
-        "cov": {"cov2_real"},
+        "cov": {"cov2_real", "cov_matrix_rows_real"},
         "corrcoef": {"corrcoef2_real"},
         "pad": {"pad2d_int", "pad2d_real"},
         "polyval": {"polyval"},
@@ -890,11 +890,168 @@ def detect_needed_helpers(tree):
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
                 and node.func.value.attr == "random"
-                and node.func.attr in {"normal", "randn"}
+                and node.func.attr in {"normal", "standard_normal", "randn", "multivariate_normal"}
             ):
                 needed.add("random_normal_vec")
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "normal":
+                if node.func.attr == "multivariate_normal":
+                    needed.add("random_mvn_samples")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "random"
+                and node.func.attr in {
+                    "exponential", "gamma", "beta", "lognormal", "chisquare",
+                    "standard_exponential", "standard_gamma", "standard_t", "f",
+                    "laplace", "logistic", "standard_cauchy",
+                    "poisson", "geometric", "binomial", "hypergeometric", "zipf",
+                    "weibull", "negative_binomial", "vonmises",
+                    "pareto", "power", "rayleigh", "gumbel", "wald",
+                    "noncentral_chisquare", "noncentral_f", "triangular",
+                    "logseries", "dirichlet", "multinomial", "multivariate_hypergeometric",
+                }
+            ):
+                if node.func.attr == "exponential":
+                    needed.update({"random_exponential", "random_exponential_vec"})
+                elif node.func.attr == "standard_exponential":
+                    needed.update({"random_exponential", "random_exponential_vec"})
+                elif node.func.attr == "gamma":
+                    needed.update({"random_gamma", "random_gamma_vec"})
+                elif node.func.attr == "standard_gamma":
+                    needed.update({"random_gamma", "random_gamma_vec"})
+                elif node.func.attr == "beta":
+                    needed.update({"random_beta", "random_beta_vec"})
+                elif node.func.attr == "lognormal":
+                    needed.update({"random_lognormal", "random_lognormal_vec"})
+                elif node.func.attr == "chisquare":
+                    needed.update({"random_chisquare", "random_chisquare_vec"})
+                elif node.func.attr == "standard_t":
+                    needed.update({"random_student_t", "random_student_t_vec"})
+                elif node.func.attr == "f":
+                    needed.update({"random_f", "random_f_vec"})
+                elif node.func.attr == "laplace":
+                    needed.update({"random_laplace", "random_laplace_vec"})
+                elif node.func.attr == "logistic":
+                    needed.update({"random_logistic", "random_logistic_vec"})
+                elif node.func.attr == "standard_cauchy":
+                    needed.update({"random_cauchy", "random_cauchy_vec"})
+                elif node.func.attr == "poisson":
+                    needed.update({"random_poisson", "random_poisson_vec"})
+                elif node.func.attr == "geometric":
+                    needed.update({"random_geometric", "random_geometric_vec"})
+                elif node.func.attr == "binomial":
+                    needed.update({"random_binomial", "random_binomial_vec"})
+                elif node.func.attr == "hypergeometric":
+                    needed.update({"random_hypergeometric", "random_hypergeometric_vec"})
+                elif node.func.attr == "zipf":
+                    needed.update({"random_zipf", "random_zipf_vec"})
+                elif node.func.attr == "weibull":
+                    needed.update({"random_weibull", "random_weibull_vec"})
+                elif node.func.attr == "negative_binomial":
+                    needed.update({"random_neg_binomial", "random_neg_binomial_vec"})
+                elif node.func.attr == "vonmises":
+                    needed.update({"random_von_mises", "random_von_mises_vec"})
+                elif node.func.attr == "pareto":
+                    needed.update({"random_pareto", "random_pareto_vec"})
+                elif node.func.attr == "power":
+                    needed.update({"random_power", "random_power_vec"})
+                elif node.func.attr == "rayleigh":
+                    needed.update({"random_rayleigh", "random_rayleigh_vec"})
+                elif node.func.attr == "gumbel":
+                    needed.update({"random_gumbel", "random_gumbel_vec"})
+                elif node.func.attr == "wald":
+                    needed.update({"random_wald", "random_wald_vec"})
+                elif node.func.attr == "noncentral_chisquare":
+                    needed.update({"random_noncentral_chisquare", "random_noncentral_chisquare_vec"})
+                elif node.func.attr == "noncentral_f":
+                    needed.update({"random_noncentral_f", "random_noncentral_f_vec"})
+                elif node.func.attr == "triangular":
+                    needed.update({"random_triangular", "random_triangular_vec"})
+                elif node.func.attr == "logseries":
+                    needed.update({"random_logseries", "random_logseries_vec"})
+                elif node.func.attr == "dirichlet":
+                    needed.update({"random_dirichlet", "random_dirichlet_samples"})
+                elif node.func.attr == "multinomial":
+                    needed.update({"random_multinomial", "random_multinomial_samples"})
+                elif node.func.attr == "multivariate_hypergeometric":
+                    needed.update({"random_multivariate_hypergeometric", "random_multivariate_hypergeometric_samples"})
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {"normal", "standard_normal"}:
                 needed.add("random_normal_vec")
+            if isinstance(node.func, ast.Attribute) and node.func.attr in {
+                "exponential", "gamma", "beta", "lognormal", "chisquare",
+                "standard_exponential", "standard_gamma", "standard_t", "f",
+                "laplace", "logistic", "standard_cauchy",
+                "poisson", "geometric", "binomial", "hypergeometric", "zipf",
+                "weibull", "negative_binomial", "vonmises",
+                "pareto", "power", "rayleigh", "gumbel", "wald",
+                "noncentral_chisquare", "noncentral_f", "triangular",
+                "logseries", "dirichlet", "multinomial", "multivariate_hypergeometric",
+            }:
+                if node.func.attr == "exponential":
+                    needed.update({"random_exponential", "random_exponential_vec"})
+                elif node.func.attr == "standard_exponential":
+                    needed.update({"random_exponential", "random_exponential_vec"})
+                elif node.func.attr == "gamma":
+                    needed.update({"random_gamma", "random_gamma_vec"})
+                elif node.func.attr == "standard_gamma":
+                    needed.update({"random_gamma", "random_gamma_vec"})
+                elif node.func.attr == "beta":
+                    needed.update({"random_beta", "random_beta_vec"})
+                elif node.func.attr == "lognormal":
+                    needed.update({"random_lognormal", "random_lognormal_vec"})
+                elif node.func.attr == "chisquare":
+                    needed.update({"random_chisquare", "random_chisquare_vec"})
+                elif node.func.attr == "standard_t":
+                    needed.update({"random_student_t", "random_student_t_vec"})
+                elif node.func.attr == "f":
+                    needed.update({"random_f", "random_f_vec"})
+                elif node.func.attr == "laplace":
+                    needed.update({"random_laplace", "random_laplace_vec"})
+                elif node.func.attr == "logistic":
+                    needed.update({"random_logistic", "random_logistic_vec"})
+                elif node.func.attr == "standard_cauchy":
+                    needed.update({"random_cauchy", "random_cauchy_vec"})
+                elif node.func.attr == "poisson":
+                    needed.update({"random_poisson", "random_poisson_vec"})
+                elif node.func.attr == "geometric":
+                    needed.update({"random_geometric", "random_geometric_vec"})
+                elif node.func.attr == "binomial":
+                    needed.update({"random_binomial", "random_binomial_vec"})
+                elif node.func.attr == "hypergeometric":
+                    needed.update({"random_hypergeometric", "random_hypergeometric_vec"})
+                elif node.func.attr == "zipf":
+                    needed.update({"random_zipf", "random_zipf_vec"})
+                elif node.func.attr == "weibull":
+                    needed.update({"random_weibull", "random_weibull_vec"})
+                elif node.func.attr == "negative_binomial":
+                    needed.update({"random_neg_binomial", "random_neg_binomial_vec"})
+                elif node.func.attr == "vonmises":
+                    needed.update({"random_von_mises", "random_von_mises_vec"})
+                elif node.func.attr == "pareto":
+                    needed.update({"random_pareto", "random_pareto_vec"})
+                elif node.func.attr == "power":
+                    needed.update({"random_power", "random_power_vec"})
+                elif node.func.attr == "rayleigh":
+                    needed.update({"random_rayleigh", "random_rayleigh_vec"})
+                elif node.func.attr == "gumbel":
+                    needed.update({"random_gumbel", "random_gumbel_vec"})
+                elif node.func.attr == "wald":
+                    needed.update({"random_wald", "random_wald_vec"})
+                elif node.func.attr == "noncentral_chisquare":
+                    needed.update({"random_noncentral_chisquare", "random_noncentral_chisquare_vec"})
+                elif node.func.attr == "noncentral_f":
+                    needed.update({"random_noncentral_f", "random_noncentral_f_vec"})
+                elif node.func.attr == "triangular":
+                    needed.update({"random_triangular", "random_triangular_vec"})
+                elif node.func.attr == "logseries":
+                    needed.update({"random_logseries", "random_logseries_vec"})
+                elif node.func.attr == "dirichlet":
+                    needed.update({"random_dirichlet", "random_dirichlet_samples"})
+                elif node.func.attr == "multinomial":
+                    needed.update({"random_multinomial", "random_multinomial_samples"})
+                elif node.func.attr == "multivariate_hypergeometric":
+                    needed.update({"random_multivariate_hypergeometric", "random_multivariate_hypergeometric_samples"})
             if isinstance(node.func, ast.Attribute) and node.func.attr == "choice":
                 needed.add("random_choice_prob")
                 replace_false = False
@@ -2912,6 +3069,20 @@ class translator(ast.NodeVisitor):
                 and node.func.attr == "integers"
             ):
                 return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"poisson", "geometric", "binomial", "hypergeometric", "zipf", "negative_binomial", "logseries", "multinomial", "multivariate_hypergeometric"}
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {
+                    "weibull", "vonmises", "pareto", "power", "rayleigh", "gumbel",
+                    "wald", "noncentral_chisquare", "noncentral_f", "triangular",
+                    "dirichlet",
+                }
+            ):
+                return "real"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "permutation"
@@ -5227,6 +5398,8 @@ class translator(ast.NodeVisitor):
                         break
                 if ord_node is None:
                     return f"sqrt(sum(({a0})**2))"
+                if is_const_str(ord_node) and str(ord_node.value).lower() in {"fro", "f"}:
+                    return f"sqrt(sum(({a0})**2))"
                 return f"sum(abs({a0}))"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -6292,8 +6465,24 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "cov"
-                and len(node.args) >= 2
+                and len(node.args) >= 1
             ):
+                if len(node.args) == 1:
+                    rowvar = True
+                    ddof = None
+                    bias = False
+                    for kw in node.keywords:
+                        if kw.arg == "rowvar" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                            rowvar = bool(kw.value.value)
+                        elif kw.arg == "ddof":
+                            ddof = self.expr(kw.value)
+                        elif kw.arg == "bias" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, bool):
+                            bias = bool(kw.value.value)
+                    if rowvar:
+                        raise NotImplementedError("np.cov(..., rowvar=True) not supported; use rowvar=False")
+                    if ddof is None:
+                        ddof = "0" if bias else "1"
+                    return f"cov_matrix_rows_real({self.expr(node.args[0])}, int({ddof}))"
                 ddof = "1"
                 for kw in node.keywords:
                     if kw.arg == "ddof":
@@ -7412,7 +7601,7 @@ class translator(ast.NodeVisitor):
                         else:
                             self.broadcast_col2.add(t.id)
 
-                # np.random.normal(size=...)
+                # np.random.normal/standard_normal(size=...)
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
@@ -7421,9 +7610,166 @@ class translator(ast.NodeVisitor):
                     and isinstance(v.func.value.value, ast.Name)
                     and v.func.value.value.id == "np"
                     and v.func.value.attr == "random"
-                    and v.func.attr == "normal"
+                    and v.func.attr in {"normal", "standard_normal"}
                 ):
-                    self._mark_alloc_real(t.id)
+                    size_node = None
+                    if v.func.attr == "standard_normal" and len(v.args) >= 1:
+                        size_node = v.args[0]
+                    for kw in v.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if size_node is None and v.func.attr == "normal":
+                        # Keep existing behavior for normal: size required.
+                        self._mark_alloc_real(t.id)
+                    elif size_node is None:
+                        self._mark_real(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
+                        self._mark_alloc_real(t.id, rank=2)
+                    else:
+                        self._mark_alloc_real(t.id, rank=1)
+
+                # np.random.{exponential,gamma,beta,lognormal,chisquare}(..., size=...)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and v.func.attr in {
+                        "exponential", "gamma", "beta", "lognormal", "chisquare",
+                        "standard_exponential", "standard_gamma", "standard_t", "f",
+                        "laplace", "logistic", "standard_cauchy",
+                        "weibull", "vonmises",
+                        "pareto", "power", "rayleigh", "gumbel", "wald",
+                        "noncentral_chisquare", "noncentral_f", "triangular",
+                        "dirichlet",
+                    }
+                ):
+                    size_node = None
+                    dist = v.func.attr
+                    if dist == "standard_exponential" and len(v.args) >= 1:
+                        size_node = v.args[0]
+                    elif dist in {"standard_gamma", "standard_t"} and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist == "f" and len(v.args) >= 3:
+                        size_node = v.args[2]
+                    elif dist in {"laplace", "logistic"} and len(v.args) >= 3:
+                        size_node = v.args[2]
+                    elif dist == "standard_cauchy" and len(v.args) >= 1:
+                        size_node = v.args[0]
+                    elif dist == "exponential" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist in {"gamma", "beta", "lognormal"} and len(v.args) >= 3:
+                        size_node = v.args[2]
+                    elif dist == "chisquare" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist == "weibull" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist == "vonmises" and len(v.args) >= 3:
+                        size_node = v.args[2]
+                    elif dist in {"pareto", "power", "rayleigh"} and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist in {"gumbel", "wald", "noncentral_chisquare"} and len(v.args) >= 3:
+                        size_node = v.args[2]
+                    elif dist in {"noncentral_f", "triangular"} and len(v.args) >= 4:
+                        size_node = v.args[3]
+                    elif dist == "dirichlet" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    for kw in v.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if dist == "dirichlet" and size_node is None:
+                        self._mark_alloc_real(t.id, rank=1)
+                    elif dist == "dirichlet":
+                        self._mark_alloc_real(t.id, rank=2)
+                    elif size_node is None:
+                        self._mark_real(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
+                        self._mark_alloc_real(t.id, rank=2)
+                    else:
+                        self._mark_alloc_real(t.id, rank=1)
+
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and v.func.attr in {"poisson", "geometric", "binomial", "hypergeometric", "zipf", "negative_binomial", "logseries"}
+                ):
+                    size_node = None
+                    dist = v.func.attr
+                    if dist == "poisson" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist == "geometric" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist == "binomial" and len(v.args) >= 3:
+                        size_node = v.args[2]
+                    elif dist == "hypergeometric" and len(v.args) >= 4:
+                        size_node = v.args[3]
+                    elif dist == "zipf" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    elif dist == "negative_binomial" and len(v.args) >= 3:
+                        size_node = v.args[2]
+                    elif dist == "logseries" and len(v.args) >= 2:
+                        size_node = v.args[1]
+                    for kw in v.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if size_node is None:
+                        self._mark_int(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
+                        self._mark_alloc_int(t.id, rank=2)
+                    else:
+                        self._mark_alloc_int(t.id, rank=1)
+
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "multinomial"
+                ):
+                    size_node = None
+                    if len(v.args) >= 3:
+                        size_node = v.args[2]
+                    for kw in v.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if size_node is None:
+                        self._mark_alloc_int(t.id, rank=1)
+                    else:
+                        self._mark_alloc_int(t.id, rank=2)
+
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and v.func.attr == "multivariate_hypergeometric"
+                ):
+                    size_node = None
+                    if len(v.args) >= 3:
+                        size_node = v.args[2]
+                    for kw in v.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if size_node is None:
+                        self._mark_alloc_int(t.id, rank=1)
+                    else:
+                        self._mark_alloc_int(t.id, rank=2)
+
+                # np.random.multivariate_normal(..., size=n)
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Call)
+                    and isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Attribute)
+                    and isinstance(v.func.value.value, ast.Name)
+                    and v.func.value.value.id == "np"
+                    and v.func.value.attr == "random"
+                    and v.func.attr == "multivariate_normal"
+                ):
+                    self._mark_alloc_real(t.id, rank=2)
 
                 # np.random.rand(...) / np.random.randn(...)
                 if (
@@ -7442,15 +7788,29 @@ class translator(ast.NodeVisitor):
                     else:
                         self.reals.add(t.id)
 
-                # rng.normal(...)
+                # rng.normal(...) / rng.standard_normal(...)
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
                     and isinstance(v.func, ast.Attribute)
                     and isinstance(v.func.value, ast.Name)
-                    and v.func.attr == "normal"
+                    and v.func.attr in {"normal", "standard_normal"}
                 ):
-                    self._mark_alloc_real(t.id)
+                    size_node = None
+                    if v.func.attr == "standard_normal" and len(v.args) >= 1:
+                        size_node = v.args[0]
+                    for kw in v.keywords:
+                        if kw.arg == "size":
+                            size_node = kw.value
+                            break
+                    if size_node is None and v.func.attr == "normal":
+                        self._mark_alloc_real(t.id)
+                    elif size_node is None:
+                        self._mark_real(t.id)
+                    elif isinstance(size_node, (ast.Tuple, ast.List)) and len(size_node.elts) == 2:
+                        self._mark_alloc_real(t.id, rank=2)
+                    else:
+                        self._mark_alloc_real(t.id, rank=1)
 
                 # rng.choice(2, size=n, p=w)
                 if (
@@ -8248,27 +8608,40 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{t.id} = 0")
             return
 
-        # x = np.random.normal(size=n [,loc=.., scale=..]) or rng.normal(...)
+        # x = np.random.normal(...) / np.random.standard_normal(...) / rng.{...}
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and v.func.attr == "normal"
+            and v.func.attr in {"normal", "standard_normal"}
         ):
+            is_standard = (v.func.attr == "standard_normal")
             size_node = None
             loc_node = None
             scale_node = None
-            if v.args:
+            if is_standard:
+                if v.args:
+                    size_node = v.args[0]
+            elif v.args:
                 size_node = v.args[0]
             for kw in v.keywords:
                 if kw.arg == "size":
                     size_node = kw.value
-                elif kw.arg == "loc":
+                elif kw.arg == "loc" and not is_standard:
                     loc_node = kw.value
-                elif kw.arg == "scale":
+                elif kw.arg == "scale" and not is_standard:
                     scale_node = kw.value
-            if size_node is None:
+            if size_node is None and not is_standard:
                 raise NotImplementedError("np.random.normal requires size=... in this transpiler")
+            if size_node is None and is_standard:
+                self.o.w("block")
+                self.o.push()
+                self.o.w("real(kind=dp) :: tmp_norm(1)")
+                self.o.w("call random_normal_vec(tmp_norm)")
+                self.o.w(f"{t.id} = tmp_norm(1)")
+                self.o.pop()
+                self.o.w("end block")
+                return
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
             n_expr = None
             if isinstance(size_node, (ast.Tuple, ast.List)):
@@ -8290,6 +8663,8 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"allocate({t.id}(1:{n_expr}))")
                     self.o.w(f"call random_normal_vec({t.id})")
                 else:
+                    if is_standard:
+                        raise NotImplementedError("np.random.standard_normal size tuple rank > 2 not supported")
                     raise NotImplementedError("np.random.normal size tuple rank > 2 not supported")
             else:
                 n_expr = self.expr(size_node)
@@ -8308,7 +8683,7 @@ class translator(ast.NodeVisitor):
                 and isinstance(scale_node.value, ast.Name)
                 and isinstance(scale_node.slice, ast.Name)
             )
-            if n_expr is not None and loc_gather and scale_gather and loc_node.slice.id == scale_node.slice.id:
+            if (not is_standard) and n_expr is not None and loc_gather and scale_gather and loc_node.slice.id == scale_node.slice.id:
                 loc_arr = loc_node.value.id
                 scale_arr = scale_node.value.id
                 idx_arr = loc_node.slice.id
@@ -8323,10 +8698,789 @@ class translator(ast.NodeVisitor):
                 self.o.pop()
                 self.o.w("end block")
             else:
-                if loc_node is not None:
+                if (not is_standard) and loc_node is not None:
                     self.o.w(f"{t.id} = {t.id} + ({self.expr(loc_node)})")
-                if scale_node is not None:
+                if (not is_standard) and scale_node is not None:
                     self.o.w(f"{t.id} = ({self.expr(scale_node)}) * {t.id}")
+            return
+
+        # x = np.random.{exponential,gamma,beta,lognormal,chisquare}(..., size=...)
+        # or rng.{...}(...) with compatible signatures.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {
+                "exponential", "gamma", "beta", "lognormal", "chisquare",
+                "standard_exponential", "standard_gamma", "standard_t", "f",
+                "laplace", "logistic", "standard_cauchy",
+                "weibull", "vonmises",
+                "pareto", "power", "rayleigh", "gumbel", "wald",
+                "noncentral_chisquare", "noncentral_f", "triangular",
+                "dirichlet",
+            }
+        ):
+            dist = v.func.attr
+            size_node = None
+            p0 = None
+            p1 = None
+            p2 = None
+            if dist == "exponential":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # scale
+            elif dist == "standard_exponential":
+                pass
+            elif dist == "gamma":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # shape
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # scale
+            elif dist == "standard_gamma":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # shape
+            elif dist == "beta":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # a
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # b
+            elif dist == "lognormal":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # mean
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # sigma
+            elif dist == "chisquare":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # df
+            elif dist == "standard_t":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # df
+            elif dist == "f":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # dfnum
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # dfden
+            elif dist == "laplace":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # loc
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # scale
+            elif dist == "logistic":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # loc
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # scale
+            elif dist == "standard_cauchy":
+                pass
+            elif dist == "weibull":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # a
+            elif dist == "vonmises":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # mu/loc (currently ignored)
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # kappa
+            elif dist == "pareto":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # a
+            elif dist == "power":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # a
+            elif dist == "rayleigh":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # scale
+            elif dist == "gumbel":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # loc
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # scale
+            elif dist == "wald":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # mean
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # scale
+            elif dist == "noncentral_chisquare":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # df
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # nonc
+            elif dist == "noncentral_f":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # dfnum
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # dfden
+                if len(v.args) >= 3:
+                    p2 = v.args[2]  # nonc
+            elif dist == "triangular":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # left
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # mode
+                if len(v.args) >= 3:
+                    p2 = v.args[2]  # right
+            elif dist == "dirichlet":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # alpha
+            for kw in v.keywords:
+                if kw.arg == "size":
+                    size_node = kw.value
+                elif dist == "exponential" and kw.arg == "scale":
+                    p0 = kw.value
+                elif dist == "standard_exponential" and kw.arg == "size":
+                    size_node = kw.value
+                elif dist == "gamma" and kw.arg == "shape":
+                    p0 = kw.value
+                elif dist == "gamma" and kw.arg == "scale":
+                    p1 = kw.value
+                elif dist == "standard_gamma" and kw.arg == "shape":
+                    p0 = kw.value
+                elif dist == "beta" and kw.arg in {"a"}:
+                    p0 = kw.value
+                elif dist == "beta" and kw.arg in {"b"}:
+                    p1 = kw.value
+                elif dist == "lognormal" and kw.arg in {"mean", "meanlog"}:
+                    p0 = kw.value
+                elif dist == "lognormal" and kw.arg in {"sigma", "sd", "sdlog"}:
+                    p1 = kw.value
+                elif dist == "chisquare" and kw.arg in {"df"}:
+                    p0 = kw.value
+                elif dist == "standard_t" and kw.arg in {"df"}:
+                    p0 = kw.value
+                elif dist == "f" and kw.arg in {"dfnum", "dfn"}:
+                    p0 = kw.value
+                elif dist == "f" and kw.arg in {"dfden", "dfd"}:
+                    p1 = kw.value
+                elif dist in {"laplace", "logistic"} and kw.arg == "loc":
+                    p0 = kw.value
+                elif dist in {"laplace", "logistic"} and kw.arg == "scale":
+                    p1 = kw.value
+                elif dist == "weibull" and kw.arg == "a":
+                    p0 = kw.value
+                elif dist == "vonmises" and kw.arg in {"mu", "loc"}:
+                    p0 = kw.value
+                elif dist == "vonmises" and kw.arg == "kappa":
+                    p1 = kw.value
+                elif dist in {"pareto", "power"} and kw.arg == "a":
+                    p0 = kw.value
+                elif dist == "rayleigh" and kw.arg == "scale":
+                    p0 = kw.value
+                elif dist == "gumbel" and kw.arg == "loc":
+                    p0 = kw.value
+                elif dist == "gumbel" and kw.arg == "scale":
+                    p1 = kw.value
+                elif dist == "wald" and kw.arg == "mean":
+                    p0 = kw.value
+                elif dist == "wald" and kw.arg == "scale":
+                    p1 = kw.value
+                elif dist == "noncentral_chisquare" and kw.arg == "df":
+                    p0 = kw.value
+                elif dist == "noncentral_chisquare" and kw.arg in {"nonc", "noncentral"}:
+                    p1 = kw.value
+                elif dist == "noncentral_f" and kw.arg in {"dfnum", "dfn"}:
+                    p0 = kw.value
+                elif dist == "noncentral_f" and kw.arg in {"dfden", "dfd"}:
+                    p1 = kw.value
+                elif dist == "noncentral_f" and kw.arg in {"nonc", "noncentral"}:
+                    p2 = kw.value
+                elif dist == "triangular" and kw.arg == "left":
+                    p0 = kw.value
+                elif dist == "triangular" and kw.arg == "mode":
+                    p1 = kw.value
+                elif dist == "triangular" and kw.arg == "right":
+                    p2 = kw.value
+                elif dist == "dirichlet" and kw.arg == "alpha":
+                    p0 = kw.value
+            if size_node is None and len(v.args) >= 2 and dist == "exponential":
+                size_node = v.args[1]
+            if size_node is None and len(v.args) >= 1 and dist == "standard_exponential":
+                size_node = v.args[0]
+            if size_node is None and len(v.args) >= 3 and dist in {"gamma", "beta", "lognormal"}:
+                size_node = v.args[2]
+            if size_node is None and len(v.args) >= 2 and dist == "standard_gamma":
+                size_node = v.args[1]
+            if size_node is None and len(v.args) >= 2 and dist == "chisquare":
+                size_node = v.args[1]
+            if size_node is None and len(v.args) >= 2 and dist == "standard_t":
+                size_node = v.args[1]
+            if size_node is None and len(v.args) >= 3 and dist == "f":
+                size_node = v.args[2]
+            if size_node is None and len(v.args) >= 3 and dist in {"laplace", "logistic"}:
+                size_node = v.args[2]
+            if size_node is None and len(v.args) >= 1 and dist == "standard_cauchy":
+                size_node = v.args[0]
+            if size_node is None and len(v.args) >= 2 and dist == "weibull":
+                size_node = v.args[1]
+            if size_node is None and len(v.args) >= 3 and dist == "vonmises":
+                size_node = v.args[2]
+            if size_node is None and len(v.args) >= 2 and dist in {"pareto", "power", "rayleigh"}:
+                size_node = v.args[1]
+            if size_node is None and len(v.args) >= 3 and dist in {"gumbel", "wald", "noncentral_chisquare"}:
+                size_node = v.args[2]
+            if size_node is None and len(v.args) >= 4 and dist in {"noncentral_f", "triangular"}:
+                size_node = v.args[3]
+            if size_node is None and len(v.args) >= 2 and dist == "dirichlet":
+                size_node = v.args[1]
+
+            if dist == "dirichlet":
+                if p0 is None:
+                    raise NotImplementedError("np.random.dirichlet requires alpha")
+                alpha_expr = self.expr(p0)
+                self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+                if size_node is None:
+                    self.o.w(f"allocate({t.id}(1:size({alpha_expr})))")
+                    self.o.w(f"call random_dirichlet({alpha_expr}, {t.id})")
+                    return
+                if isinstance(size_node, (ast.Tuple, ast.List)):
+                    if len(size_node.elts) == 1:
+                        n0 = self.expr(size_node.elts[0])
+                    else:
+                        raise NotImplementedError("np.random.dirichlet currently supports scalar size only")
+                else:
+                    n0 = self.expr(size_node)
+                self.o.w(f"allocate({t.id}(1:{n0},1:size({alpha_expr})))")
+                self.o.w(f"call random_dirichlet_samples({alpha_expr}, {t.id})")
+                return
+
+            def _dist_call_vec(vec_name):
+                if dist == "exponential":
+                    if p0 is None:
+                        self.o.w(f"call random_exponential_vec({vec_name})")
+                    else:
+                        self.o.w(f"call random_exponential_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "standard_exponential":
+                    self.o.w(f"call random_exponential_vec({vec_name})")
+                elif dist == "gamma":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.gamma requires shape")
+                    if p1 is None:
+                        self.o.w(f"call random_gamma_vec({vec_name}, {self.expr(p0)})")
+                    else:
+                        self.o.w(f"call random_gamma_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "standard_gamma":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.standard_gamma requires shape")
+                    self.o.w(f"call random_gamma_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "beta":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.beta requires a and b")
+                    self.o.w(f"call random_beta_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "lognormal":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"call random_lognormal_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"call random_lognormal_vec({vec_name}, meanlog={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"call random_lognormal_vec({vec_name}, sdlog={self.expr(p1)})")
+                    else:
+                        self.o.w(f"call random_lognormal_vec({vec_name})")
+                elif dist == "chisquare":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.chisquare requires df")
+                    self.o.w(f"call random_chisquare_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "standard_t":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.standard_t requires df")
+                    self.o.w(f"call random_student_t_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "f":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.f requires dfnum and dfden")
+                    self.o.w(f"call random_f_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "laplace":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"call random_laplace_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"call random_laplace_vec({vec_name}, loc={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"call random_laplace_vec({vec_name}, scale={self.expr(p1)})")
+                    else:
+                        self.o.w(f"call random_laplace_vec({vec_name})")
+                elif dist == "logistic":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"call random_logistic_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"call random_logistic_vec({vec_name}, loc={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"call random_logistic_vec({vec_name}, scale={self.expr(p1)})")
+                    else:
+                        self.o.w(f"call random_logistic_vec({vec_name})")
+                elif dist == "standard_cauchy":
+                    self.o.w(f"call random_cauchy_vec({vec_name})")
+                elif dist == "weibull":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.weibull requires a")
+                    self.o.w(f"call random_weibull_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "vonmises":
+                    if p1 is None:
+                        raise NotImplementedError("np.random.vonmises requires kappa")
+                    self.o.w(f"call random_von_mises_vec({vec_name}, {self.expr(p1)})")
+                elif dist == "pareto":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.pareto requires a")
+                    self.o.w(f"call random_pareto_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "power":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.power requires a")
+                    self.o.w(f"call random_power_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "rayleigh":
+                    if p0 is None:
+                        self.o.w(f"call random_rayleigh_vec({vec_name})")
+                    else:
+                        self.o.w(f"call random_rayleigh_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "gumbel":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"call random_gumbel_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"call random_gumbel_vec({vec_name}, loc={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"call random_gumbel_vec({vec_name}, scale={self.expr(p1)})")
+                    else:
+                        self.o.w(f"call random_gumbel_vec({vec_name})")
+                elif dist == "wald":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.wald requires mean and scale")
+                    self.o.w(f"call random_wald_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "noncentral_chisquare":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.noncentral_chisquare requires df and nonc")
+                    self.o.w(f"call random_noncentral_chisquare_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "noncentral_f":
+                    if p0 is None or p1 is None or p2 is None:
+                        raise NotImplementedError("np.random.noncentral_f requires dfnum, dfden, nonc")
+                    self.o.w(f"call random_noncentral_f_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)}, {self.expr(p2)})")
+                elif dist == "triangular":
+                    if p0 is None or p1 is None or p2 is None:
+                        raise NotImplementedError("np.random.triangular requires left, mode, right")
+                    self.o.w(f"call random_triangular_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)}, {self.expr(p2)})")
+
+            if size_node is None:
+                if dist == "exponential":
+                    if p0 is None:
+                        self.o.w(f"{t.id} = random_exponential()")
+                    else:
+                        self.o.w(f"{t.id} = random_exponential({self.expr(p0)})")
+                elif dist == "standard_exponential":
+                    self.o.w(f"{t.id} = random_exponential()")
+                elif dist == "gamma":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.gamma requires shape")
+                    if p1 is None:
+                        self.o.w(f"{t.id} = random_gamma({self.expr(p0)})")
+                    else:
+                        self.o.w(f"{t.id} = random_gamma({self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "standard_gamma":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.standard_gamma requires shape")
+                    self.o.w(f"{t.id} = random_gamma({self.expr(p0)})")
+                elif dist == "beta":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.beta requires a and b")
+                    self.o.w(f"{t.id} = random_beta({self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "lognormal":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"{t.id} = random_lognormal({self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"{t.id} = random_lognormal(meanlog={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"{t.id} = random_lognormal(sdlog={self.expr(p1)})")
+                    else:
+                        self.o.w(f"{t.id} = random_lognormal()")
+                elif dist == "chisquare":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.chisquare requires df")
+                    self.o.w(f"{t.id} = random_chisquare({self.expr(p0)})")
+                elif dist == "standard_t":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.standard_t requires df")
+                    self.o.w(f"{t.id} = random_student_t({self.expr(p0)})")
+                elif dist == "f":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.f requires dfnum and dfden")
+                    self.o.w(f"{t.id} = random_f({self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "laplace":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"{t.id} = random_laplace({self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"{t.id} = random_laplace(loc={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"{t.id} = random_laplace(scale={self.expr(p1)})")
+                    else:
+                        self.o.w(f"{t.id} = random_laplace()")
+                elif dist == "logistic":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"{t.id} = random_logistic({self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"{t.id} = random_logistic(loc={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"{t.id} = random_logistic(scale={self.expr(p1)})")
+                    else:
+                        self.o.w(f"{t.id} = random_logistic()")
+                elif dist == "standard_cauchy":
+                    self.o.w(f"{t.id} = random_cauchy()")
+                elif dist == "weibull":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.weibull requires a")
+                    self.o.w(f"{t.id} = random_weibull({self.expr(p0)})")
+                elif dist == "vonmises":
+                    if p1 is None:
+                        raise NotImplementedError("np.random.vonmises requires kappa")
+                    self.o.w(f"{t.id} = random_von_mises({self.expr(p1)})")
+                elif dist == "pareto":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.pareto requires a")
+                    self.o.w(f"{t.id} = random_pareto({self.expr(p0)})")
+                elif dist == "power":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.power requires a")
+                    self.o.w(f"{t.id} = random_power({self.expr(p0)})")
+                elif dist == "rayleigh":
+                    if p0 is None:
+                        self.o.w(f"{t.id} = random_rayleigh()")
+                    else:
+                        self.o.w(f"{t.id} = random_rayleigh({self.expr(p0)})")
+                elif dist == "gumbel":
+                    if p0 is not None and p1 is not None:
+                        self.o.w(f"{t.id} = random_gumbel({self.expr(p0)}, {self.expr(p1)})")
+                    elif p0 is not None:
+                        self.o.w(f"{t.id} = random_gumbel(loc={self.expr(p0)})")
+                    elif p1 is not None:
+                        self.o.w(f"{t.id} = random_gumbel(scale={self.expr(p1)})")
+                    else:
+                        self.o.w(f"{t.id} = random_gumbel()")
+                elif dist == "wald":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.wald requires mean and scale")
+                    self.o.w(f"{t.id} = random_wald({self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "noncentral_chisquare":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.noncentral_chisquare requires df and nonc")
+                    self.o.w(f"{t.id} = random_noncentral_chisquare({self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "noncentral_f":
+                    if p0 is None or p1 is None or p2 is None:
+                        raise NotImplementedError("np.random.noncentral_f requires dfnum, dfden, nonc")
+                    self.o.w(f"{t.id} = random_noncentral_f({self.expr(p0)}, {self.expr(p1)}, {self.expr(p2)})")
+                elif dist == "triangular":
+                    if p0 is None or p1 is None or p2 is None:
+                        raise NotImplementedError("np.random.triangular requires left, mode, right")
+                    self.o.w(f"{t.id} = random_triangular({self.expr(p0)}, {self.expr(p1)}, {self.expr(p2)})")
+                return
+
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 2:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp), allocatable :: tmp_rv(:)")
+                    self.o.w(f"allocate(tmp_rv(1:({n0})*({n1})))")
+                    _dist_call_vec("tmp_rv")
+                    self.o.w(f"{t.id} = reshape(tmp_rv, [({n0}), ({n1})])")
+                    self.o.w("if (allocated(tmp_rv)) deallocate(tmp_rv)")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
+                if len(size_node.elts) == 1:
+                    n0 = self.expr(size_node.elts[0])
+                    self.o.w(f"allocate({t.id}(1:{n0}))")
+                    _dist_call_vec(t.id)
+                    return
+                raise NotImplementedError(f"np.random.{dist} size tuple rank > 2 not supported")
+            n0 = self.expr(size_node)
+            self.o.w(f"allocate({t.id}(1:{n0}))")
+            _dist_call_vec(t.id)
+            return
+
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"poisson", "geometric", "binomial", "hypergeometric", "zipf", "negative_binomial", "logseries"}
+        ):
+            dist = v.func.attr
+            size_node = None
+            p0 = None
+            p1 = None
+            p2 = None
+            if dist == "poisson":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # lam
+            elif dist == "geometric":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # p
+            elif dist == "binomial":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # n
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # p
+            elif dist == "hypergeometric":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # ngood
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # nbad
+                if len(v.args) >= 3:
+                    p2 = v.args[2]  # nsample
+            elif dist == "zipf":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # a
+            elif dist == "negative_binomial":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # n/sk
+                if len(v.args) >= 2:
+                    p1 = v.args[1]  # p
+            elif dist == "logseries":
+                if len(v.args) >= 1:
+                    p0 = v.args[0]  # p
+            for kw in v.keywords:
+                if kw.arg == "size":
+                    size_node = kw.value
+                elif dist == "poisson" and kw.arg in {"lam"}:
+                    p0 = kw.value
+                elif dist == "geometric" and kw.arg in {"p"}:
+                    p0 = kw.value
+                elif dist == "binomial" and kw.arg in {"n"}:
+                    p0 = kw.value
+                elif dist == "binomial" and kw.arg in {"p"}:
+                    p1 = kw.value
+                elif dist == "hypergeometric" and kw.arg in {"ngood"}:
+                    p0 = kw.value
+                elif dist == "hypergeometric" and kw.arg in {"nbad"}:
+                    p1 = kw.value
+                elif dist == "hypergeometric" and kw.arg in {"nsample"}:
+                    p2 = kw.value
+                elif dist == "zipf" and kw.arg in {"a"}:
+                    p0 = kw.value
+                elif dist == "negative_binomial" and kw.arg == "n":
+                    p0 = kw.value
+                elif dist == "negative_binomial" and kw.arg == "p":
+                    p1 = kw.value
+                elif dist == "logseries" and kw.arg == "p":
+                    p0 = kw.value
+            if size_node is None and dist == "poisson" and len(v.args) >= 2:
+                size_node = v.args[1]
+            if size_node is None and dist == "geometric" and len(v.args) >= 2:
+                size_node = v.args[1]
+            if size_node is None and dist == "binomial" and len(v.args) >= 3:
+                size_node = v.args[2]
+            if size_node is None and dist == "hypergeometric" and len(v.args) >= 4:
+                size_node = v.args[3]
+            if size_node is None and dist == "zipf" and len(v.args) >= 2:
+                size_node = v.args[1]
+            if size_node is None and dist == "negative_binomial" and len(v.args) >= 3:
+                size_node = v.args[2]
+            if size_node is None and dist == "logseries" and len(v.args) >= 2:
+                size_node = v.args[1]
+
+            def _idist_call_vec(vec_name):
+                if dist == "poisson":
+                    if p0 is None:
+                        self.o.w(f"call random_poisson_vec({vec_name}, 1.0_dp)")
+                    else:
+                        self.o.w(f"call random_poisson_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "geometric":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.geometric requires p")
+                    self.o.w(f"call random_geometric_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "binomial":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.binomial requires n and p")
+                    self.o.w(f"call random_binomial_vec({vec_name}, int({self.expr(p0)}), {self.expr(p1)})")
+                elif dist == "hypergeometric":
+                    if p0 is None or p1 is None or p2 is None:
+                        raise NotImplementedError("np.random.hypergeometric requires ngood, nbad, nsample")
+                    self.o.w(
+                        f"call random_hypergeometric_vec({vec_name}, int({self.expr(p0)}), int({self.expr(p1)}), int({self.expr(p2)}))"
+                    )
+                elif dist == "zipf":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.zipf requires a")
+                    self.o.w(f"call random_zipf_vec({vec_name}, {self.expr(p0)})")
+                elif dist == "negative_binomial":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.negative_binomial requires n and p")
+                    self.o.w(f"call random_neg_binomial_vec({vec_name}, {self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "logseries":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.logseries requires p")
+                    self.o.w(f"call random_logseries_vec({vec_name}, {self.expr(p0)})")
+
+            if size_node is None:
+                if dist == "poisson":
+                    if p0 is None:
+                        self.o.w(f"{t.id} = random_poisson(1.0_dp)")
+                    else:
+                        self.o.w(f"{t.id} = random_poisson({self.expr(p0)})")
+                elif dist == "geometric":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.geometric requires p")
+                    self.o.w(f"{t.id} = random_geometric({self.expr(p0)})")
+                elif dist == "binomial":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.binomial requires n and p")
+                    self.o.w(f"{t.id} = random_binomial(int({self.expr(p0)}), {self.expr(p1)})")
+                elif dist == "hypergeometric":
+                    if p0 is None or p1 is None or p2 is None:
+                        raise NotImplementedError("np.random.hypergeometric requires ngood, nbad, nsample")
+                    self.o.w(
+                        f"{t.id} = random_hypergeometric(int({self.expr(p0)}), int({self.expr(p1)}), int({self.expr(p2)}))"
+                    )
+                elif dist == "zipf":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.zipf requires a")
+                    self.o.w(f"{t.id} = random_zipf({self.expr(p0)})")
+                elif dist == "negative_binomial":
+                    if p0 is None or p1 is None:
+                        raise NotImplementedError("np.random.negative_binomial requires n and p")
+                    self.o.w(f"{t.id} = random_neg_binomial({self.expr(p0)}, {self.expr(p1)})")
+                elif dist == "logseries":
+                    if p0 is None:
+                        raise NotImplementedError("np.random.logseries requires p")
+                    self.o.w(f"{t.id} = random_logseries({self.expr(p0)})")
+                return
+
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 2:
+                    n0 = self.expr(size_node.elts[0])
+                    n1 = self.expr(size_node.elts[1])
+                    self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("integer, allocatable :: tmp_iv(:)")
+                    self.o.w(f"allocate(tmp_iv(1:({n0})*({n1})))")
+                    _idist_call_vec("tmp_iv")
+                    self.o.w(f"{t.id} = reshape(tmp_iv, [({n0}), ({n1})])")
+                    self.o.w("if (allocated(tmp_iv)) deallocate(tmp_iv)")
+                    self.o.pop()
+                    self.o.w("end block")
+                    return
+                if len(size_node.elts) == 1:
+                    n0 = self.expr(size_node.elts[0])
+                    self.o.w(f"allocate({t.id}(1:{n0}))")
+                    _idist_call_vec(t.id)
+                    return
+                raise NotImplementedError(f"np.random.{dist} size tuple rank > 2 not supported")
+            n0 = self.expr(size_node)
+            self.o.w(f"allocate({t.id}(1:{n0}))")
+            _idist_call_vec(t.id)
+            return
+
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "multinomial"
+        ):
+            p_n = None
+            p_pvals = None
+            size_node = None
+            if len(v.args) >= 1:
+                p_n = v.args[0]
+            if len(v.args) >= 2:
+                p_pvals = v.args[1]
+            if len(v.args) >= 3:
+                size_node = v.args[2]
+            for kw in v.keywords:
+                if kw.arg == "n":
+                    p_n = kw.value
+                elif kw.arg in {"pvals", "p"}:
+                    p_pvals = kw.value
+                elif kw.arg == "size":
+                    size_node = kw.value
+            if p_n is None or p_pvals is None:
+                raise NotImplementedError("np.random.multinomial requires n and pvals")
+            n_expr = f"int({self.expr(p_n)})"
+            p_expr = self.expr(p_pvals)
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            if size_node is None:
+                self.o.w(f"allocate({t.id}(1:size({p_expr})))")
+                self.o.w(f"call random_multinomial({n_expr}, {p_expr}, {t.id})")
+                return
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 1:
+                    n0 = self.expr(size_node.elts[0])
+                else:
+                    raise NotImplementedError("np.random.multinomial currently supports scalar size only")
+            else:
+                n0 = self.expr(size_node)
+            self.o.w(f"allocate({t.id}(1:{n0},1:size({p_expr})))")
+            self.o.w(f"call random_multinomial_samples({n_expr}, {p_expr}, {t.id})")
+            return
+
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "multivariate_hypergeometric"
+        ):
+            p_ngood = None
+            p_nsample = None
+            size_node = None
+            method_node = None
+            if len(v.args) >= 1:
+                p_ngood = v.args[0]
+            if len(v.args) >= 2:
+                p_nsample = v.args[1]
+            if len(v.args) >= 3:
+                size_node = v.args[2]
+            for kw in v.keywords:
+                if kw.arg in {"ngood", "colors"}:
+                    p_ngood = kw.value
+                elif kw.arg in {"nsample", "nsamples"}:
+                    p_nsample = kw.value
+                elif kw.arg == "size":
+                    size_node = kw.value
+                elif kw.arg == "method":
+                    method_node = kw.value
+            if method_node is not None and not (
+                isinstance(method_node, ast.Constant) and isinstance(method_node.value, str) and method_node.value == "marginals"
+            ):
+                raise NotImplementedError("np.random.multivariate_hypergeometric currently supports method='marginals' only")
+            if p_ngood is None or p_nsample is None:
+                raise NotImplementedError("np.random.multivariate_hypergeometric requires ngood/colors and nsample")
+            ngood_expr = self.expr(p_ngood)
+            ns_expr = f"int({self.expr(p_nsample)})"
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            if size_node is None:
+                self.o.w(f"allocate({t.id}(1:size({ngood_expr})))")
+                self.o.w(f"call random_multivariate_hypergeometric({ngood_expr}, {ns_expr}, {t.id})")
+                return
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                if len(size_node.elts) == 1:
+                    n0 = self.expr(size_node.elts[0])
+                else:
+                    raise NotImplementedError("np.random.multivariate_hypergeometric currently supports scalar size only")
+            else:
+                n0 = self.expr(size_node)
+            self.o.w(f"allocate({t.id}(1:{n0},1:size({ngood_expr})))")
+            self.o.w(f"call random_multivariate_hypergeometric_samples({ngood_expr}, {ns_expr}, {t.id})")
+            return
+
+        # x = np.random.multivariate_normal(mean, cov, size=n)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Attribute)
+            and isinstance(v.func.value.value, ast.Name)
+            and v.func.value.value.id == "np"
+            and v.func.value.attr == "random"
+            and v.func.attr == "multivariate_normal"
+            and len(v.args) >= 2
+        ):
+            mean_expr = self.expr(v.args[0])
+            cov_expr = self.expr(v.args[1])
+            size_node = v.args[2] if len(v.args) >= 3 else None
+            for kw in v.keywords:
+                if kw.arg == "size":
+                    size_node = kw.value
+            if size_node is None:
+                raise NotImplementedError("np.random.multivariate_normal currently requires size=...")
+            if isinstance(size_node, (ast.Tuple, ast.List)):
+                raise NotImplementedError("np.random.multivariate_normal size tuple not supported")
+            n_expr = self.expr(size_node)
+            self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            self.o.w(f"allocate({t.id}(1:{n_expr},1:size({mean_expr})))")
+            self.o.w(f"call random_mvn_samples({mean_expr}, {cov_expr}, {t.id})")
             return
 
         # x = np.random.rand(n0, n1, ...) / np.random.randn(n0, n1, ...)
@@ -11098,7 +12252,7 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
             missing_modules.append((mod, ""))
 
     # LAPACK linkage support for numpy.linalg wrappers in python_mod.
-    if re.search(r"\blinalg_(solve|det|inv|eig|svd)\s*\(", src, flags=re.IGNORECASE):
+    if re.search(r"\b(linalg_(solve|det|inv|eig|svd)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
         lapack_src = Path("lapack_d.f90")
         lapack_s = str(lapack_src)
         if lapack_src.exists():
