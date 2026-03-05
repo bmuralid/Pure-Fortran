@@ -1125,6 +1125,8 @@ def detect_needed_helpers(tree):
             ):
                 if node.func.attr == "solve":
                     needed.add("linalg_solve")
+                elif node.func.attr == "cholesky":
+                    needed.add("linalg_cholesky")
                 elif node.func.attr == "det":
                     needed.add("linalg_det")
                 elif node.func.attr == "inv":
@@ -3072,6 +3074,16 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Attribute)
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "cholesky"
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
                 and node.func.value.attr == "random"
                 and node.func.attr in {"rand", "randn"}
             ):
@@ -4028,6 +4040,8 @@ class translator(ast.NodeVisitor):
             ):
                 if node.func.attr == "solve" and len(node.args) >= 2:
                     return self._rank_expr(node.args[1])
+                if node.func.attr == "cholesky" and len(node.args) >= 1:
+                    return 2
                 if node.func.attr == "det" and len(node.args) >= 1:
                     return 0
                 if node.func.attr == "inv" and len(node.args) >= 1:
@@ -5405,6 +5419,16 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 2
             ):
                 return f"linalg_solve({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "linalg"
+                and node.func.attr == "cholesky"
+                and len(node.args) >= 1
+            ):
+                return f"linalg_cholesky({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
@@ -12459,7 +12483,7 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
             missing_modules.append((mod, ""))
 
     # LAPACK linkage support for numpy.linalg wrappers in python_mod.
-    if re.search(r"\b(linalg_(solve|det|inv|eig|svd)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
+    if re.search(r"\b(linalg_(solve|cholesky|det|inv|eig|svd)|random_mvn_samples)\s*\(", src, flags=re.IGNORECASE):
         lapack_src = Path("lapack_d.f90")
         lapack_s = str(lapack_src)
         if lapack_src.exists():

@@ -161,6 +161,7 @@ public :: reduceat_logical_or !@pyapi kind=function ret=logical(:) args=x:logica
 public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in) desc="solve linear system A x = b using LAPACK DGESV"
+public :: linalg_cholesky !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="lower-triangular Cholesky factor using LAPACK DPOTRF"
 public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="determinant of square matrix using LAPACK DGETRF"
 public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="matrix inverse using LAPACK DGETRF/DGETRI"
 public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="right eigenpairs of real square matrix using LAPACK DGEEV (real-spectrum only)"
@@ -2890,6 +2891,31 @@ contains
          allocate(x(1:n,1:nrhs))
          x = bc
       end function linalg_solve_mat
+
+      function linalg_cholesky(a) result(l)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable :: l(:,:)
+         integer :: n, i, j, info
+         interface
+            subroutine dpotrf(uplo, n, a, lda, info)
+               character(len=1), intent(in) :: uplo
+               integer, intent(in) :: n, lda
+               double precision, intent(inout) :: a(lda,*)
+               integer, intent(out) :: info
+            end subroutine dpotrf
+         end interface
+         n = size(a,1)
+         if (size(a,2) /= n) stop "linalg_cholesky: matrix must be square"
+         allocate(l(1:n,1:n), source=a)
+         call dpotrf('L', n, l, n, info)
+         if (info < 0) stop "linalg_cholesky: dpotrf argument error"
+         if (info > 0) stop "linalg_cholesky: matrix is not positive definite"
+         do i = 1, n
+            do j = i + 1, n
+               l(i,j) = 0.0_dp
+            end do
+         end do
+      end function linalg_cholesky
 
       function linalg_det(a) result(detv)
          real(kind=dp), intent(in) :: a(:,:)
