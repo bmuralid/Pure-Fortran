@@ -665,6 +665,12 @@ def simplify_generated_parentheses(lines):
 
         # Keyword args like dim=(1) -> dim=1
         code = re.sub(r"\b(dim|axis|ncopies)\s*=\s*\(\s*([^()]+?)\s*\)", r"\1=\2", code, flags=re.IGNORECASE)
+        # Avoid "op - -x" form that triggers compiler warnings in legacy mode.
+        code = re.sub(
+            r"([+\-*/])\s*-\s*([A-Za-z_]\w*|\d+(?:\.\d*)?(?:_dp)?)",
+            r"\1 (-\2)",
+            code,
+        )
 
         # Assignment RHS outer-paren cleanup:
         #   x = (expr) -> x = expr
@@ -771,6 +777,22 @@ def simplify_redundant_int_casts(lines):
             lambda m: m.group(1) if m.group(1).lower() in int_names else m.group(0),
             code,
         )
+        if bang:
+            out.append(code + bang + comment)
+        else:
+            out.append(code)
+    return out
+
+
+def normalize_unary_minus_after_operator(lines):
+    """Rewrite `op -x` forms as `op (-x)` to avoid parser warnings."""
+    out = []
+    pat = re.compile(
+        r"([+\-*/])\s*-\s*([A-Za-z_]\w*|\d+(?:\.\d*)?(?:_dp)?)"
+    )
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        code = pat.sub(r"\1 (-\2)", code)
         if bang:
             out.append(code + bang + comment)
         else:
@@ -3082,6 +3104,7 @@ class translator(ast.NodeVisitor):
         local_generic_overloads=None,
         user_class_types=None,
         local_func_dict_arg_types=None,
+        local_elemental_funcs=None,
         structured_type_components=None,
         structured_array_types=None,
         structured_dtype_strings=None,
@@ -3125,6 +3148,7 @@ class translator(ast.NodeVisitor):
         self.local_generic_overloads = set(local_generic_overloads or [])
         self.user_class_types = dict(user_class_types or {})
         self.local_func_dict_arg_types = dict(local_func_dict_arg_types or {})
+        self.local_elemental_funcs = set(local_elemental_funcs or [])
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
@@ -4750,6 +4774,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id in {"log_normal_pdf_1d", "normal_logpdf_1d"}:
                     return 2
+                if node.func.id in self.local_elemental_funcs and len(node.args) >= 1:
+                    return max(self._rank_expr(a) for a in node.args)
                 if node.func.id == "reshape" and len(node.args) >= 2 and isinstance(node.args[1], ast.List):
                     return max(1, len(node.args[1].elts))
                 if node.func.id == "spread" and len(node.args) >= 1:
@@ -8234,16 +8260,28 @@ class translator(ast.NodeVisitor):
                     and v.func.id in self.local_return_specs
                 ):
                     spec = self.local_return_specs[v.func.id]
+                    rr_v = max(0, int(self._rank_expr(v)))
                     if spec == "alloc_real":
-                        self._mark_alloc_real(t.id, rank=max(1, self._rank_expr(v)))
+                        self._mark_alloc_real(t.id, rank=max(1, rr_v))
                     elif spec == "alloc_int":
-                        self._mark_alloc_int(t.id)
+                        self._mark_alloc_int(t.id, rank=max(1, rr_v))
                     elif spec == "alloc_log":
-                        self._mark_alloc_log(t.id)
+                        self._mark_alloc_log(t.id, rank=max(1, rr_v))
                     elif spec == "real":
-                        self._mark_real(t.id)
+                        if rr_v > 0:
+                            self._mark_alloc_real(t.id, rank=rr_v)
+                        else:
+                            self._mark_real(t.id)
                     elif spec == "int":
-                        self._mark_int(t.id)
+                        if rr_v > 0:
+                            self._mark_alloc_int(t.id, rank=rr_v)
+                        else:
+                            self._mark_int(t.id)
+                    elif spec == "logical":
+                        if rr_v > 0:
+                            self._mark_alloc_log(t.id, rank=rr_v)
+                        else:
+                            self._mark_log(t.id)
                 if (
                     isinstance(t, ast.Name)
                     and isinstance(v, ast.Call)
@@ -9593,10 +9631,23 @@ class translator(ast.NodeVisitor):
             # If the target is a known typed-dict variable, emit component
             # assignments (and allocation-on-assignment for array components).
             if t.id in self.dict_typed_vars:
+                tnm = self.dict_typed_vars[t.id]
+                comp_map = self.dict_type_components.get(tnm, {})
+                pairs = []
                 for k, vv in zip(v.keys, v.values):
                     if not (isinstance(k, ast.Constant) and isinstance(k.value, str)):
                         raise NotImplementedError("dict keys must be string constants")
-                    lhs = f"{t.id}%{k.value}"
+                    pairs.append((k.value, vv))
+                key_set = {k for k, _ in pairs}
+                comp_names = list(comp_map.keys())
+                # Prefer default structure constructor when all components are present.
+                if comp_names and key_set == set(comp_names):
+                    val_by_key = {k: vv for k, vv in pairs}
+                    ctor_args = ", ".join(self.expr(val_by_key[c]) for c in comp_names)
+                    self.o.w(f"{t.id} = {tnm}({ctor_args})")
+                    return
+                for k, vv in pairs:
+                    lhs = f"{t.id}%{k}"
                     rhs = self.expr(vv)
                     self.o.w(f"{lhs} = {rhs}")
                 return
@@ -12572,6 +12623,7 @@ def _emit_local_function(
         local_generic_overloads=local_generic_overloads,
         user_class_types=user_class_types,
         local_func_dict_arg_types=local_func_dict_arg_types,
+        local_elemental_funcs=elemental_funcs,
     )
     # Scope comment emission to this procedure body; otherwise comments from
     # earlier procedures leak into the first emitted statement.
@@ -13710,6 +13762,7 @@ def generate_flat(
         local_generic_overloads=local_generic_overloads,
         user_class_types=user_class_types,
         local_func_dict_arg_types=local_func_dict_arg_types,
+        local_elemental_funcs=elemental_targets,
         structured_type_components=structured_type_components,
         structured_array_types=structured_array_types,
         structured_dtype_strings=structured_dtype_strings,
@@ -14337,6 +14390,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = simplify_allocate_shape_to_mold(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_redundant_parens_in_lines(f90_lines)
+    f90_lines = normalize_unary_minus_after_operator(f90_lines)
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = remove_empty_if_blocks(f90_lines)
     f90_lines = inline_shape_comments(f90_lines)
@@ -14353,6 +14407,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     # Final loop-index normalization pass after all other line rewrites.
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = simplify_redundant_int_casts(f90_lines)
+    f90_lines = normalize_unary_minus_after_operator(f90_lines)
     f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
