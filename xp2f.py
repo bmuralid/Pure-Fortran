@@ -12039,6 +12039,7 @@ def _emit_local_function(
     dict_type_components=None,
     dict_arg_types=None,
     local_func_arg_ranks=None,
+    local_func_arg_kinds=None,
     local_func_defaults=None,
     elemental_funcs=None,
 ):
@@ -12224,12 +12225,22 @@ def _emit_local_function(
         if is_elemental_fn:
             continue
         rr = _pre_arg_rank(a.arg)
+        rk_hint = None
+        if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
+            idxk = next((i for i, aa in enumerate(fn.args.args) if aa.arg == a.arg), -1)
+            if idxk >= 0 and idxk < len(local_func_arg_kinds[fn.name]):
+                rk_hint = local_func_arg_kinds[fn.name][idxk]
         if local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == a.arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
         if rr > 0:
-            tr._mark_alloc_real(a.arg, rank=rr)
+            if rk_hint == "int":
+                tr._mark_alloc_int(a.arg, rank=rr)
+            elif rk_hint == "logical":
+                tr._mark_alloc_log(a.arg, rank=rr)
+            else:
+                tr._mark_alloc_real(a.arg, rank=rr)
 
     tr.prescan(fn.body)
 
@@ -12441,6 +12452,11 @@ def _emit_local_function(
         ann_is_int = ("int" in ann) and ("float" not in ann) and ("bool" not in ann)
         ann_is_float = "float" in ann
         ann_is_bool = "bool" in ann or "logical" in ann
+        hint_kind = None
+        if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
+            idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == arg), -1)
+            if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
+                hint_kind = local_func_arg_kinds[fn.name][idx]
         arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
         if arg in tr.alloc_real_rank:
             arr_rank = max(arr_rank, int(tr.alloc_real_rank.get(arg, 0)))
@@ -12454,7 +12470,17 @@ def _emit_local_function(
             idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 arr_rank = max(arr_rank, int(local_func_arg_ranks[fn.name][idx]))
-        if arg in (dict_arg_types or {}):
+        if is_elemental_fn:
+            if ann_is_bool or hint_kind == "logical":
+                arg_kind = "logical"
+            elif ann_is_int or hint_kind == "int":
+                arg_kind = "integer"
+            elif ann_is_float or hint_kind == "real" or arg in tr.reals or _arg_real_context(arg):
+                arg_kind = "real(kind=dp)"
+            else:
+                arg_kind = "integer"
+            arg_decl = f"{arg_kind}, intent(in) :: {arg}"
+        elif arg in (dict_arg_types or {}):
             tnm = (dict_arg_types or {})[arg]
             arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg}"
         elif arg in tr.alloc_ints:
@@ -12548,13 +12574,31 @@ def _emit_local_function(
             else:
                 o.w(f"integer, intent(out) :: {nm}")
     else:
-        ret_is_real = False
+        ret_scalar_kind = None
         ret_name_src = None
         ret_decl_full = False
         if returns and isinstance(returns[0].value, ast.Name):
             ret_name_src = returns[0].value.id
+        ret_spec = None
+        if local_return_specs is not None:
+            ret_spec = local_return_specs.get(fn.name)
         if dict_return:
             ret_decl = f"type({dict_return_spec['type_name']})"
+        elif ret_spec in {"alloc_real", "alloc_int", "alloc_log"}:
+            rr = 1
+            if returns:
+                try:
+                    rr = max(1, int(tr._rank_expr(returns[0].value)))
+                except Exception:
+                    rr = 1
+            dims = ",".join(":" for _ in range(rr))
+            if ret_spec == "alloc_real":
+                ret_decl = f"real(kind=dp), allocatable :: {ret_name}({dims})"
+            elif ret_spec == "alloc_log":
+                ret_decl = f"logical, allocatable :: {ret_name}({dims})"
+            else:
+                ret_decl = f"integer, allocatable :: {ret_name}({dims})"
+            ret_decl_full = True
         elif ret_name_src is not None and ret_name_src in tr.alloc_reals:
             rr = max(1, tr.alloc_real_rank.get(ret_name_src, 1))
             dims = ",".join(":" for _ in range(rr))
@@ -12578,14 +12622,25 @@ def _emit_local_function(
             if fn.returns is not None and hasattr(ast, "unparse"):
                 rtxt = ast.unparse(fn.returns).lower()
                 if "float" in rtxt:
-                    ret_is_real = True
-            if (not ret_is_real) and returns:
+                    ret_scalar_kind = "real"
+                elif "bool" in rtxt or "logical" in rtxt:
+                    ret_scalar_kind = "logical"
+                elif "int" in rtxt:
+                    ret_scalar_kind = "int"
+            if ret_scalar_kind is None and returns:
                 rk0 = tr._expr_kind(returns[0].value)
-                if rk0 == "real":
-                    ret_is_real = True
-            if ret_name in tr.reals or (ret_name_src is not None and ret_name_src in tr.reals):
-                ret_is_real = True
-            ret_decl = "real(kind=dp)" if ret_is_real else "integer"
+                if rk0 in {"real", "logical", "int"}:
+                    ret_scalar_kind = rk0
+            if ret_scalar_kind is None and (ret_name in tr.reals or (ret_name_src is not None and ret_name_src in tr.reals)):
+                ret_scalar_kind = "real"
+            if ret_scalar_kind is None:
+                ret_scalar_kind = "int"
+            if ret_scalar_kind == "real":
+                ret_decl = "real(kind=dp)"
+            elif ret_scalar_kind == "logical":
+                ret_decl = "logical"
+            else:
+                ret_decl = "integer"
         if ret_decl_full:
             o.w(ret_decl)
         else:
@@ -12744,10 +12799,19 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                 scalar_or_array[fn.name] = "int"
         else:
             k = tr._expr_kind(r0)
-            if k == "real":
-                scalar_or_array[fn.name] = "real"
-            elif k == "int":
-                scalar_or_array[fn.name] = "int"
+            rr = tr._rank_expr(r0)
+            if rr > 0:
+                if k == "real":
+                    scalar_or_array[fn.name] = "alloc_real"
+                elif k == "int":
+                    scalar_or_array[fn.name] = "alloc_int"
+                elif k == "logical":
+                    scalar_or_array[fn.name] = "alloc_log"
+            else:
+                if k == "real":
+                    scalar_or_array[fn.name] = "real"
+                elif k == "int":
+                    scalar_or_array[fn.name] = "int"
     return scalar_or_array, tuple_out
 
 
@@ -12810,12 +12874,20 @@ def generate_flat(
         arg_rank_hints=call_rank_hints,
         arg_kind_hints=call_kind_hints,
     )
+    base_func_arg_ranks = {}
     local_func_arg_ranks = {}
+    local_func_arg_kinds = {}
     for fn in (local_funcs or []):
         base_ranks = [_infer_arg_rank_in_fn(fn, a.arg) for a in fn.args.args]
+        base_func_arg_ranks[fn.name] = list(base_ranks)
         hint_ranks = call_rank_hints.get(fn.name, [])
+        hint_kinds = call_kind_hints.get(fn.name, [])
         local_func_arg_ranks[fn.name] = [
             max(base_ranks[i], (hint_ranks[i] if i < len(hint_ranks) else 0))
+            for i in range(len(base_ranks))
+        ]
+        local_func_arg_kinds[fn.name] = [
+            hint_kinds[i] if i < len(hint_kinds) else None
             for i in range(len(base_ranks))
         ]
     local_func_defaults = {}
@@ -12866,6 +12938,44 @@ def generate_flat(
             if isinstance(st, ast.Return) and isinstance(st.value, ast.Tuple):
                 tuple_return_funcs.add(fn.name)
                 break
+
+    elemental_targets = set(translator.global_vectorize_aliases.values())
+    for fn in (local_funcs or []):
+        if fn.name in tuple_return_funcs:
+            continue
+        if fn.name in dict_return_specs:
+            continue
+        if not function_is_pure(fn, known_pure_calls=known_pure_calls):
+            continue
+        base_ranks = base_func_arg_ranks.get(fn.name, [])
+        if any(int(rr) > 0 for rr in base_ranks):
+            continue
+        # Do not force elemental for functions that reassign dummy arguments.
+        arg_names = {a.arg for a in fn.args.args}
+        assigns_dummy = False
+        for st in ast.walk(fn):
+            if isinstance(st, ast.Assign):
+                for tg in st.targets:
+                    if isinstance(tg, ast.Name) and tg.id in arg_names:
+                        assigns_dummy = True
+                        break
+                if assigns_dummy:
+                    break
+            if isinstance(st, ast.AugAssign) and isinstance(st.target, ast.Name) and st.target.id in arg_names:
+                assigns_dummy = True
+                break
+        if assigns_dummy:
+            continue
+        elemental_targets.add(fn.name)
+        # Elemental functions are scalar in interface/result even when call sites
+        # pass arrays; array behavior comes from elemental application semantics.
+        rs = local_return_specs.get(fn.name)
+        if rs == "alloc_real":
+            local_return_specs[fn.name] = "real"
+        elif rs == "alloc_int":
+            local_return_specs[fn.name] = "int"
+        elif rs == "alloc_log":
+            local_return_specs[fn.name] = "logical"
 
     use_proc_module = bool(local_funcs)
     proc_mod_name = f"{stem}_proc_mod"
@@ -12946,7 +13056,6 @@ def generate_flat(
         om.w("")
         om.w("contains")
         om.w("")
-        elemental_targets = set(translator.global_vectorize_aliases.values())
         for fn in local_funcs:
             arg_dict_types = {}
             for a in fn.args.args:
@@ -12984,6 +13093,7 @@ def generate_flat(
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
                 local_func_arg_ranks=local_func_arg_ranks,
+                local_func_arg_kinds=local_func_arg_kinds,
                 local_func_defaults=local_func_defaults,
                 elemental_funcs=elemental_targets,
             )
@@ -13101,7 +13211,6 @@ def generate_flat(
         tr.visit(stmt)
 
     if local_funcs and not use_proc_module:
-        elemental_targets = set(translator.global_vectorize_aliases.values())
         o.w("")
         o.w("contains")
         o.w("")
@@ -13142,6 +13251,7 @@ def generate_flat(
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
                 local_func_arg_ranks=local_func_arg_ranks,
+                local_func_arg_kinds=local_func_arg_kinds,
                 local_func_defaults=local_func_defaults,
                 elemental_funcs=elemental_targets,
             )
