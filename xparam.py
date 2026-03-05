@@ -224,17 +224,25 @@ def expr_refs(expr: str) -> Set[str]:
     return refs
 
 
-def is_parameter_safe_expr(expr: str, known_params: Set[str]) -> Tuple[bool, str]:
+def is_parameter_safe_expr(
+    expr: str,
+    known_params: Set[str],
+    known_type_ctors: Optional[Set[str]] = None,
+) -> Tuple[bool, str]:
     """Conservative check for RHS suitability as a PARAMETER initializer."""
     text = strip_quoted_text((expr or "").strip().lower())
     if not text:
         return False, "missing initializer expression"
 
-    if CALL_LIKE_RE.search(text):
-        return False, "contains function call"
+    call_like = [m.group(1).lower() for m in CALL_LIKE_RE.finditer(text)]
+    allowed_ctors = set((known_type_ctors or set()))
+    if call_like:
+        bad_calls = sorted({nm for nm in call_like if nm not in allowed_ctors})
+        if bad_calls:
+            return False, "contains function call"
 
     refs = expr_refs(text)
-    bad = sorted(n for n in refs if n not in known_params)
+    bad = sorted(n for n in refs if n not in known_params and n not in allowed_ctors)
     if bad:
         return False, f"depends on non-parameter name(s): {', '.join(bad)}"
     return True, ""
@@ -512,6 +520,7 @@ def analyze_unit(
     unit: xunset.Unit,
     proc_sigs: Dict[str, List[ProcSignature]],
     descendant_writes: Optional[Dict[str, int]] = None,
+    known_type_ctors: Optional[Set[str]] = None,
     allow_alloc_promotion: bool = False,
 ) -> Tuple[List[Candidate], List[Exclusion]]:
     """Analyze one unit and return candidates and exclusions."""
@@ -754,7 +763,7 @@ def analyze_unit(
         next_pending: List[str] = []
         for name in pending:
             expr = first_write_expr.get(name, "")
-            ok, why = is_parameter_safe_expr(expr, known_params)
+            ok, why = is_parameter_safe_expr(expr, known_params, known_type_ctors=known_type_ctors)
             if ok:
                 accepted.add(name)
                 known_params.add(name)
@@ -1031,6 +1040,11 @@ def analyze_file(path: Path, allow_alloc_promotion: bool) -> Tuple[List[Candidat
     if not infos or any_missing:
         return [], []
     finfo = infos[0]
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    known_type_ctors: Set[str] = set(
+        m.group(1).lower()
+        for m in re.finditer(r"^\s*type\s*::\s*([a-z][a-z0-9_]*)\b", text, flags=re.IGNORECASE | re.MULTILINE)
+    )
     proc_sigs = parse_proc_signatures(finfo)
     desc_writes_map = collect_descendant_writes(finfo)
     candidates: List[Candidate] = []
@@ -1041,6 +1055,7 @@ def analyze_file(path: Path, allow_alloc_promotion: bool) -> Tuple[List[Candidat
             unit,
             proc_sigs,
             descendant_writes=desc_writes_map.get(dkey),
+            known_type_ctors=known_type_ctors,
             allow_alloc_promotion=allow_alloc_promotion,
         )
         candidates.extend(cands)
