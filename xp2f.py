@@ -146,7 +146,7 @@ def count_assignments(tree):
 
 
 def is_const_int(node):
-    return isinstance(node, ast.Constant) and isinstance(node.value, int)
+    return isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool)
 
 
 def is_const_str(node):
@@ -2147,6 +2147,7 @@ class translator(ast.NodeVisitor):
         tuple_return_out_kinds=None,
         dict_type_components=None,
         local_func_arg_ranks=None,
+        local_func_defaults=None,
         structured_type_components=None,
         structured_array_types=None,
         structured_dtype_strings=None,
@@ -2184,12 +2185,14 @@ class translator(ast.NodeVisitor):
         self.dict_aliases = {}
         self.dict_type_components = dict(dict_type_components or {})
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
+        self.local_func_defaults = dict(local_func_defaults or {})
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
         self.dict_var_components = {}
         self.synthetic_slices = dict(translator.global_synthetic_slices)
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
+        self.promoted_colvec_results = set()
         self.var_type_first_seen = {}
         self.reserved_names = {"dp"}
         self.name_aliases = {}
@@ -2275,6 +2278,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Constant) and isinstance(node.value, float):
             return "real64"
         if isinstance(node, ast.Name):
+            if node.id in {"True", "False"}:
+                return "logical"
             nm = self._aliased_name(node.id)
             prev = self.var_type_first_seen.get(nm)
             if prev is not None:
@@ -2662,6 +2667,13 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.BoolOp):
             return "logical"
         if isinstance(node, ast.Subscript):
+            if (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "shape"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+            ):
+                return "int"
             if (
                 isinstance(node.value, ast.Name)
                 and self._aliased_name(node.value.id) in self.structured_array_types
@@ -3129,6 +3141,14 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"argmin", "argmax"}
+                and len(node.args) >= 1
+            ):
+                return "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -4267,6 +4287,10 @@ class translator(ast.NodeVisitor):
             return f"[{vals}]"
 
         if isinstance(node, ast.Name):
+            if node.id == "True":
+                return ".true."
+            if node.id == "False":
+                return ".false."
             return self._aliased_name(node.id)
 
         if isinstance(node, ast.Constant):
@@ -4380,6 +4404,8 @@ class translator(ast.NodeVisitor):
                             else:
                                 b = f"spread(reshape({b0}, [size({b0},2)]), dim=1, ncopies={_size_dim(node.left, lshape, 1)})"
             elif self._rank_expr(node.left) == 2 and self._rank_expr(node.right) == 1:
+                if self._is_col2_expr(node.left):
+                    a = f"spread(reshape({a0}, [size({a0},1)]), dim=2, ncopies=size({b0}))"
                 if self._is_col2_expr(node.right):
                     b = f"spread({b0}, dim=2, ncopies=size({a0},2))"
                 else:
@@ -4390,6 +4416,8 @@ class translator(ast.NodeVisitor):
                     a = f"spread({a0}, dim=2, ncopies=size({b0},2))"
                 else:
                     a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
+                if self._is_col2_expr(node.right):
+                    b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
             if op is ast.Mod:
                 return f"mod({a}, {b})"
             if op is ast.LShift:
@@ -4467,6 +4495,17 @@ class translator(ast.NodeVisitor):
             return f"({a} {opmap[op]} {b})"
 
         if isinstance(node, ast.Subscript):
+            # NumPy shape indexing: a.shape[0] -> size(a,1)
+            if (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "shape"
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+            ):
+                dim0 = int(node.slice.value)
+                if dim0 < 0:
+                    raise NotImplementedError("negative shape index not supported")
+                return f"size({self.expr(node.value.value)},{dim0 + 1})"
             if (
                 isinstance(node.value, ast.Name)
                 and self._aliased_name(node.value.id) in self.structured_array_types
@@ -4831,6 +4870,11 @@ class translator(ast.NodeVisitor):
                     if kw.arg is None:
                         raise NotImplementedError("**kwargs not supported")
                     args_nodes.append(kw.value)
+                dfl = self.local_func_defaults.get(node.func.id, [])
+                if dfl and len(args_nodes) < len(dfl):
+                    for j in range(len(args_nodes), len(dfl)):
+                        if dfl[j] is not None:
+                            args_nodes.append(dfl[j])
                 args = ", ".join(self.expr(a) for a in args_nodes)
                 return f"{node.func.id}({args})"
             if (
@@ -6548,6 +6592,10 @@ class translator(ast.NodeVisitor):
                 return f"aimag({self.expr(node.value)})"
             if node.attr == "shape":
                 return f"shape({self.expr(node.value)})"
+            if node.attr == "ndim":
+                # NumPy-style array rank; use transpiler rank inference to avoid
+                # relying on compiler support for Fortran RANK intrinsic.
+                return str(max(0, int(self._rank_expr(node.value))))
             if node.attr == "dtype":
                 # Approximate NumPy dtype text from inferred symbol kind.
                 if isinstance(node.value, ast.Name):
@@ -8256,6 +8304,59 @@ class translator(ast.NodeVisitor):
         if isinstance(t, ast.Name) and t.id in self.params:
             return
 
+        # x = local_func(...): promote rank-1 actuals to rank-2 temporaries
+        # when the local function expects rank-2 arguments.
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in self.local_func_arg_ranks
+        ):
+            call_id = v.func.id
+            args_nodes = list(v.args)
+            for kw in getattr(v, "keywords", []):
+                if kw.arg is None:
+                    raise NotImplementedError("**kwargs not supported")
+                args_nodes.append(kw.value)
+            dfl = self.local_func_defaults.get(call_id, [])
+            if dfl and len(args_nodes) < len(dfl):
+                for j in range(len(args_nodes), len(dfl)):
+                    if dfl[j] is not None:
+                        args_nodes.append(dfl[j])
+            want_ranks = self.local_func_arg_ranks.get(call_id, [])
+            need_promote = []
+            for i_a, a in enumerate(args_nodes):
+                want = int(want_ranks[i_a]) if i_a < len(want_ranks) else 0
+                got = self._rank_expr(a)
+                need_promote.append((want == 2 and got == 1))
+            if any(need_promote):
+                self.o.w("block")
+                self.o.push()
+                arg_exprs = []
+                tmp_i = 0
+                for i_a, a in enumerate(args_nodes):
+                    ae = self.expr(a)
+                    if need_promote[i_a]:
+                        tmp_i += 1
+                        tnm = f"arg2_prom_{tmp_i}"
+                        kk = self._expr_kind(a)
+                        if kk == "int":
+                            self.o.w(f"integer, allocatable :: {tnm}(:,:)")
+                        elif kk == "logical":
+                            self.o.w(f"logical, allocatable :: {tnm}(:,:)")
+                        elif kk == "complex":
+                            self.o.w(f"complex(kind=dp), allocatable :: {tnm}(:,:)")
+                        else:
+                            self.o.w(f"real(kind=dp), allocatable :: {tnm}(:,:)")
+                        self.o.w(f"{tnm} = reshape({ae}, [size({ae}), 1])")
+                        arg_exprs.append(tnm)
+                    else:
+                        arg_exprs.append(ae)
+                self.o.w(f"{t.id} = {call_id}(" + ", ".join(arg_exprs) + ")")
+                self.o.pop()
+                self.o.w("end block")
+                return
+
         # d = {"k": expr, ...}
         if isinstance(t, ast.Name) and isinstance(v, ast.Dict):
             # If the target is a known typed-dict variable, emit component
@@ -9891,6 +9992,42 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{name} = {fill_expr}")
             return
 
+        # np.zeros_like(a) / np.ones_like(a)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr in {"zeros_like", "ones_like"}
+            and len(v.args) >= 1
+        ):
+            name = t.id
+            a0 = self.expr(v.args[0])
+            r0 = self._rank_expr(v.args[0])
+            k0 = self._expr_kind(v.args[0])
+            fill_expr = "0"
+            if k0 == "real" or (name in self.alloc_reals):
+                fill_expr = "0.0_dp"
+            elif k0 == "logical":
+                fill_expr = ".false."
+            if v.func.attr == "ones_like":
+                if k0 == "real" or (name in self.alloc_reals):
+                    fill_expr = "1.0_dp"
+                elif k0 == "logical":
+                    fill_expr = ".true."
+                else:
+                    fill_expr = "1"
+            self.o.w(f"if (allocated({name})) deallocate({name})")
+            if r0 <= 1:
+                self.o.w(f"allocate({name}(1:size({a0})))")
+            elif r0 == 2:
+                self.o.w(f"allocate({name}(1:size({a0},1),1:size({a0},2)))")
+            else:
+                raise NotImplementedError("zeros_like/ones_like supports rank up to 2")
+            self.o.w(f"{name} = {fill_expr}")
+            return
+
         # np.full(shape, value, dtype=...)
         if (
             isinstance(t, ast.Name)
@@ -10313,30 +10450,31 @@ class translator(ast.NodeVisitor):
 
     def visit_AugAssign(self, node):
         self._emit_comments_for(node)
-        # supports common augmented assignments on scalar names
-        if not isinstance(node.target, ast.Name):
-            raise NotImplementedError("augassign target must be name")
-        name = node.target.id
+        # supports common augmented assignments on names and indexed targets
+        if isinstance(node.target, ast.Name):
+            lhs = node.target.id
+        else:
+            lhs = self.expr(node.target)
         rhs = self.expr(node.value)
         if isinstance(node.op, ast.Add):
-            self.o.w(f"{name} = {name} + {rhs}")
+            self.o.w(f"{lhs} = {lhs} + {rhs}")
             return
         if isinstance(node.op, ast.Sub):
-            self.o.w(f"{name} = {name} - {rhs}")
+            self.o.w(f"{lhs} = {lhs} - {rhs}")
             return
         if isinstance(node.op, ast.Mult):
-            self.o.w(f"{name} = {name} * {rhs}")
+            self.o.w(f"{lhs} = {lhs} * {rhs}")
             return
         if isinstance(node.op, ast.Div):
-            self.o.w(f"{name} = {name} / {rhs}")
+            self.o.w(f"{lhs} = {lhs} / {rhs}")
             return
         if isinstance(node.op, ast.FloorDiv):
             # Python // is floor division; Fortran integer "/" truncates toward zero.
             # For current supported integer workflows this is the closest direct mapping.
-            self.o.w(f"{name} = {name} / {rhs}")
+            self.o.w(f"{lhs} = {lhs} / {rhs}")
             return
         if isinstance(node.op, ast.Mod):
-            self.o.w(f"{name} = mod({name}, {rhs})")
+            self.o.w(f"{lhs} = mod({lhs}, {rhs})")
             return
         raise NotImplementedError("unsupported augassign op")
 
@@ -10345,7 +10483,19 @@ class translator(ast.NodeVisitor):
         if node.value is not None:
             if self.function_result_name is None:
                 raise NotImplementedError("return value only supported in function context")
-            self.o.w(f"{self.function_result_name} = {self.expr(node.value)}")
+            # Mixed-rank Python returns (e.g., conditional x vs x.ravel()) cannot
+            # be represented by a single Fortran function result rank. Keep rank
+            # stable by returning the base array when flatten appears in return.
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr in {"ravel", "flatten"}
+                and len(node.value.args) == 0
+                and self._rank_expr(node.value.func.value) > 1
+            ):
+                self.o.w(f"{self.function_result_name} = {self.expr(node.value.func.value)}")
+            else:
+                self.o.w(f"{self.function_result_name} = {self.expr(node.value)}")
         self.o.w("return")
 
     def visit_If(self, node):
@@ -10469,13 +10619,42 @@ class translator(ast.NodeVisitor):
         else:
             raise NotImplementedError("range with 1,2,3 args only")
 
-        if is_const_int(step) and step.value <= 0:
-            raise NotImplementedError("nonpositive range step not supported")
+        sv = None
+        if is_const_int(step):
+            sv = int(step.value)
+        elif (
+            isinstance(step, ast.UnaryOp)
+            and isinstance(step.op, (ast.USub, ast.UAdd))
+            and is_const_int(step.operand)
+        ):
+            sv = int(step.operand.value)
+            if isinstance(step.op, ast.USub):
+                sv = -sv
+        if sv == 0:
+            raise NotImplementedError("range step cannot be zero")
 
         return start, stop, step
 
-    def _upper_from_stop(self, stop_node):
-        # range(a, b) goes to b-1; special-case b == x+1 => upper=x
+    def _upper_from_stop(self, stop_node, step_node=None):
+        # Python range excludes stop.
+        # For positive step: inclusive upper = stop - 1.
+        # For negative step: inclusive upper = stop + 1.
+        step_val = None
+        if is_const_int(step_node):
+            step_val = int(step_node.value)
+        elif (
+            isinstance(step_node, ast.UnaryOp)
+            and isinstance(step_node.op, (ast.USub, ast.UAdd))
+            and is_const_int(step_node.operand)
+        ):
+            step_val = int(step_node.operand.value)
+            if isinstance(step_node.op, ast.USub):
+                step_val = -step_val
+        if step_val is not None and step_val < 0:
+            if isinstance(stop_node, ast.BinOp) and isinstance(stop_node.op, ast.Sub):
+                if is_const_int(stop_node.right) and stop_node.right.value == 1:
+                    return self.expr(stop_node.left)
+            return f"({self.expr(stop_node)} + 1)"
         if isinstance(stop_node, ast.BinOp) and isinstance(stop_node.op, ast.Add):
             if is_const_int(stop_node.right) and stop_node.right.value == 1:
                 return self.expr(stop_node.left)
@@ -10495,7 +10674,7 @@ class translator(ast.NodeVisitor):
         start, stop, step = self._range_parts(node.iter)
         f_start = self.expr(start)
         f_step = self.expr(step)
-        f_upper = self._upper_from_stop(stop)
+        f_upper = self._upper_from_stop(stop, step)
 
         if is_const_int(step) and step.value == 1:
             self.o.w(f"do {var} = {f_start}, {f_upper}")
@@ -10946,6 +11125,7 @@ def _emit_local_function(
     dict_type_components=None,
     dict_arg_types=None,
     local_func_arg_ranks=None,
+    local_func_defaults=None,
     elemental_funcs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
@@ -11078,6 +11258,7 @@ def _emit_local_function(
         tuple_return_out_kinds=tuple_return_out_kinds,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
+        local_func_defaults=local_func_defaults,
     )
     # Scope comment emission to this procedure body; otherwise comments from
     # earlier procedures leak into the first emitted statement.
@@ -11314,6 +11495,18 @@ def _emit_local_function(
         ann_is_float = "float" in ann
         ann_is_bool = "bool" in ann or "logical" in ann
         arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
+        if arg in tr.alloc_real_rank:
+            arr_rank = max(arr_rank, int(tr.alloc_real_rank.get(arg, 0)))
+        if arg in tr.alloc_int_rank:
+            arr_rank = max(arr_rank, int(tr.alloc_int_rank.get(arg, 0)))
+        if arg in tr.alloc_log_rank:
+            arr_rank = max(arr_rank, int(tr.alloc_log_rank.get(arg, 0)))
+        if arg in tr.alloc_complex_rank:
+            arr_rank = max(arr_rank, int(tr.alloc_complex_rank.get(arg, 0)))
+        if local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
+            idx = next((i for i, aa in enumerate(fn.args.args) if aa.arg == arg), -1)
+            if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
+                arr_rank = max(arr_rank, int(local_func_arg_ranks[fn.name][idx]))
         if arg in (dict_arg_types or {}):
             tnm = (dict_arg_types or {})[arg]
             arg_decl = f"type({tnm}), intent({intent_txt}) :: {arg}"
@@ -11676,6 +11869,15 @@ def generate_flat(
             max(base_ranks[i], (hint_ranks[i] if i < len(hint_ranks) else 0))
             for i in range(len(base_ranks))
         ]
+    local_func_defaults = {}
+    for fn in (local_funcs or []):
+        narg = len(fn.args.args)
+        dfl = [None for _ in range(narg)]
+        if fn.args.defaults:
+            start = narg - len(fn.args.defaults)
+            for j, dv in enumerate(fn.args.defaults):
+                dfl[start + j] = dv
+        local_func_defaults[fn.name] = dfl
     dict_return_specs = {}
     dict_return_types = {}
     dict_type_components = {}
@@ -11782,6 +11984,7 @@ def generate_flat(
         tuple_return_out_kinds=tuple_return_out_kinds,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
+        local_func_defaults=local_func_defaults,
         structured_type_components=structured_type_components,
         structured_array_types=structured_array_types,
         structured_dtype_strings=structured_dtype_strings,
@@ -11902,6 +12105,7 @@ def generate_flat(
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
                 local_func_arg_ranks=local_func_arg_ranks,
+                local_func_defaults=local_func_defaults,
                 elemental_funcs=elemental_targets,
             )
 
