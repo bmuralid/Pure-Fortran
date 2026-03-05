@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import re
 import shlex
 import subprocess
 import tempfile
@@ -32,16 +33,46 @@ def _expand_inputs(items: List[str]) -> List[Path]:
 
 def _safe_wrap_lines(lines: List[str], max_len: int) -> List[str]:
     """Wrap only low-risk lines to avoid introducing invalid continuations."""
+    decl_like_re = re.compile(
+        r"^\s*(integer|real|logical|complex|character|type\s*\([^)]+\))\b.*::",
+        re.IGNORECASE,
+    )
+    use_like_re = re.compile(r"^\s*use\b", re.IGNORECASE)
     out: List[str] = []
     for ln in lines:
-        # Risky for generic wrappers: string literals, explicit concatenation,
-        # and pre-existing continuations.
-        if ("'" in ln) or ('"' in ln) or ("//" in ln) or ("&" in ln):
+        if len(ln) <= max_len:
             out.append(ln)
             continue
-        wrapped = fscan.wrap_long_fortran_lines([ln], max_len=max_len)
-        out.extend(wrapped)
+        # Risky for generic wrappers: string literals, explicit concatenation,
+        # and pre-existing continuations.
+        if ("!" in ln) or ("'" in ln) or ('"' in ln) or ("//" in ln) or ("&" in ln):
+            out.append(ln)
+            continue
+        if ("**" in ln) or (";" in ln):
+            out.append(ln)
+            continue
+        # Be conservative: wrap only declaration/use-like statements.
+        if decl_like_re.match(ln):
+            wrapped = fscan.wrap_long_declaration_lines([ln], max_len=max_len)
+            out.extend(wrapped)
+            continue
+        if use_like_re.match(ln):
+            wrapped = fscan.wrap_long_fortran_lines([ln], max_len=max_len)
+            out.extend(wrapped)
+            continue
+        out.append(ln)
     return out
+
+
+def _max_leading_spaces(lines: List[str]) -> int:
+    m = 0
+    for ln in lines:
+        if not ln:
+            continue
+        n = len(ln) - len(ln.lstrip(" "))
+        if n > m:
+            m = n
+    return m
 
 
 def main() -> int:
@@ -89,7 +120,7 @@ def main() -> int:
     changed = 0
     transformed = {}
     for path in paths:
-        src = path.read_text(encoding="utf-8")
+        src = fscan.read_text_flexible(path)
         dst = fscan.indent_fortran_blocks(
             src,
             indent_step=args.indent,
@@ -98,7 +129,20 @@ def main() -> int:
             indent_program=args.indent_program,
             indent_contains=args.indent_contains,
         )
+        src_lines = src.splitlines()
         lines = dst.splitlines()
+
+        # Guardrail: avoid pathological indentation blow-ups on some legacy
+        # sources (e.g., ENDIF/ENDDO forms not fully recognized by indenter).
+        src_max_indent = _max_leading_spaces(src_lines)
+        dst_max_indent = _max_leading_spaces(lines)
+        if dst_max_indent > max(512, src_max_indent + 120):
+            print(
+                f"Warning: skipping indentation for {path} due to runaway indent "
+                f"(max leading spaces {src_max_indent} -> {dst_max_indent})."
+            )
+            lines = src_lines
+
         # Keep runtime export metadata lines intact; wrapping can otherwise
         # break "!@pyapi ..." comments into invalid continuation lines.
         pyapi_keep = {}
@@ -142,7 +186,12 @@ def main() -> int:
                 out_paths[paths[0]] = Path(args.out)
             else:
                 for p in paths:
-                    tf = tempfile.NamedTemporaryFile(prefix=f"{p.stem}_ind_", suffix=p.suffix, delete=False)
+                    tf = tempfile.NamedTemporaryFile(
+                        prefix=f"{p.stem}_ind_",
+                        suffix=p.suffix,
+                        dir=str(p.parent) if str(p.parent) else None,
+                        delete=False,
+                    )
                     tpath = Path(tf.name)
                     tf.close()
                     tpath.write_text(transformed[p], encoding="utf-8")
