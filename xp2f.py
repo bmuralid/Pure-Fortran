@@ -2958,6 +2958,7 @@ class translator(ast.NodeVisitor):
         dict_type_components=None,
         local_func_arg_ranks=None,
         local_func_defaults=None,
+        local_void_funcs=None,
         structured_type_components=None,
         structured_array_types=None,
         structured_dtype_strings=None,
@@ -2996,6 +2997,7 @@ class translator(ast.NodeVisitor):
         self.dict_type_components = dict(dict_type_components or {})
         self.local_func_arg_ranks = dict(local_func_arg_ranks or {})
         self.local_func_defaults = dict(local_func_defaults or {})
+        self.local_void_funcs = set(local_void_funcs or [])
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
@@ -5695,6 +5697,8 @@ class translator(ast.NodeVisitor):
                     return self.list_counts[a0.id]
                 return f"size({self.expr(a0)})"
             if isinstance(node.func, ast.Name):
+                if node.func.id in self.local_void_funcs:
+                    raise NotImplementedError("subroutine call cannot be used in expression context")
                 args_nodes = list(node.args)
                 for kw in getattr(node, "keywords", []):
                     if kw.arg is None:
@@ -11736,6 +11740,34 @@ class translator(ast.NodeVisitor):
             self._emit_print_call(c)
             return
 
+        if isinstance(c.func, ast.Name) and c.func.id in self.local_void_funcs:
+            args_nodes = list(c.args)
+            for kw in getattr(c, "keywords", []):
+                if kw.arg is None:
+                    raise NotImplementedError("**kwargs not supported")
+                args_nodes.append(kw.value)
+            dfl = self.local_func_defaults.get(c.func.id, [])
+            if dfl and len(args_nodes) < len(dfl):
+                for j in range(len(args_nodes), len(dfl)):
+                    if dfl[j] is not None:
+                        args_nodes.append(dfl[j])
+            ranks = self.local_func_arg_ranks.get(c.func.id, [])
+            parts = []
+            for i, a in enumerate(args_nodes):
+                ae = self.expr(a)
+                er = ranks[i] if i < len(ranks) else 0
+                ar = self._rank_expr(a)
+                if er == 2 and ar == 1:
+                    ae = f"reshape({ae}, [size({ae}), 1])"
+                elif er == 1 and ar == 2:
+                    ae = f"reshape({ae}, [size({ae})])"
+                parts.append(ae)
+            if parts:
+                self.o.w(f"call {c.func.id}(" + ", ".join(parts) + ")")
+            else:
+                self.o.w(f"call {c.func.id}()")
+            return
+
         if isinstance(c.func, ast.Attribute) and c.func.attr == "append":
             if not isinstance(c.func.value, ast.Name):
                 raise NotImplementedError("append target must be a name")
@@ -12041,6 +12073,7 @@ def _emit_local_function(
     local_func_arg_ranks=None,
     local_func_arg_kinds=None,
     local_func_defaults=None,
+    local_void_funcs=None,
     elemental_funcs=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
@@ -12180,6 +12213,7 @@ def _emit_local_function(
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
         local_func_defaults=local_func_defaults,
+        local_void_funcs=local_void_funcs,
     )
     # Scope comment emission to this procedure body; otherwise comments from
     # earlier procedures leak into the first emitted statement.
@@ -12285,6 +12319,7 @@ def _emit_local_function(
             if not isinstance(e, ast.Name):
                 raise NotImplementedError("tuple return elements must be names")
             out_names.append(e.id)
+    void_return = (not tuple_return) and (not dict_return) and (len(returns) == 0)
 
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints - {ret_name})
@@ -12314,11 +12349,11 @@ def _emit_local_function(
     alloc_chars = sorted(alloc_chars_set)
 
     is_pure_fn = function_is_pure(fn, known_pure_calls=known_pure_calls)
-    if is_elemental_fn and not tuple_return:
+    if is_elemental_fn and not tuple_return and not void_return:
         pure_prefix = "pure elemental " if is_pure_fn else "impure elemental "
     else:
         pure_prefix = "pure " if is_pure_fn else ""
-    if tuple_return:
+    if tuple_return or void_return:
         sig = args + out_names
         o.w(f"{pure_prefix}subroutine {fn.name}(" + ", ".join(sig) + ")")
     else:
@@ -12326,7 +12361,7 @@ def _emit_local_function(
     o.push()
     emit_python_docstring_as_fortran_comments(o, fn)
     if not no_comment:
-        o.w(f"! {procedure_comment(fn.name, 'subroutine' if tuple_return else 'function')}")
+        o.w(f"! {procedure_comment(fn.name, 'subroutine' if (tuple_return or void_return) else 'function')}")
     ann_map = {}
     for a in fn.args.args:
         if a.annotation is not None and hasattr(ast, "unparse"):
@@ -12573,7 +12608,7 @@ def _emit_local_function(
                 o.w(f"real(kind=dp), intent(out) :: {nm}")
             else:
                 o.w(f"integer, intent(out) :: {nm}")
-    else:
+    elif not void_return:
         ret_scalar_kind = None
         ret_name_src = None
         ret_decl_full = False
@@ -12726,7 +12761,7 @@ def _emit_local_function(
             continue
         tr.visit(s)
     o.pop()
-    if tuple_return:
+    if tuple_return or void_return:
         o.w(f"end subroutine {fn.name}")
     else:
         o.w(f"end function {fn.name}")
@@ -12938,6 +12973,11 @@ def generate_flat(
             if isinstance(st, ast.Return) and isinstance(st.value, ast.Tuple):
                 tuple_return_funcs.add(fn.name)
                 break
+    local_void_funcs = set()
+    for fn in (local_funcs or []):
+        has_value_return = any(isinstance(st, ast.Return) and (st.value is not None) for st in ast.walk(fn))
+        if (not has_value_return) and (fn.name not in tuple_return_funcs) and (fn.name not in dict_return_specs):
+            local_void_funcs.add(fn.name)
 
     elemental_targets = set(translator.global_vectorize_aliases.values())
     for fn in (local_funcs or []):
@@ -13095,6 +13135,7 @@ def generate_flat(
                 local_func_arg_ranks=local_func_arg_ranks,
                 local_func_arg_kinds=local_func_arg_kinds,
                 local_func_defaults=local_func_defaults,
+                local_void_funcs=local_void_funcs,
                 elemental_funcs=elemental_targets,
             )
         om.w(f"end module {proc_mod_name}")
@@ -13132,6 +13173,7 @@ def generate_flat(
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
         local_func_defaults=local_func_defaults,
+        local_void_funcs=local_void_funcs,
         structured_type_components=structured_type_components,
         structured_array_types=structured_array_types,
         structured_dtype_strings=structured_dtype_strings,
@@ -13253,6 +13295,7 @@ def generate_flat(
                 local_func_arg_ranks=local_func_arg_ranks,
                 local_func_arg_kinds=local_func_arg_kinds,
                 local_func_defaults=local_func_defaults,
+                local_void_funcs=local_void_funcs,
                 elemental_funcs=elemental_targets,
             )
 
