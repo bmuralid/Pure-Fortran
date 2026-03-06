@@ -4456,6 +4456,7 @@ class translator(ast.NodeVisitor):
         dict_return_types=None,
         local_return_specs=None,
         tuple_return_out_kinds=None,
+        tuple_return_out_ranks=None,
         dict_type_components=None,
         local_func_arg_ranks=None,
         local_func_arg_kinds=None,
@@ -4469,6 +4470,7 @@ class translator(ast.NodeVisitor):
         local_elemental_funcs=None,
         optional_dummy_args=None,
         tuple_return_out_names=None,
+        local_tuple_return_out_names=None,
         structured_type_components=None,
         structured_array_types=None,
         structured_dtype_strings=None,
@@ -4502,6 +4504,7 @@ class translator(ast.NodeVisitor):
         self.tuple_return_funcs = set(tuple_return_funcs or [])
         self.local_return_specs = dict(local_return_specs or {})
         self.tuple_return_out_kinds = dict(tuple_return_out_kinds or {})
+        self.tuple_return_out_ranks = dict(tuple_return_out_ranks or {})
         self.dict_return_types = dict(dict_return_types or {})
         self.dict_typed_vars = {}
         self.dict_aliases = {}
@@ -4518,6 +4521,7 @@ class translator(ast.NodeVisitor):
         self.local_elemental_funcs = set(local_elemental_funcs or [])
         self.optional_dummy_args = set(optional_dummy_args or [])
         self.tuple_return_out_names = list(tuple_return_out_names or [])
+        self.local_tuple_return_out_names = dict(local_tuple_return_out_names or {})
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
@@ -10078,16 +10082,22 @@ class translator(ast.NodeVisitor):
                     and node.value.func.id in self.tuple_return_funcs
                 ):
                     out_kinds = self.tuple_return_out_kinds.get(node.value.func.id, [])
+                    out_ranks = self.tuple_return_out_ranks.get(node.value.func.id, [])
                     for j, e in enumerate(node.targets[0].elts):
                         if not isinstance(e, ast.Name):
                             continue
                         k = out_kinds[j] if j < len(out_kinds) else "int"
+                        rr = max(0, int(out_ranks[j])) if j < len(out_ranks) else 0
                         if k == "alloc_real":
-                            self._mark_alloc_real(e.id)
+                            self._mark_alloc_real(e.id, rank=max(1, rr if rr > 0 else 1))
                         elif k == "alloc_int":
-                            self._mark_alloc_int(e.id)
+                            self._mark_alloc_int(e.id, rank=max(1, rr if rr > 0 else 1))
                         elif k == "alloc_log":
-                            self._mark_alloc_log(e.id)
+                            self._mark_alloc_log(e.id, rank=max(1, rr if rr > 0 else 1))
+                        elif k == "alloc_complex":
+                            self._mark_alloc_complex(e.id, rank=max(1, rr if rr > 0 else 1))
+                        elif k == "alloc_char":
+                            self._mark_alloc_char(e.id, rank=max(1, rr if rr > 0 else 1))
                         elif k == "real":
                             self._mark_real(e.id)
                         else:
@@ -11540,6 +11550,18 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("multiple assignment not supported")
         t = node.targets[0]
         v = node.value
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id in {"float", "real", "dble", "cmplx"}
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Name)
+            and v.args[0].id == t.id
+        ):
+            # No-op self-cast in Python (`x = float(x)`) can force invalid
+            # Fortran assignment to INTENT(IN) dummies; skip emission.
+            return
         if isinstance(t, ast.Name):
             if is_none(v):
                 self.none_vars.add(t.id)
@@ -11826,12 +11848,20 @@ class translator(ast.NodeVisitor):
                 if not isinstance(e, ast.Name):
                     raise NotImplementedError("tuple assignment targets must be names")
                 outs.append(e.id)
-            args_nodes = list(v.args)
+            args = [self.expr(a) for a in list(v.args)]
+            saw_named = False
             for kw in getattr(v, "keywords", []):
                 if kw.arg is None:
                     raise NotImplementedError("**kwargs not supported")
-                args_nodes.append(kw.value)
-            args = [self.expr(a) for a in args_nodes] + outs
+                args.append(f"{kw.arg}={self.expr(kw.value)}")
+                saw_named = True
+            if saw_named:
+                out_formals = list(self.local_tuple_return_out_names.get(v.func.id, []))
+                for j, onm in enumerate(outs):
+                    frm = out_formals[j] if j < len(out_formals) else f"{v.func.id}_out_{j + 1}"
+                    args.append(f"{frm}={onm}")
+            else:
+                args.extend(outs)
             self.o.w(f"call {v.func.id}(" + ", ".join(args) + ")")
             return
         # tuple unpacking from np.unique(..., return_inverse=True, return_counts=True)
@@ -15184,6 +15214,7 @@ def _emit_local_function(
     dict_return_types=None,
     local_return_specs=None,
     tuple_return_out_kinds=None,
+    tuple_return_out_ranks=None,
     tuple_return_funcs=None,
     dict_type_components=None,
     dict_arg_types=None,
@@ -15202,6 +15233,7 @@ def _emit_local_function(
     force_arg_ranks=None,
     force_list_args=None,
     elemental_funcs=None,
+    local_tuple_return_out_names=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -15380,6 +15412,7 @@ def _emit_local_function(
         dict_return_types=dict_return_types,
         local_return_specs=local_return_specs,
         tuple_return_out_kinds=tuple_return_out_kinds,
+        tuple_return_out_ranks=tuple_return_out_ranks,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
         local_func_arg_kinds=local_func_arg_kinds,
@@ -15392,6 +15425,7 @@ def _emit_local_function(
         local_func_dict_arg_types=local_func_dict_arg_types,
         local_elemental_funcs=elemental_funcs,
         optional_dummy_args=none_optional_args,
+        local_tuple_return_out_names=local_tuple_return_out_names,
     )
     if force_list_args:
         for _nm in force_list_args:
@@ -15689,6 +15723,60 @@ def _emit_local_function(
             else:
                 tr._mark_alloc_int(ret_name, rank=rr0)
     void_return = (not tuple_return) and (not dict_return) and (len(returns) == 0)
+
+    # Normalize tuple-unpacked locals from name sources (e.g. `x0, x1 = x`)
+    # so element kinds follow the source collection kind.
+    _arg_hint_kind = {}
+    if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
+        _klist = local_func_arg_kinds.get(fn.name, [])
+        for _i, _a in enumerate(arg_nodes):
+            if _i < len(_klist):
+                _arg_hint_kind[_a.arg] = _klist[_i]
+    if force_arg_kinds:
+        _arg_hint_kind.update(force_arg_kinds)
+
+    for _st in ast.walk(ast.Module(body=list(fn.body), type_ignores=[])):
+        if not (
+            isinstance(_st, ast.Assign)
+            and len(_st.targets) == 1
+            and isinstance(_st.targets[0], (ast.Tuple, ast.List))
+            and isinstance(_st.value, ast.Name)
+        ):
+            continue
+        _src = _st.value.id
+        _src_kind = None
+        if _src in tr.alloc_reals or _src in tr.reals:
+            _src_kind = "real"
+        elif _src in tr.alloc_complexes or _src in tr.complexes:
+            _src_kind = "complex"
+        elif _src in tr.alloc_logs or _src in tr.logs:
+            _src_kind = "logical"
+        elif _src in tr.alloc_chars or _src in tr.chars:
+            _src_kind = "char"
+        elif _src in tr.alloc_ints or _src in tr.ints:
+            _src_kind = "int"
+        elif _src in args:
+            _hk = _arg_hint_kind.get(_src)
+            if _hk in {"real", "complex", "logical", "char", "int"}:
+                _src_kind = _hk
+            elif int(_pre_arg_rank(_src)) > 0:
+                # Default numeric collection kind for unknown array args.
+                _src_kind = "real"
+        if _src_kind is None:
+            continue
+        for _e in _st.targets[0].elts:
+            if not isinstance(_e, ast.Name):
+                continue
+            if _src_kind == "real":
+                tr._mark_real(_e.id)
+            elif _src_kind == "complex":
+                tr._mark_complex(_e.id)
+            elif _src_kind == "logical":
+                tr._mark_log(_e.id)
+            elif _src_kind == "char":
+                tr._mark_char(_e.id)
+            else:
+                tr._mark_int(_e.id)
 
     # Local rank/kind correction for common vector algebra patterns where
     # prescan can over-approximate rank:
@@ -16014,6 +16102,15 @@ def _emit_local_function(
                 and isinstance(rhs.func.value, ast.Name)
                 and rhs.func.value.id == nm
                 and rhs.func.attr in {"reshape", "copy"}
+            ):
+                return True
+            if (
+                isinstance(rhs, ast.Call)
+                and isinstance(rhs.func, ast.Name)
+                and rhs.func.id in {"real", "int", "dble", "cmplx", "float"}
+                and len(rhs.args) >= 1
+                and isinstance(rhs.args[0], ast.Name)
+                and rhs.args[0].id == nm
             ):
                 return True
             return False
@@ -16600,6 +16697,7 @@ def _emit_local_function(
 
 def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=None):
     tuple_out = {}
+    tuple_out_ranks = {}
     scalar_or_array = {}
     arg_rank_hints = arg_rank_hints or {}
     arg_kind_hints = arg_kind_hints or {}
@@ -16634,19 +16732,31 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
         r0 = rets[0].value
         if isinstance(r0, ast.Tuple):
             kinds = []
+            ranks = []
             for e in r0.elts:
                 if isinstance(e, ast.Name):
                     nm = e.id
                     if nm in tr.alloc_reals:
                         kinds.append("alloc_real")
+                        ranks.append(int(tr.alloc_real_rank.get(nm, 1)))
                     elif nm in tr.alloc_ints:
                         kinds.append("alloc_int")
+                        ranks.append(int(tr.alloc_int_rank.get(nm, 1)))
                     elif nm in tr.alloc_logs:
                         kinds.append("alloc_log")
+                        ranks.append(int(tr.alloc_log_rank.get(nm, 1)))
+                    elif nm in tr.alloc_complexes:
+                        kinds.append("alloc_complex")
+                        ranks.append(int(tr.alloc_complex_rank.get(nm, 1)))
+                    elif nm in tr.alloc_chars:
+                        kinds.append("alloc_char")
+                        ranks.append(int(tr.alloc_char_rank.get(nm, 1)))
                     elif nm in tr.reals:
                         kinds.append("real")
+                        ranks.append(0)
                     else:
                         kinds.append("int")
+                        ranks.append(0)
                 else:
                     ek = tr._expr_kind(e)
                     er = tr._rank_expr(e)
@@ -16661,6 +16771,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                             kinds.append("alloc_char")
                         else:
                             kinds.append("alloc_int")
+                        ranks.append(int(er))
                     else:
                         if ek == "real":
                             kinds.append("real")
@@ -16672,7 +16783,9 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                             kinds.append("char")
                         else:
                             kinds.append("int")
+                        ranks.append(0)
             tuple_out[fn.name] = kinds
+            tuple_out_ranks[fn.name] = ranks
             continue
         if isinstance(r0, ast.Name):
             nm = r0.id
@@ -16701,7 +16814,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                     scalar_or_array[fn.name] = "real"
                 elif k == "int":
                     scalar_or_array[fn.name] = "int"
-    return scalar_or_array, tuple_out
+    return scalar_or_array, tuple_out, tuple_out_ranks
 
 
 def generate_flat(
@@ -16841,7 +16954,7 @@ def generate_flat(
                                         is_list = bool(tr_seed._is_python_list_expr(kw.value))
                                         krl[i].add((pk, pr, is_list))
 
-    local_return_specs, tuple_return_out_kinds = _local_return_maps(
+    local_return_specs, tuple_return_out_kinds, tuple_return_out_ranks = _local_return_maps(
         local_funcs,
         params,
         arg_rank_hints=call_rank_hints,
@@ -16914,10 +17027,22 @@ def generate_flat(
             dict_type_components[tnm] = {cname: (ckind, crank) for cname, ckind, _, crank in spec["components"]}
 
     tuple_return_funcs = set()
+    local_tuple_return_out_names = {}
     for fn in (local_funcs or []):
         for st in fn.body:
             if isinstance(st, ast.Return) and isinstance(st.value, ast.Tuple):
                 tuple_return_funcs.add(fn.name)
+                fn_args = {a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))}
+                out_names = []
+                for j, e in enumerate(st.value.elts):
+                    if isinstance(e, ast.Name):
+                        nm = e.id
+                        if nm in fn_args:
+                            nm = f"{fn.name}_out_{j + 1}"
+                        out_names.append(nm)
+                    else:
+                        out_names.append(f"{fn.name}_out_{j + 1}")
+                local_tuple_return_out_names[fn.name] = out_names
                 break
     local_void_funcs = set()
     for fn in (local_funcs or []):
@@ -17257,6 +17382,7 @@ def generate_flat(
                         dict_return_types=dict_return_types,
                         local_return_specs=local_return_specs,
                         tuple_return_out_kinds=tuple_return_out_kinds,
+                        tuple_return_out_ranks=tuple_return_out_ranks,
                         tuple_return_funcs=tuple_return_funcs,
                         dict_type_components=dict_type_components,
                         dict_arg_types=arg_dict_types,
@@ -17275,6 +17401,7 @@ def generate_flat(
                         force_arg_ranks=forced_ranks,
                         force_list_args=forced_list_args,
                         elemental_funcs=elemental_targets,
+                        local_tuple_return_out_names=local_tuple_return_out_names,
                     )
             else:
                 _emit_local_function(
@@ -17289,6 +17416,7 @@ def generate_flat(
                     dict_return_types=dict_return_types,
                     local_return_specs=local_return_specs,
                     tuple_return_out_kinds=tuple_return_out_kinds,
+                    tuple_return_out_ranks=tuple_return_out_ranks,
                     tuple_return_funcs=tuple_return_funcs,
                     dict_type_components=dict_type_components,
                     dict_arg_types=arg_dict_types,
@@ -17303,6 +17431,7 @@ def generate_flat(
                     user_class_types=user_class_types,
                     local_func_dict_arg_types=local_func_dict_arg_types,
                     elemental_funcs=elemental_targets,
+                    local_tuple_return_out_names=local_tuple_return_out_names,
                 )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
@@ -17344,6 +17473,7 @@ def generate_flat(
         dict_return_types=dict_return_types,
         local_return_specs=local_return_specs,
         tuple_return_out_kinds=tuple_return_out_kinds,
+        tuple_return_out_ranks=tuple_return_out_ranks,
         dict_type_components=dict_type_components,
         local_func_arg_ranks=local_func_arg_ranks,
         local_func_arg_kinds=local_func_arg_kinds,
@@ -17358,6 +17488,7 @@ def generate_flat(
         structured_type_components=structured_type_components,
         structured_array_types=structured_array_types,
         structured_dtype_strings=structured_dtype_strings,
+        local_tuple_return_out_names=local_tuple_return_out_names,
     )
     tr.prescan(tree.body)
     for st in tree.body:
@@ -17462,6 +17593,7 @@ def generate_flat(
                 dict_return_types=dict_return_types,
                 local_return_specs=local_return_specs,
                 tuple_return_out_kinds=tuple_return_out_kinds,
+                tuple_return_out_ranks=tuple_return_out_ranks,
                 tuple_return_funcs=tuple_return_funcs,
                 dict_type_components=dict_type_components,
                 dict_arg_types=arg_dict_types,
@@ -17476,6 +17608,7 @@ def generate_flat(
                 user_class_types=user_class_types,
                 local_func_dict_arg_types=local_func_dict_arg_types,
                 elemental_funcs=elemental_targets,
+                local_tuple_return_out_names=local_tuple_return_out_names,
             )
 
     o.pop()
