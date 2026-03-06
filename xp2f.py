@@ -28,10 +28,10 @@ import tokenize
 import keyword
 from datetime import datetime
 import fortran_output as fout
+import fortran_post as fpost
 from fortran_scan import (
     coalesce_simple_declarations,
     remove_empty_if_blocks,
-    simplify_redundant_parens_in_lines,
     simplify_integer_arithmetic_in_lines,
     strip_redundant_outer_parens_expr,
     wrap_long_declaration_lines,
@@ -17651,16 +17651,18 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
     f90_lines = simplify_allocate_shape_to_mold(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
-    f90_lines = simplify_redundant_parens_in_lines(f90_lines)
+    f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
     f90_lines = normalize_string_concat_operator(f90_lines)
     f90_lines = normalize_unary_minus_after_operator(f90_lines)
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
     f90_lines = remove_empty_if_blocks(f90_lines)
+    f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
     f90_lines = inline_shape_comments(f90_lines)
     f90_lines = remove_write_only_scalar_locals(f90_lines)
     f90_lines = remove_unused_named_constants(f90_lines)
     f90_lines = remove_unused_use_only_imports(f90_lines)
     f90_lines = ensure_blank_line_between_procedures(f90_lines)
+    f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     f90_lines = ensure_blank_line_between_program_units(f90_lines)
     # First coalesce adjacent declarations without wrapping, then apply
     # the dedicated 80-column wrapper that packs continuation lines.
@@ -17670,11 +17672,13 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
     # Final loop-index normalization pass after all other line rewrites.
     f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
+    f90_lines = fpost.simplify_do_while_true(f90_lines)
     f90_lines = simplify_redundant_int_casts(f90_lines)
     f90_lines = promote_immediate_scalar_constants(f90_lines)
     f90_lines = normalize_string_concat_operator(f90_lines)
     f90_lines = normalize_unary_minus_after_operator(f90_lines)
     f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
+    f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")

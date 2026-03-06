@@ -9,6 +9,460 @@ from typing import List
 import fortran_scan as fscan
 import xunused
 
+# Internal style toggles (kept local to post-processing behavior).
+ENABLE_SAFE_SQUARE_REWRITE = True
+
+
+def simplify_do_while_true(lines: List[str]) -> List[str]:
+    """Rewrite unconditional `do while (.true.)` loops to plain `do`.
+
+    Conservative rewrite:
+    - Match only exact `.true.` condition (case-insensitive, optional spaces/parens).
+    - Preserve indentation and trailing comments.
+    """
+    out = list(lines)
+    pat = re.compile(r"^(?P<indent>\s*)do\s+while\s*\(\s*\.true\.\s*\)\s*$", re.IGNORECASE)
+    for i, ln in enumerate(out):
+        code, comment = xunused.split_code_comment(ln.rstrip("\r\n"))
+        m = pat.match(code)
+        if not m:
+            continue
+        eol = xunused.get_eol(ln) or ("\n" if ln.endswith("\n") else "")
+        out[i] = f"{m.group('indent')}do{comment}{eol}"
+    return out
+
+
+def collapse_single_stmt_if_blocks(lines: List[str]) -> List[str]:
+    """Collapse 3-line IF blocks with one executable body statement.
+
+    This keeps the behavior of the standalone `xone_line_if.py` workflow,
+    but as a reusable post-processing step.
+    """
+    return fscan.collapse_single_stmt_if_blocks(lines)
+
+
+def ensure_blank_line_between_module_procedures(lines: List[str]) -> List[str]:
+    """Ensure at least one blank line between consecutive module procedures."""
+    out: List[str] = []
+    module_start_re = re.compile(r"^\s*module\b(?!\s+procedure\b)", re.IGNORECASE)
+    module_end_re = re.compile(r"^\s*end\s+module\b", re.IGNORECASE)
+    contains_re = re.compile(r"^\s*contains\s*$", re.IGNORECASE)
+    proc_hdr_re = re.compile(
+        r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(?:function|subroutine)\b",
+        re.IGNORECASE,
+    )
+    proc_end_re = re.compile(r"^\s*end\s+(?:function|subroutine)\b", re.IGNORECASE)
+
+    in_module = False
+    in_contains = False
+    blank_line = "\n" if any(("\n" in ln) or ("\r" in ln) for ln in lines) else ""
+
+    def _code_only(ln: str) -> str:
+        return fscan.strip_comment(ln).strip()
+
+    def _is_blank(ln: str) -> bool:
+        return not ln.strip()
+
+    for i, ln in enumerate(lines):
+        code = _code_only(ln)
+        low = code.lower()
+
+        if module_start_re.match(code) and not low.startswith("end module"):
+            in_module = True
+            in_contains = False
+        elif in_module and contains_re.match(code):
+            in_contains = True
+        elif in_module and module_end_re.match(code):
+            in_module = False
+            in_contains = False
+
+        out.append(ln)
+
+        if not (in_module and in_contains and proc_end_re.match(code)):
+            continue
+
+        # Check whether the next procedure header appears without any blank
+        # separating lines (comments-only lines do not count as blank).
+        j = i + 1
+        saw_blank = False
+        while j < len(lines):
+            code_j = _code_only(lines[j])
+            if _is_blank(lines[j]):
+                saw_blank = True
+                j += 1
+                continue
+            if not code_j:
+                j += 1
+                continue
+            break
+        if j < len(lines):
+            code_j = _code_only(lines[j])
+            if proc_hdr_re.match(code_j) and not saw_blank:
+                out.append(blank_line)
+
+    return out
+
+
+def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
+    """Conservative wrapper for unneeded-parentheses cleanup.
+
+    Delegates to shared scan-time logic so rewrite behavior stays centralized.
+    """
+    out = fscan.simplify_redundant_parens_in_lines(lines)
+
+    def _split_top_level_add_ops(expr: str):
+        def _is_exp_sign(pos: int) -> bool:
+            # Detect signs in scientific notation, e.g. 1e-16 or 1d+03.
+            j = pos - 1
+            while j >= 0 and expr[j].isspace():
+                j -= 1
+            if j < 1 or expr[j] not in "eEdD":
+                return False
+            k = j - 1
+            while k >= 0 and expr[k].isspace():
+                k -= 1
+            if k < 0 or not (expr[k].isdigit() or expr[k] == "."):
+                return False
+            t = pos + 1
+            while t < len(expr) and expr[t].isspace():
+                t += 1
+            return t < len(expr) and expr[t].isdigit()
+
+        terms: List[str] = []
+        ops: List[str] = []
+        cur: List[str] = []
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(expr) and expr[i + 1] == "'":
+                    cur.append(expr[i : i + 2]); i += 2; continue
+                in_single = not in_single
+                cur.append(ch); i += 1; continue
+            if ch == '"' and not in_single:
+                if in_double and i + 1 < len(expr) and expr[i + 1] == '"':
+                    cur.append(expr[i : i + 2]); i += 2; continue
+                in_double = not in_double
+                cur.append(ch); i += 1; continue
+            if in_single or in_double:
+                cur.append(ch); i += 1; continue
+            if ch == "(":
+                depth += 1; cur.append(ch); i += 1; continue
+            if ch == ")":
+                depth = max(0, depth - 1); cur.append(ch); i += 1; continue
+            if ch in "+-" and depth == 0:
+                if _is_exp_sign(i):
+                    cur.append(ch); i += 1; continue
+                # Treat as binary op only when flanked by expression text.
+                left = "".join(cur).rstrip()
+                j = i + 1
+                while j < len(expr) and expr[j].isspace():
+                    j += 1
+                if left and j < len(expr):
+                    terms.append("".join(cur).strip())
+                    ops.append(ch)
+                    cur = []
+                    i += 1
+                    continue
+            cur.append(ch)
+            i += 1
+        terms.append("".join(cur).strip())
+        return terms, ops
+
+    def _has_top_level_binary_add_sub(expr: str) -> bool:
+        depth = 0
+        in_single = False
+        in_double = False
+        prev_sig = ""
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(expr) and expr[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                if in_double and i + 1 < len(expr) and expr[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and ch in "+-":
+                # Unary sign is allowed; detect binary +/-
+                if prev_sig and prev_sig not in "(*/+-=,:":  # binary op
+                    return True
+            if not ch.isspace():
+                prev_sig = ch
+            i += 1
+        return False
+
+    def _has_top_level_comma(expr: str) -> bool:
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(expr) and expr[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                if in_double and i + 1 < len(expr) and expr[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0 and ch == ",":
+                return True
+            i += 1
+        return False
+
+    def _strip_simple_parenthesized_sections(expr: str) -> str:
+        # Remove grouping parens only when the inner expression has no top-level
+        # binary +/- and no top-level comma, and context is not a call/index.
+        s = expr
+        while True:
+            changed = False
+            stack: List[int] = []
+            pairs: List[tuple[int, int]] = []
+            in_single = False
+            in_double = False
+            i = 0
+            while i < len(s):
+                ch = s[i]
+                if ch == "'" and not in_double:
+                    if in_single and i + 1 < len(s) and s[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_single = not in_single
+                    i += 1
+                    continue
+                if ch == '"' and not in_single:
+                    if in_double and i + 1 < len(s) and s[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_double = not in_double
+                    i += 1
+                    continue
+                if in_single or in_double:
+                    i += 1
+                    continue
+                if ch == "(":
+                    stack.append(i)
+                elif ch == ")" and stack:
+                    pairs.append((stack.pop(), i))
+                i += 1
+            for lpos, rpos in reversed(pairs):
+                inner = s[lpos + 1 : rpos].strip()
+                if not inner:
+                    continue
+                prev = s[lpos - 1] if lpos > 0 else ""
+                next_ch = s[rpos + 1] if rpos + 1 < len(s) else ""
+                # likely call/index context: name(...), arr(...), dt%comp(...)
+                if prev.isalnum() or prev in "_%)]":
+                    continue
+                # likely intrinsic operator call style with no separator
+                if next_ch and (next_ch.isalnum() or next_ch == "_"):
+                    continue
+                if _has_top_level_comma(inner):
+                    continue
+                if _has_top_level_binary_add_sub(inner):
+                    continue
+                s = s[:lpos] + inner + s[rpos + 1 :]
+                changed = True
+                break
+            if not changed:
+                break
+        return s
+
+    def _split_top_level_relop(expr: str):
+        # Return (lhs, op, rhs) for a top-level relational operator if present.
+        ops = ["<=", ">=", "==", "/=", "<", ">"]
+        depth = 0
+        in_single = False
+        in_double = False
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch == "'" and not in_double:
+                if in_single and i + 1 < len(expr) and expr[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                if in_double and i + 1 < len(expr) and expr[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0:
+                for op in ops:
+                    if expr.startswith(op, i):
+                        lhs = expr[:i].rstrip()
+                        rhs = expr[i + len(op) :].lstrip()
+                        return lhs, op, rhs
+            i += 1
+        return None
+
+    def _rewrite_safe_mul_self_to_pow2(expr: str) -> str:
+        # Conservative: only rewrite simple scalar-like atoms, e.g. x*x, obj%v*obj%v.
+        # Do not touch array refs/calls, character literals, or complex syntax.
+        if not ENABLE_SAFE_SQUARE_REWRITE:
+            return expr
+        atom = r"[A-Za-z_][A-Za-z0-9_]*(?:%[A-Za-z_][A-Za-z0-9_]*)*"
+        pat = re.compile(
+            rf"(?<![A-Za-z0-9_%])(?P<a>{atom})\s*(?<!\*)\*(?!\*)\s*(?P=a)(?![A-Za-z0-9_%(])"
+        )
+
+        def _sub_outside_quotes(text: str) -> str:
+            out_parts: List[str] = []
+            cur: List[str] = []
+            in_single = False
+            in_double = False
+            i = 0
+            while i < len(text):
+                ch = text[i]
+                if ch == "'" and not in_double:
+                    if in_single and i + 1 < len(text) and text[i + 1] == "'":
+                        # Doubled quote inside string
+                        cur.append(text[i : i + 2])
+                        i += 2
+                        continue
+                    if in_single:
+                        cur.append(ch)
+                        out_parts.append("".join(cur))
+                        cur = []
+                        in_single = False
+                    else:
+                        # Flush code segment before entering quote.
+                        code_seg = "".join(cur)
+                        out_parts.append(pat.sub(lambda m: f"{m.group('a')}**2", code_seg))
+                        cur = [ch]
+                        in_single = True
+                    i += 1
+                    continue
+                if ch == '"' and not in_single:
+                    if in_double and i + 1 < len(text) and text[i + 1] == '"':
+                        cur.append(text[i : i + 2])
+                        i += 2
+                        continue
+                    if in_double:
+                        cur.append(ch)
+                        out_parts.append("".join(cur))
+                        cur = []
+                        in_double = False
+                    else:
+                        code_seg = "".join(cur)
+                        out_parts.append(pat.sub(lambda m: f"{m.group('a')}**2", code_seg))
+                        cur = [ch]
+                        in_double = True
+                    i += 1
+                    continue
+                cur.append(ch)
+                i += 1
+            tail = "".join(cur)
+            if in_single or in_double:
+                out_parts.append(tail)
+            else:
+                out_parts.append(pat.sub(lambda m: f"{m.group('a')}**2", tail))
+            return "".join(out_parts)
+
+        return _sub_outside_quotes(expr)
+
+    cleaned: List[str] = []
+    for ln in out:
+        code, comment = xunused.split_code_comment(ln.rstrip("\r\n"))
+        eol = xunused.get_eol(ln) or ("\n" if ln.endswith("\n") else "")
+        m_asn = re.match(r"^(\s*[^=]+?=\s*)(.+)$", code)
+        if m_asn and "::" not in code and "=>" not in code and not re.match(r"^\s*(if|do|where|forall|select)\b", code, re.IGNORECASE):
+            lhs = m_asn.group(1)
+            rhs = m_asn.group(2).rstrip()
+            rhs = fscan.strip_redundant_outer_parens_expr(rhs)
+            rhs = _strip_simple_parenthesized_sections(rhs)
+            rhs = _rewrite_safe_mul_self_to_pow2(rhs)
+            terms, ops = _split_top_level_add_ops(rhs)
+            if len(terms) > 1:
+                terms = [fscan.strip_redundant_outer_parens_expr(t) for t in terms]
+                rhs2 = terms[0]
+                for op, t in zip(ops, terms[1:]):
+                    rhs2 += f" {op} {t}"
+                rhs = rhs2
+            code = lhs + rhs
+        else:
+            # Also simplify redundant parentheses inside IF conditions.
+            m_if = re.match(r"^(\s*if\s*\()(.+)(\)\s*(?:then|return|cycle|exit|call\b.*)?)$", code, re.IGNORECASE)
+            if m_if:
+                pre = m_if.group(1)
+                cond = m_if.group(2).rstrip()
+                post = m_if.group(3)
+                cond = fscan.strip_redundant_outer_parens_expr(cond)
+                cond = _strip_simple_parenthesized_sections(cond)
+                cond = _rewrite_safe_mul_self_to_pow2(cond)
+                terms, ops = _split_top_level_add_ops(cond)
+                if len(terms) > 1:
+                    terms = [fscan.strip_redundant_outer_parens_expr(t) for t in terms]
+                    cond2 = terms[0]
+                    for op, t in zip(ops, terms[1:]):
+                        cond2 += f" {op} {t}"
+                    cond = cond2
+                rel = _split_top_level_relop(cond)
+                if rel is not None:
+                    lhs_rel, op_rel, rhs_rel = rel
+                    lhs_rel = fscan.strip_redundant_outer_parens_expr(lhs_rel)
+                    rhs_rel = fscan.strip_redundant_outer_parens_expr(rhs_rel)
+                    cond = f"{lhs_rel} {op_rel} {rhs_rel}"
+                code = f"{pre}{cond}{post}"
+        cleaned.append(f"{code}{comment}{eol}")
+    return cleaned
+
 
 def ensure_function_result_syntax(lines: List[str]) -> List[str]:
     """Ensure function signatures use explicit RESULT(...) syntax.
