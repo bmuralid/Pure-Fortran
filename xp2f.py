@@ -8334,6 +8334,24 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "array_equal"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                ra = max(0, int(self._rank_expr(node.args[0])))
+                rb = max(0, int(self._rank_expr(node.args[1])))
+                if ra != rb:
+                    return ".false."
+                if ra == 0:
+                    return f"({a0} == {b0})"
+                shape_checks = [f"(size({a0},{d}) == size({b0},{d}))" for d in range(1, ra + 1)]
+                shape_ok = " .and. ".join(shape_checks) if shape_checks else ".true."
+                return f"(({shape_ok}) .and. all({a0} == {b0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "max"
                 and len(node.args) >= 1
             ):
