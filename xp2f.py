@@ -2754,6 +2754,8 @@ def detect_needed_helpers(tree):
                     needed.update({"random_multivariate_hypergeometric", "random_multivariate_hypergeometric_samples"})
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"normal", "standard_normal"}:
                 needed.add("rnorm")
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "integers":
+                needed.add("runif")
             if isinstance(node.func, ast.Attribute) and node.func.attr in {
                 "exponential", "gamma", "beta", "lognormal", "chisquare",
                 "standard_exponential", "standard_gamma", "standard_t", "f",
@@ -2911,6 +2913,21 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_eig")
                 elif node.func.attr == "svd":
                     needed.add("linalg_svd")
+                elif node.func.attr == "eigh":
+                    needed.add("linalg_eigh")
+                elif node.func.attr == "qr":
+                    needed.add("linalg_qr_reduced")
+                elif node.func.attr == "eigh":
+                    needed.add("linalg_eigh")
+                elif node.func.attr == "qr":
+                    needed.add("linalg_qr_reduced")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "quantile"
+            ):
+                needed.add("quantile_linear")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -8352,6 +8369,38 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr == "quantile"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                q0 = self.expr(node.args[1])
+                return f"quantile_linear(reshape({a0}, [size({a0})]), {q0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "integers"
+            ):
+                low_node = node.args[0] if len(node.args) >= 1 else ast.Constant(value=0)
+                high_node = None
+                if len(node.args) >= 2:
+                    high_node = node.args[1]
+                for kw in node.keywords:
+                    if kw.arg == "low":
+                        low_node = kw.value
+                    elif kw.arg == "high":
+                        high_node = kw.value
+                if high_node is None:
+                    raise NotImplementedError("rng.integers requires high in expression context")
+                low_expr = self.expr(low_node)
+                high_expr = self.expr(high_node)
+                if any(kw.arg == "size" for kw in node.keywords) or len(node.args) >= 3:
+                    raise NotImplementedError("rng.integers(size=...) expression form is not supported")
+                return (
+                    f"(int({low_expr}) + int(runif() * real(max(1, int({high_expr}) - int({low_expr})), kind=dp)))"
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "max"
                 and len(node.args) >= 1
             ):
@@ -10312,6 +10361,14 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_real(outs[0], rank=1)
                         self._mark_alloc_real(outs[1], rank=2)
                         continue
+                    if node.value.func.attr == "eigh" and len(outs) >= 2:
+                        self._mark_alloc_real(outs[0], rank=1)
+                        self._mark_alloc_real(outs[1], rank=2)
+                        continue
+                    if node.value.func.attr == "qr" and len(outs) >= 2:
+                        self._mark_alloc_real(outs[0], rank=2)
+                        self._mark_alloc_real(outs[1], rank=2)
+                        continue
                     if node.value.func.attr == "svd" and len(outs) >= 3:
                         self._mark_alloc_real(outs[0], rank=2)
                         self._mark_alloc_real(outs[1], rank=1)
@@ -12083,6 +12140,8 @@ class translator(ast.NodeVisitor):
             return
         # tuple unpacking from supported numpy.linalg calls:
         #   w, v = np.linalg.eig(a)
+        #   w, v = np.linalg.eigh(a)
+        #   q, r = np.linalg.qr(a, mode='reduced')
         #   u, s, vt = np.linalg.svd(a)
         if (
             isinstance(t, (ast.Tuple, ast.List))
@@ -12100,6 +12159,33 @@ class translator(ast.NodeVisitor):
                 outs.append(e.id)
             if v.func.attr == "eig" and len(v.args) >= 1 and len(outs) >= 2:
                 self.o.w(f"call linalg_eig({self.expr(v.args[0])}, {outs[0]}, {outs[1]})")
+                return
+            if v.func.attr == "eigh" and len(v.args) >= 1 and len(outs) >= 2:
+                self.o.w(f"call linalg_eigh({self.expr(v.args[0])}, {outs[0]}, {outs[1]})")
+                return
+            if v.func.attr == "qr" and len(v.args) >= 1 and len(outs) >= 2:
+                mode = "reduced"
+                for kw in v.keywords:
+                    if kw.arg == "mode":
+                        if not is_const_str(kw.value):
+                            raise NotImplementedError("np.linalg.qr mode must be constant string")
+                        mode = str(kw.value.value).lower()
+                if mode != "reduced":
+                    raise NotImplementedError("np.linalg.qr currently supports only mode='reduced'")
+                out0, out1 = outs[0], outs[1]
+                if out0 != "_" and out1 != "_":
+                    self.o.w(f"call linalg_qr_reduced({self.expr(v.args[0])}, {out0}, {out1})")
+                else:
+                    self.o.w("block")
+                    self.o.push()
+                    self.o.w("real(kind=dp), allocatable :: q_qr_tmp(:,:), r_qr_tmp(:,:)")
+                    self.o.w(f"call linalg_qr_reduced({self.expr(v.args[0])}, q_qr_tmp, r_qr_tmp)")
+                    if out0 != "_":
+                        self.o.w(f"{out0} = q_qr_tmp")
+                    if out1 != "_":
+                        self.o.w(f"{out1} = r_qr_tmp")
+                    self.o.pop()
+                    self.o.w("end block")
                 return
             if v.func.attr == "svd" and len(v.args) >= 1 and len(outs) >= 3:
                 self.o.w(f"call linalg_svd({self.expr(v.args[0])}, {outs[0]}, {outs[1]}, {outs[2]})")
@@ -13633,11 +13719,13 @@ class translator(ast.NodeVisitor):
                 self.o.w("end block")
                 return
             self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+            rank2 = False
             if isinstance(size_node, (ast.Tuple, ast.List)):
                 if len(size_node.elts) == 2:
                     n0 = self.expr(size_node.elts[0])
                     n1 = self.expr(size_node.elts[1])
                     self.o.w(f"allocate({t.id}(1:{n0},1:{n1}))")
+                    rank2 = True
                 elif len(size_node.elts) == 1:
                     n0 = self.expr(size_node.elts[0])
                     self.o.w(f"allocate({t.id}(1:{n0}))")
@@ -13652,13 +13740,18 @@ class translator(ast.NodeVisitor):
             self.o.w("real(kind=dp), allocatable :: u_rng(:)")
             self.o.w(f"allocate(u_rng(1:size({t.id})))")
             self.o.w("call random_number(u_rng)")
-            self.o.w(f"do i_rng = 1, size({t.id})")
-            self.o.push()
-            self.o.w(
-                f"{t.id}(i_rng) = int({low_expr}) + int(u_rng(i_rng) * real(max(1, int({high_expr}) - int({low_expr})), kind=dp))"
-            )
-            self.o.pop()
-            self.o.w("end do")
+            if rank2:
+                self.o.w(
+                    f"{t.id} = reshape(int({low_expr}) + int(u_rng * real(max(1, int({high_expr}) - int({low_expr})), kind=dp)), shape({t.id}))"
+                )
+            else:
+                self.o.w(f"do i_rng = 1, size({t.id})")
+                self.o.push()
+                self.o.w(
+                    f"{t.id}(i_rng) = int({low_expr}) + int(u_rng(i_rng) * real(max(1, int({high_expr}) - int({low_expr})), kind=dp))"
+                )
+                self.o.pop()
+                self.o.w("end do")
             self.o.w("if (allocated(u_rng)) deallocate(u_rng)")
             self.o.pop()
             self.o.w("end block")
@@ -14988,6 +15081,27 @@ class translator(ast.NodeVisitor):
                     self.o.w(f"{arr}(idx_put(i_put) + 1) = {vals}")
                 else:
                     self.o.w(f"{arr}({idx} + 1) = {vals}")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Name)
+            and c.func.value.id == "np"
+            and c.func.attr == "fill_diagonal"
+            and len(c.args) >= 2
+        ):
+            arr = self.expr(c.args[0])
+            val = self.expr(c.args[1])
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: i_diag")
+            self.o.w(f"do i_diag = 1, min(size({arr},1), size({arr},2))")
+            self.o.push()
+            self.o.w(f"{arr}(i_diag, i_diag) = {val}")
             self.o.pop()
             self.o.w("end do")
             self.o.pop()

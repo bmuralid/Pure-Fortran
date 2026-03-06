@@ -172,7 +172,10 @@ public :: linalg_cholesky !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp
 public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="determinant of square matrix using LAPACK DGETRF"
 public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="matrix inverse using LAPACK DGETRF/DGETRI"
 public :: linalg_eig !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="right eigenpairs of real square matrix using LAPACK DGEEV (real-spectrum only)"
+public :: linalg_eigh !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),w:real(dp)(:):intent(out),v:real(dp)(:,:):intent(out) desc="eigenpairs of real symmetric matrix using LAPACK DSYEV"
+public :: linalg_qr_reduced !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),q:real(dp)(:,:):intent(out),r:real(dp)(:,:):intent(out) desc="reduced QR factorization using LAPACK DGEQRF/DORGQR"
 public :: linalg_svd !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),u:real(dp)(:,:):intent(out),s:real(dp)(:):intent(out),vt:real(dp)(:,:):intent(out) desc="full SVD using LAPACK DGESVD"
+public :: quantile_linear !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),q:real(dp):intent(in) desc="1D quantile with linear interpolation (NumPy-like default)"
 public :: tri_int !@pyapi kind=function ret=integer(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
 public :: tri_real !@pyapi kind=function ret=real(dp)(:,:) args=n:integer:intent(in),m:integer:intent(in),k:integer:intent(in):optional desc="lower-triangular ones matrix with diagonal offset k"
 public :: moveaxis3_int !@pyapi kind=function ret=integer(:,:,:) args=a:integer(:,:,:):intent(in),src:integer:intent(in),dst:integer:intent(in) desc="move one axis for rank-3 integer arrays (NumPy-style indices)"
@@ -201,6 +204,7 @@ public :: nanmin !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in
 public :: nanmax !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="maximum ignoring NaN values"
 public :: nanargmin !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmin ignoring NaN values; -1 when all NaN"
 public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmax ignoring NaN values; -1 when all NaN"
+public :: optval !@pyapi kind=function ret=scalar args=x:scalar:intent(in):optional,default:scalar:intent(in) desc="return x when present, otherwise default"
 public :: cumsum
 public :: cumprod
 public :: eye
@@ -304,6 +308,13 @@ end interface py_str
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
 end interface linalg_solve
+
+interface optval
+   module procedure optval_int
+   module procedure optval_real
+   module procedure optval_logical
+   module procedure optval_char
+end interface optval
 
 contains
 
@@ -430,6 +441,47 @@ contains
          call random_seed(put=seed_buf)
          deallocate(seed_buf)
       end subroutine seed_rng
+
+      pure integer function optval_int(x, default) result(v)
+         integer, intent(in), optional :: x
+         integer, intent(in) :: default
+         if (present(x)) then
+            v = x
+         else
+            v = default
+         end if
+      end function optval_int
+
+      pure real(kind=dp) function optval_real(x, default) result(v)
+         real(kind=dp), intent(in), optional :: x
+         real(kind=dp), intent(in) :: default
+         if (present(x)) then
+            v = x
+         else
+            v = default
+         end if
+      end function optval_real
+
+      pure logical function optval_logical(x, default) result(v)
+         logical, intent(in), optional :: x
+         logical, intent(in) :: default
+         if (present(x)) then
+            v = x
+         else
+            v = default
+         end if
+      end function optval_logical
+
+      pure function optval_char(x, default) result(v)
+         character(len=*), intent(in), optional :: x
+         character(len=*), intent(in) :: default
+         character(len=:), allocatable :: v
+         if (present(x)) then
+            v = x
+         else
+            v = default
+         end if
+      end function optval_char
 
       subroutine random_normal_vec(x)
          ! fill x with N(0,1) variates using Box-Muller
@@ -3269,6 +3321,87 @@ contains
          allocate(v(1:n,1:n), source=vr)
       end subroutine linalg_eig
 
+      subroutine linalg_eigh(a, w, v)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable, intent(out) :: w(:), v(:,:)
+         real(kind=dp), allocatable :: ac(:,:), work(:)
+         integer :: n, info, lwork
+         interface
+            subroutine dsyev(jobz, uplo, n, a, lda, w, work, lwork, info)
+               character(len=1), intent(in) :: jobz, uplo
+               integer, intent(in) :: n, lda, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*), work(*)
+               double precision, intent(out) :: w(*)
+            end subroutine dsyev
+         end interface
+         n = size(a,1)
+         if (size(a,2) /= n) stop "linalg_eigh: matrix must be square"
+         allocate(ac(1:n,1:n), source=a)
+         allocate(w(1:n))
+         allocate(work(1))
+         lwork = -1
+         call dsyev('V', 'U', n, ac, n, w, work, lwork, info)
+         if (info /= 0) stop "linalg_eigh: dsyev workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dsyev('V', 'U', n, ac, n, w, work, lwork, info)
+         if (info /= 0) stop "linalg_eigh: dsyev failed"
+         allocate(v(1:n,1:n), source=ac)
+      end subroutine linalg_eigh
+
+      subroutine linalg_qr_reduced(a, q, r)
+         real(kind=dp), intent(in) :: a(:,:)
+         real(kind=dp), allocatable, intent(out) :: q(:,:), r(:,:)
+         real(kind=dp), allocatable :: ac(:,:), tau(:), work(:)
+         integer :: m, n, k, info, lwork, i_r, j_r
+         interface
+            subroutine dgeqrf(m, n, a, lda, tau, work, lwork, info)
+               integer, intent(in) :: m, n, lda, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*), tau(*), work(*)
+            end subroutine dgeqrf
+            subroutine dorgqr(m, n, k, a, lda, tau, work, lwork, info)
+               integer, intent(in) :: m, n, k, lda, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*), tau(*), work(*)
+            end subroutine dorgqr
+         end interface
+         m = size(a,1)
+         n = size(a,2)
+         k = min(m, n)
+         allocate(ac(1:m,1:n), source=a)
+         allocate(tau(1:k))
+         allocate(work(1))
+         lwork = -1
+         call dgeqrf(m, n, ac, m, tau, work, lwork, info)
+         if (info /= 0) stop "linalg_qr_reduced: dgeqrf workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dgeqrf(m, n, ac, m, tau, work, lwork, info)
+         if (info /= 0) stop "linalg_qr_reduced: dgeqrf failed"
+         allocate(r(1:k,1:n), source=0.0_dp)
+         do i_r = 1, k
+            do j_r = i_r, n
+               r(i_r,j_r) = ac(i_r,j_r)
+            end do
+         end do
+         if (k < n) ac(:,k+1:n) = 0.0_dp
+         deallocate(work)
+         allocate(work(1))
+         lwork = -1
+         call dorgqr(m, k, k, ac, m, tau, work, lwork, info)
+         if (info /= 0) stop "linalg_qr_reduced: dorgqr workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(1:lwork))
+         call dorgqr(m, k, k, ac, m, tau, work, lwork, info)
+         if (info /= 0) stop "linalg_qr_reduced: dorgqr failed"
+         allocate(q(1:m,1:k), source=ac(:,1:k))
+      end subroutine linalg_qr_reduced
+
       subroutine linalg_svd(a, u, s, vt)
          real(kind=dp), intent(in) :: a(:,:)
          real(kind=dp), allocatable, intent(out) :: u(:,:), s(:), vt(:,:)
@@ -3300,6 +3433,31 @@ contains
          call dgesvd('A', 'A', m, n, ac, m, s, u, m, vt, n, work, lwork, info)
          if (info /= 0) stop "linalg_svd: dgesvd failed"
       end subroutine linalg_svd
+
+      real(kind=dp) function quantile_linear(x, q)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp), intent(in) :: q
+         real(kind=dp), allocatable :: xs(:)
+         real(kind=dp) :: qq, pos, frac
+         integer :: n, lo, hi
+         n = size(x)
+         if (n <= 0) then
+            quantile_linear = 0.0_dp
+            return
+         end if
+         allocate(xs(1:n), source=x)
+         call sort_vec(xs)
+         qq = max(0.0_dp, min(1.0_dp, q))
+         if (n == 1) then
+            quantile_linear = xs(1)
+            return
+         end if
+         pos = qq * real(n - 1, kind=dp) + 1.0_dp
+         lo = int(floor(pos))
+         hi = min(n, lo + 1)
+         frac = pos - real(lo, kind=dp)
+         quantile_linear = (1.0_dp - frac) * xs(lo) + frac * xs(hi)
+      end function quantile_linear
 
       pure real(kind=dp) function var(x, ddof)
          real(kind=dp), intent(in) :: x(:)
