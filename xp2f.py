@@ -2080,9 +2080,17 @@ def normalize_zero_based_unit_stride_loops(lines):
                     if n2 == 1:
                         return f"{iv} + 1"
                     return f"{iv} + {n2}"
+                def _shift_plus_rev_paren(mm):
+                    n = int(mm.group(1))
+                    n2 = n - 1
+                    if n2 <= 0:
+                        return f"({iv})"
+                    if n2 == 1:
+                        return f"({iv} + 1)"
+                    return f"({iv} + {n2})"
                 code = re.sub(
                     rf"\(\s*{re.escape(iv)}\s*\+\s*(\d+)\s*\)",
-                    lambda mm: _shift_plus_rev(mm),
+                    lambda mm: _shift_plus_rev_paren(mm),
                     code,
                     flags=re.IGNORECASE,
                 )
@@ -2148,10 +2156,18 @@ def normalize_zero_based_unit_stride_loops(lines):
                 if n2 == 1:
                     return f"{iv} + 1"
                 return f"{iv} + {n2}"
+            def _shift_plus_paren(m):
+                n = int(m.group(1))
+                n2 = n - 1
+                if n2 <= 0:
+                    return f"({iv})"
+                if n2 == 1:
+                    return f"({iv} + 1)"
+                return f"({iv} + {n2})"
 
             code = re.sub(
                 rf"\(\s*{re.escape(iv)}\s*\+\s*(\d+)\s*\)",
-                lambda m: _shift_plus(m),
+                lambda m: _shift_plus_paren(m),
                 code,
                 flags=re.IGNORECASE,
             )
@@ -2401,7 +2417,9 @@ def remove_redundant_first_guarded_deallocate(lines):
       if (allocated(x)) deallocate(x)
     when:
     - the next nonblank/non-comment line is allocate(x(...))
-    - x has not appeared in prior executable statements.
+    - x has not appeared in prior executable statements
+    - and no executable statements appear before this guard in the procedure.
+      (Avoids deleting guards inside loops/branches where reallocation repeats.)
     """
     out = list(lines)
     re_guard = re.compile(
@@ -2443,6 +2461,7 @@ def remove_redundant_first_guarded_deallocate(lines):
             continue
 
         prior_use = False
+        saw_exec_before_guard = False
         tok_re = re.compile(rf"\b{re.escape(var)}\b", re.IGNORECASE)
         k0 = 0
         for k in range(i - 1, -1, -1):
@@ -2456,10 +2475,11 @@ def remove_redundant_first_guarded_deallocate(lines):
                 continue
             if re_declish.match(ck):
                 continue
+            saw_exec_before_guard = True
             if tok_re.search(ck):
                 prior_use = True
                 break
-        if not prior_use:
+        if (not prior_use) and (not saw_exec_before_guard):
             del out[i]
             # do not advance i; next line shifts into current slot
             continue
@@ -4349,35 +4369,39 @@ def specialize_lambda_function_args(exec_body, local_funcs):
         def visit_Call(self, node):
             nonlocal counter
             self.generic_visit(node)
-            if not (isinstance(node.func, ast.Name) and node.func.id in fn_map):
-                return node
-            fn = fn_map[node.func.id]
-            args = list(node.args)
-            for i, a in enumerate(args):
-                lam = None
-                if isinstance(a, ast.Name) and a.id in lambda_env:
-                    lam = lambda_env[a.id]
-                elif isinstance(a, ast.Lambda):
-                    lam = a
-                if lam is None:
+            while True:
+                if not (isinstance(node.func, ast.Name) and node.func.id in fn_map):
+                    return node
+                fn = fn_map[node.func.id]
+                changed = False
+                args = list(node.args)
+                for i, a in enumerate(args):
+                    lam = None
+                    if isinstance(a, ast.Name) and a.id in lambda_env:
+                        lam = lambda_env[a.id]
+                    elif isinstance(a, ast.Lambda):
+                        lam = a
+                    if lam is None:
+                        continue
+                    if i >= len(fn.args.args):
+                        continue
+                    counter += 1
+                    new_name = f"{fn.name}_lam_{counter}"
+                    new_fn = _specialize_local_fn_with_lambda(fn, i, lam, new_name)
+                    if new_fn is None:
+                        continue
+                    fn_map[new_name] = new_fn
+                    specialized.append(new_fn)
+                    rewritten_calls[fn.name] = rewritten_calls.get(fn.name, 0) + 1
+                    node.func = ast.Name(id=new_name, ctx=ast.Load())
+                    del node.args[i]
+                    # Remove keyword for removed param if used.
+                    pname = fn.args.args[i].arg
+                    node.keywords = [kw for kw in node.keywords if kw.arg != pname]
+                    changed = True
+                    break
+                if changed:
                     continue
-                if i >= len(fn.args.args):
-                    continue
-                counter += 1
-                new_name = f"{fn.name}_lam_{counter}"
-                new_fn = _specialize_local_fn_with_lambda(fn, i, lam, new_name)
-                if new_fn is None:
-                    continue
-                fn_map[new_name] = new_fn
-                specialized.append(new_fn)
-                rewritten_calls[fn.name] = rewritten_calls.get(fn.name, 0) + 1
-                node.func = ast.Name(id=new_name, ctx=ast.Load())
-                del node.args[i]
-                # Remove keyword for removed param if used.
-                pname = fn.args.args[i].arg
-                node.keywords = [kw for kw in node.keywords if kw.arg != pname]
-                break
-            else:
                 # Also support inline lambda passed by keyword, e.g. f(..., g=lambda x: ...)
                 for kw in list(node.keywords):
                     if kw.arg is None or not isinstance(kw.value, ast.Lambda):
@@ -4395,8 +4419,10 @@ def specialize_lambda_function_args(exec_body, local_funcs):
                     rewritten_calls[fn.name] = rewritten_calls.get(fn.name, 0) + 1
                     node.func = ast.Name(id=new_name, ctx=ast.Load())
                     node.keywords = [k for k in node.keywords if k.arg != kw.arg]
+                    changed = True
                     break
-            return node
+                if not changed:
+                    return node
 
     tx = _CallSpecializer()
     for i, st in enumerate(list(exec_body)):
@@ -7596,13 +7622,50 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("only [None,:] and [:,None] tuple subscripts are supported")
             if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 3:
                 a0, a1, a2 = node.slice.elts
+                elts3 = [a0, a1, a2]
+                none_pos = [i for i, a in enumerate(elts3) if is_none(a)]
+                non_none = [a for a in elts3 if not is_none(a)]
+
+                def _dim_size_expr(dim1):
+                    if isinstance(node.value, ast.Name):
+                        return f"size({base_name},{dim1})"
+                    return f"size({base},{dim1})"
+
+                def _idx_or_slice_expr(a, dim1):
+                    if isinstance(a, ast.Slice):
+                        return self._slice_triplet(a, _dim_size_expr(dim1))
+                    return f"({self.expr(a)} + 1)"
+
+                # Support NumPy axis insertion with None/newaxis by indexing in the
+                # base rank first and then inserting singleton axes via SPREAD.
+                if none_pos:
+                    eff_base_rank = len(non_none)
+                    comps = []
+                    for d1, a in enumerate(non_none, start=1):
+                        comps.append(_idx_or_slice_expr(a, d1))
+                    if eff_base_rank == 1:
+                        base_view = base if comps[0] == ":" else f"{base}({comps[0]})"
+                    else:
+                        base_view = f"{base}({', '.join(comps)})"
+                    out_expr = base_view
+                    for p0 in none_pos:
+                        out_expr = f"spread({out_expr}, dim={p0 + 1}, ncopies=1)"
+                    return out_expr
+
+                # General 3D scalar/slice indexing.
+                if any(isinstance(a, ast.Slice) for a in elts3):
+                    d0 = _idx_or_slice_expr(a0, 1)
+                    d1 = _idx_or_slice_expr(a1, 2)
+                    d2 = _idx_or_slice_expr(a2, 3)
+                    return f"{base}({d0}, {d1}, {d2})"
+
                 if all(not isinstance(a, ast.Slice) and not is_none(a) for a in (a0, a1, a2)):
                     return (
                         f"{base}(({self.expr(a0)} + 1), "
                         f"({self.expr(a1)} + 1), "
                         f"({self.expr(a2)} + 1))"
                     )
-                raise NotImplementedError("only scalar 3D tuple subscripts are supported")
+                raise NotImplementedError("unsupported 3D tuple subscripts")
             # Logical mask indexing (NumPy): a[mask] -> pack(a, mask)
             slice_rank = self._rank_expr(node.slice)
             if slice_rank > 0 and self._expr_kind(node.slice) == "logical":
@@ -11855,7 +11918,9 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("**kwargs not supported")
                 args.append(f"{kw.arg}={self.expr(kw.value)}")
                 saw_named = True
-            if saw_named:
+            formal_in = list(self.local_func_arg_names.get(v.func.id, []))
+            force_named_outs = len(v.args) < len(formal_in)
+            if saw_named or force_named_outs:
                 out_formals = list(self.local_tuple_return_out_names.get(v.func.id, []))
                 for j, onm in enumerate(outs):
                     frm = out_formals[j] if j < len(out_formals) else f"{v.func.id}_out_{j + 1}"
@@ -15524,6 +15589,20 @@ def _emit_local_function(
                     and isinstance(n.func.value.value, ast.Name)
                     and n.func.value.value.id == "np"
                     and n.func.value.attr == "linalg"
+                    and n.func.attr == "solve"
+                    and len(n.args) >= 2
+                ):
+                    if isinstance(n.args[0], ast.Name) and n.args[0].id == nm:
+                        rr = max(rr, 2)
+                    if isinstance(n.args[1], ast.Name) and n.args[1].id == nm:
+                        rr = max(rr, 1)
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Attribute)
+                    and isinstance(n.func.value.value, ast.Name)
+                    and n.func.value.value.id == "np"
+                    and n.func.value.attr == "linalg"
                     and n.func.attr == "norm"
                     and len(n.args) >= 1
                     and isinstance(n.args[0], ast.Name)
@@ -15610,7 +15689,12 @@ def _emit_local_function(
             if not (isinstance(_a, ast.Assign) and len(_a.targets) == 1 and isinstance(_a.targets[0], ast.Name)):
                 continue
             _v = _a.value
-            if not (isinstance(_v, ast.Call) and isinstance(_v.func, ast.Name) and _v.func.id == cb):
+            has_cb = False
+            for _vn in ast.walk(_v):
+                if isinstance(_vn, ast.Call) and isinstance(_vn.func, ast.Name) and _vn.func.id == cb:
+                    has_cb = True
+                    break
+            if not has_cb:
                 continue
             tnm = _a.targets[0].id
             rr = 0
@@ -16072,6 +16156,20 @@ def _emit_local_function(
                     and isinstance(n.func.value.value, ast.Name)
                     and n.func.value.value.id == "np"
                     and n.func.value.attr == "linalg"
+                    and n.func.attr == "solve"
+                    and len(n.args) >= 2
+                ):
+                    if isinstance(n.args[0], ast.Name) and n.args[0].id == nm:
+                        rr = max(rr, 2)
+                    if isinstance(n.args[1], ast.Name) and n.args[1].id == nm:
+                        rr = max(rr, 1)
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Attribute)
+                    and isinstance(n.func.value.value, ast.Name)
+                    and n.func.value.value.id == "np"
+                    and n.func.value.attr == "linalg"
                     and n.func.attr == "norm"
                     and len(n.args) >= 1
                     and isinstance(n.args[0], ast.Name)
@@ -16188,7 +16286,10 @@ def _emit_local_function(
             o.w(f"end function {iface_name}")
             o.pop()
             o.w("end interface")
-            arg_decl = f"procedure({iface_name}) :: {arg}"
+            arg_decl = f"procedure({iface_name})"
+            if arg in optional_args:
+                arg_decl += ", optional"
+            arg_decl += f" :: {arg}"
             o.w(arg_decl + (f" ! {argument_comment(arg, 'in')}" if not no_comment else ""))
             continue
         intent_txt = "inout" if _arg_is_assigned(arg) else "in"
@@ -18049,6 +18150,26 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
             "no transpilable executable statements found; "
             "supported guarded-main form is: if __name__ == '__main__': main()"
         )
+
+    # Lift executable-scope local defs (commonly from unwrapped main()) into
+    # local procedure emission, and keep only executable statements in program body.
+    lifted = [s for s in effective_tree.body if isinstance(s, ast.FunctionDef)]
+    if lifted:
+        known_names = {f.name for f in local_funcs if isinstance(f, ast.FunctionDef)}
+        for fn in lifted:
+            if fn.name not in known_names:
+                local_funcs.append(fn)
+                known_names.add(fn.name)
+        effective_tree = ast.Module(
+            body=[s for s in effective_tree.body if not isinstance(s, ast.FunctionDef)],
+            type_ignores=[],
+        )
+        exec_nodes = [
+            s
+            for s in effective_tree.body
+            if not isinstance(s, (ast.ImportFrom, ast.Import, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and not is_main_guard_if(s)
+        ]
 
     # Normalize mixed-type branch-merge prints (e.g. y changes type in if/elif/else
     # then is only printed after the merge) by moving print into each branch.
