@@ -1897,6 +1897,20 @@ def detect_needed_helpers(tree):
 
     class scan(ast.NodeVisitor):
         def visit_Call(self, node):
+            if isinstance(node.func, ast.Name) and node.func.id == "set":
+                needed.add("unique_char")
+                needed.add("unique_int")
+            if isinstance(node.func, ast.Name) and node.func.id == "sorted":
+                needed.add("sort_vec")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"add", "discard"}
+            ):
+                needed.add("unique_char")
+                needed.add("unique_int")
+                if node.func.attr == "discard":
+                    needed.add("setdiff1d_char")
+                    needed.add("setdiff1d_int")
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 needed.add("isqrt_int")
             if (
@@ -2197,6 +2211,23 @@ def detect_needed_helpers(tree):
                     needed.add("print_int_list")
             if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
                 needed.add("py_str")
+            self.generic_visit(node)
+
+        def visit_Set(self, node):
+            needed.add("unique_int")
+            needed.add("unique_char")
+            self.generic_visit(node)
+
+        def visit_BinOp(self, node):
+            if isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)):
+                needed.add("unique_int")
+                needed.add("unique_char")
+            if isinstance(node.op, (ast.BitAnd, ast.Sub, ast.BitXor)):
+                needed.add("setdiff1d_int")
+                needed.add("setdiff1d_char")
+            if isinstance(node.op, (ast.BitAnd, ast.BitXor)):
+                needed.add("intersect1d_int")
+                needed.add("intersect1d_char")
             self.generic_visit(node)
 
     scan().visit(tree)
@@ -3617,6 +3648,7 @@ class translator(ast.NodeVisitor):
         self.rng_vars = set()
         self.python_list_vars = set()
         self.list_aliases = {}
+        self.python_set_vars = set()
 
     def _resolve_list_alias(self, name):
         cur = name
@@ -3636,6 +3668,24 @@ class translator(ast.NodeVisitor):
             return self._is_python_list_expr(node.left) and self._is_python_list_expr(node.right)
         if isinstance(node, ast.IfExp):
             return self._is_python_list_expr(node.body) and self._is_python_list_expr(node.orelse)
+        return False
+
+    def _is_python_set_expr(self, node):
+        if isinstance(node, ast.Set):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "set"
+        ):
+            return True
+        if isinstance(node, ast.Name):
+            nm = self._resolve_list_alias(node.id)
+            return (node.id in self.python_set_vars) or (nm in self.python_set_vars)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitOr, ast.BitAnd, ast.Sub, ast.BitXor)):
+            return self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right)
+        if isinstance(node, ast.IfExp):
+            return self._is_python_set_expr(node.body) and self._is_python_set_expr(node.orelse)
         return False
 
     def _aliased_name(self, name):
@@ -4314,6 +4364,24 @@ class translator(ast.NodeVisitor):
             if kinds == {"char"}:
                 return "char"
             return None
+        if isinstance(node, ast.Set):
+            if not node.elts:
+                return "int"
+            kinds = {self._expr_kind(e) for e in node.elts}
+            kinds.discard(None)
+            if not kinds:
+                return None
+            if "real" in kinds:
+                return "real"
+            if "complex" in kinds:
+                return "complex"
+            if kinds == {"int"}:
+                return "int"
+            if kinds == {"logical"}:
+                return "logical"
+            if kinds == {"char"}:
+                return "char"
+            return None
         if isinstance(node, ast.ListComp):
             # Homogeneous list comprehensions map to homogeneous rank-1 arrays.
             if (
@@ -4563,6 +4631,13 @@ class translator(ast.NodeVisitor):
                     return "int"
                 if node.func.id in {"str"}:
                     return "char"
+                if node.func.id == "set":
+                    if len(node.args) == 0:
+                        return "int"
+                    if len(node.args) >= 1:
+                        return self._expr_kind(node.args[0])
+                if node.func.id == "sorted" and len(node.args) >= 1:
+                    return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -5445,6 +5520,8 @@ class translator(ast.NodeVisitor):
             if node.elts and all(isinstance(e, ast.Tuple) for e in node.elts):
                 return 2
             return 1
+        if isinstance(node, ast.Set):
+            return 1
         if isinstance(node, ast.ListComp):
             return 1
         if isinstance(node, ast.Subscript):
@@ -5541,7 +5618,10 @@ class translator(ast.NodeVisitor):
                 "tile",
                 "unique",
                 "arange_int",
+                "sorted",
             } and len(node.args) >= 1:
+                return 1
+            if isinstance(node.func, ast.Name) and node.func.id == "set":
                 return 1
             if isinstance(node.func, ast.Name) and node.func.id == "diag" and len(node.args) >= 1:
                 r0 = self._rank_expr(node.args[0])
@@ -6144,8 +6224,46 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Tuple):
             return _array_constructor(node.elts)
 
+        if isinstance(node, ast.Set):
+            if not node.elts:
+                return "unique_int([integer ::])"
+            if any(self._rank_expr(e) != 0 for e in node.elts):
+                raise NotImplementedError("set literals currently support only scalar elements")
+            kset = {self._expr_kind(e) for e in node.elts}
+            kset.discard(None)
+            if kset == {"int"}:
+                return f"unique_int({_array_constructor(node.elts)})"
+            if kset == {"char"}:
+                return f"unique_char({_array_constructor(node.elts)})"
+            raise NotImplementedError("set literals currently support only homogeneous scalar integer or character elements")
+
         if isinstance(node, ast.BinOp):
             op = type(node.op)
+            if self._is_python_set_expr(node.left) and self._is_python_set_expr(node.right):
+                a_set = self.expr(node.left)
+                b_set = self.expr(node.right)
+                kset = {self._expr_kind(node.left), self._expr_kind(node.right)}
+                kset.discard(None)
+                if len(kset) > 1:
+                    raise NotImplementedError("set operations require homogeneous operand element types")
+                sk = next(iter(kset)) if kset else "int"
+                if sk == "char":
+                    fn_unique = "unique_char"
+                    fn_inter = "intersect1d_char"
+                    fn_diff = "setdiff1d_char"
+                else:
+                    fn_unique = "unique_int"
+                    fn_inter = "intersect1d_int"
+                    fn_diff = "setdiff1d_int"
+                if op is ast.BitOr:
+                    return f"{fn_unique}([{a_set}, {b_set}])"
+                if op is ast.BitAnd:
+                    return f"{fn_inter}({a_set}, {b_set})"
+                if op is ast.Sub:
+                    return f"{fn_diff}({a_set}, {b_set})"
+                if op is ast.BitXor:
+                    return f"{fn_diff}({fn_unique}([{a_set}, {b_set}]), {fn_inter}({a_set}, {b_set}))"
+                raise NotImplementedError("unsupported set binary operation")
             opmap = {
                 ast.Add: "+",
                 ast.Sub: "-",
@@ -6882,6 +7000,19 @@ class translator(ast.NodeVisitor):
                 if isinstance(a0, ast.Name) and a0.id in self.list_counts:
                     return self.list_counts[a0.id]
                 return f"size({self.expr(a0)})"
+            if isinstance(node.func, ast.Name) and node.func.id == "set":
+                if len(node.args) == 0:
+                    return "unique_int([integer ::])"
+                if len(node.args) == 1:
+                    ak = self._expr_kind(node.args[0])
+                    if ak == "char":
+                        return f"unique_char({self.expr(node.args[0])})"
+                    if ak == "int":
+                        return f"unique_int({self.expr(node.args[0])})"
+                    raise NotImplementedError("set(...) currently supports only integer or character inputs")
+                raise NotImplementedError("set(...) expects at most one argument")
+            if isinstance(node.func, ast.Name) and node.func.id == "sorted":
+                raise NotImplementedError("sorted(...) is currently supported only in for-loops")
             if isinstance(node.func, ast.Name):
                 if node.func.id in self.user_class_types:
                     tnm = self.user_class_types[node.func.id]
@@ -10303,6 +10434,10 @@ class translator(ast.NodeVisitor):
                 self.python_list_vars.add(t.id)
             else:
                 self.python_list_vars.discard(t.id)
+            if self._is_python_set_expr(v):
+                self.python_set_vars.add(t.id)
+            else:
+                self.python_set_vars.discard(t.id)
         if isinstance(t, ast.Name) and t.id in self.reserved_names:
             t = ast.Name(id=self._aliased_name(t.id), ctx=t.ctx)
 
@@ -13169,7 +13304,42 @@ class translator(ast.NodeVisitor):
             return
 
         if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range"):
-            raise NotImplementedError("only for .. in range(..) supported")
+            if (
+                isinstance(node.iter, ast.Call)
+                and isinstance(node.iter.func, ast.Name)
+                and node.iter.func.id == "sorted"
+                and len(node.iter.args) == 1
+                and isinstance(node.target, ast.Name)
+            ):
+                arr_expr = self.expr(node.iter.args[0])
+                iv = f"i_sorted_{node.lineno}"
+                self._mark_int(iv)
+                if node.target.id != "_":
+                    if self._expr_kind(node.iter.args[0]) == "real":
+                        self._mark_real(node.target.id)
+                    else:
+                        self._mark_int(node.target.id)
+                self.o.w("block")
+                self.o.push()
+                if self._expr_kind(node.iter.args[0]) == "real":
+                    self.o.w("real(kind=dp), allocatable :: sorted_tmp(:)")
+                else:
+                    self.o.w("integer, allocatable :: sorted_tmp(:)")
+                self.o.w(f"integer :: {iv}")
+                self.o.w(f"sorted_tmp = {arr_expr}")
+                self.o.w("call sort_vec(sorted_tmp)")
+                self.o.w(f"do {iv} = 1, size(sorted_tmp)")
+                self.o.push()
+                if node.target.id != "_":
+                    self.o.w(f"{node.target.id} = sorted_tmp({iv})")
+                for s in node.body:
+                    self.visit(s)
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            raise NotImplementedError("only for .. in range(..) or for .. in sorted(..) supported")
         if not isinstance(node.target, ast.Name):
             raise NotImplementedError("for target must be a name")
 
@@ -13356,6 +13526,33 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"call {call_name}(" + ", ".join(parts) + ")")
             else:
                 self.o.w(f"call {call_name}()")
+            return
+
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Name)
+            and c.func.value.id in self.python_set_vars
+            and c.func.attr in {"add", "discard"}
+        ):
+            name = c.func.value.id
+            if len(c.args) != 1:
+                raise NotImplementedError(f"set.{c.func.attr} expects exactly one argument")
+            if self._rank_expr(c.args[0]) != 0:
+                raise NotImplementedError(f"set.{c.func.attr} currently supports only scalar argument")
+            k = self._expr_kind(c.args[0])
+            if k not in {"int", "char"}:
+                raise NotImplementedError(f"set.{c.func.attr} currently supports only scalar integer or character argument")
+            val = self.expr(c.args[0])
+            if k == "char":
+                fn_unique = "unique_char"
+                fn_diff = "setdiff1d_char"
+            else:
+                fn_unique = "unique_int"
+                fn_diff = "setdiff1d_int"
+            if c.func.attr == "add":
+                self.o.w(f"{name} = {fn_unique}([{name}, {val}])")
+            else:
+                self.o.w(f"{name} = {fn_diff}({name}, [{val}])")
             return
 
         if isinstance(c.func, ast.Attribute) and c.func.attr == "append":
