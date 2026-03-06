@@ -4,6 +4,7 @@ use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value, ieee_quiet_nan
 implicit none
 private
 integer, parameter :: dp = real64
+logical, parameter :: fft_use_fast = .true.
 
 type :: strvec_t
    character(len=:), allocatable :: v(:)
@@ -191,6 +192,12 @@ public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
 public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
 public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional desc="m-th derivative coefficients for descending-order polynomial"
+public :: fft_fft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like fft for 1D real/complex input (naive DFT backend)"
+public :: fft_ifft !@pyapi kind=function ret=complex(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like ifft for 1D complex input (naive DFT backend)"
+public :: fft_rfft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like rfft for 1D real input"
+public :: fft_irfft !@pyapi kind=function ret=real(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like irfft for 1D Hermitian spectrum"
+public :: fft_fftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional desc="numpy-like fftfreq(n,d)"
+public :: fft_rfftfreq !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in),d:real(dp):intent(in):optional desc="numpy-like rfftfreq(n,d)"
 
 public :: var !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
 public :: mean !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
@@ -315,6 +322,11 @@ interface optval
    module procedure optval_logical
    module procedure optval_char
 end interface optval
+
+interface fft_fft
+   module procedure fft_fft_real
+   module procedure fft_fft_complex
+end interface fft_fft
 
 contains
 
@@ -3965,5 +3977,293 @@ contains
          allocate(dpcoef(size(cur)))
          dpcoef = cur
       end function polyder_real
+
+      pure logical function fft_is_power_of_two(n)
+         integer, intent(in) :: n
+         fft_is_power_of_two = n > 0 .and. iand(n, n - 1) == 0
+      end function fft_is_power_of_two
+
+
+      subroutine fft_dft_forward(x, y)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), intent(out) :: y(:)
+         integer :: j, k, nn
+         real(kind=dp) :: ang, twopi
+         complex(kind=dp) :: w
+
+         nn = size(x)
+         twopi = 2.0_dp * acos(-1.0_dp)
+         do k = 1, nn
+            y(k) = cmplx(0.0_dp, 0.0_dp, kind=dp)
+            do j = 1, nn
+               ang = -twopi * real((k - 1) * (j - 1), kind=dp) / real(nn, kind=dp)
+               w = cmplx(cos(ang), sin(ang), kind=dp)
+               y(k) = y(k) + x(j) * w
+            end do
+         end do
+      end subroutine fft_dft_forward
+
+
+      subroutine fft_dft_inverse(x, y)
+         complex(kind=dp), intent(in) :: x(:)
+         complex(kind=dp), intent(out) :: y(:)
+         integer :: j, k, nn
+         real(kind=dp) :: ang, twopi
+         complex(kind=dp) :: w
+
+         nn = size(x)
+         twopi = 2.0_dp * acos(-1.0_dp)
+         do k = 1, nn
+            y(k) = cmplx(0.0_dp, 0.0_dp, kind=dp)
+            do j = 1, nn
+               ang = twopi * real((k - 1) * (j - 1), kind=dp) / real(nn, kind=dp)
+               w = cmplx(cos(ang), sin(ang), kind=dp)
+               y(k) = y(k) + x(j) * w
+            end do
+            y(k) = y(k) / real(nn, kind=dp)
+         end do
+      end subroutine fft_dft_inverse
+
+
+      subroutine fft_radix2_inplace(a, inverse)
+         complex(kind=dp), intent(inout) :: a(:)
+         logical, intent(in) :: inverse
+         integer :: i, j, m, mmax, istep, n
+         real(kind=dp) :: pi, theta, wi, wpi, wpr, wr, wtemp
+         complex(kind=dp) :: temp
+
+         n = size(a)
+         if (n <= 1) return
+
+         j = 1
+         do i = 1, n
+            if (i < j) then
+               temp = a(j)
+               a(j) = a(i)
+               a(i) = temp
+            end if
+            m = n / 2
+            do while (m >= 1 .and. j > m)
+               j = j - m
+               m = m / 2
+            end do
+            j = j + m
+         end do
+
+         pi = acos(-1.0_dp)
+         mmax = 1
+         do while (n > mmax)
+            istep = 2 * mmax
+            if (inverse) then
+               theta = pi / real(mmax, kind=dp)
+            else
+               theta = -pi / real(mmax, kind=dp)
+            end if
+            wtemp = sin(0.5_dp * theta)
+            wpr = -2.0_dp * wtemp * wtemp
+            wpi = sin(theta)
+            wr = 1.0_dp
+            wi = 0.0_dp
+            do m = 1, mmax
+               do i = m, n, istep
+                  j = i + mmax
+                  temp = cmplx(wr, wi, kind=dp) * a(j)
+                  a(j) = a(i) - temp
+                  a(i) = a(i) + temp
+               end do
+               wtemp = wr
+               wr = wr * wpr - wi * wpi + wr
+               wi = wi * wpr + wtemp * wpi + wi
+            end do
+            mmax = istep
+         end do
+
+         if (inverse) a = a / real(n, kind=dp)
+      end subroutine fft_radix2_inplace
+
+
+      function fft_fft_real(x, n) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: n
+         complex(kind=dp), allocatable :: y(:)
+         complex(kind=dp), allocatable :: xc(:)
+         integer :: i, nn
+
+         if (present(n)) then
+            nn = n
+         else
+            nn = size(x)
+         end if
+         if (nn < 0) nn = 0
+         allocate(y(nn))
+         if (nn <= 0) return
+         allocate(xc(nn))
+         xc = cmplx(0.0_dp, 0.0_dp, kind=dp)
+         do i = 1, min(size(x), nn)
+            xc(i) = cmplx(x(i), 0.0_dp, kind=dp)
+         end do
+         if (fft_use_fast .and. fft_is_power_of_two(nn)) then
+            y = xc
+            call fft_radix2_inplace(y, .false.)
+         else
+            call fft_dft_forward(xc, y)
+         end if
+      end function fft_fft_real
+
+
+      function fft_fft_complex(x, n) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: n
+         complex(kind=dp), allocatable :: y(:)
+         complex(kind=dp), allocatable :: xc(:)
+         integer :: i, nn
+
+         if (present(n)) then
+            nn = n
+         else
+            nn = size(x)
+         end if
+         if (nn < 0) nn = 0
+         allocate(y(nn))
+         if (nn <= 0) return
+         allocate(xc(nn))
+         xc = cmplx(0.0_dp, 0.0_dp, kind=dp)
+         do i = 1, min(size(x), nn)
+            xc(i) = x(i)
+         end do
+         if (fft_use_fast .and. fft_is_power_of_two(nn)) then
+            y = xc
+            call fft_radix2_inplace(y, .false.)
+         else
+            call fft_dft_forward(xc, y)
+         end if
+      end function fft_fft_complex
+
+
+      function fft_ifft(x, n) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: n
+         complex(kind=dp), allocatable :: y(:)
+         complex(kind=dp), allocatable :: xc(:)
+         integer :: i, nn
+
+         if (present(n)) then
+            nn = n
+         else
+            nn = size(x)
+         end if
+         if (nn < 0) nn = 0
+         allocate(y(nn))
+         if (nn <= 0) return
+         allocate(xc(nn))
+         xc = cmplx(0.0_dp, 0.0_dp, kind=dp)
+         do i = 1, min(size(x), nn)
+            xc(i) = x(i)
+         end do
+         if (fft_use_fast .and. fft_is_power_of_two(nn)) then
+            y = xc
+            call fft_radix2_inplace(y, .true.)
+         else
+            call fft_dft_inverse(xc, y)
+         end if
+      end function fft_ifft
+
+
+      function fft_rfft(x, n) result(y)
+         real(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: n
+         complex(kind=dp), allocatable :: y(:)
+         complex(kind=dp), allocatable :: full(:)
+         integer :: nn, m
+
+         full = fft_fft_real(x, n)
+         nn = size(full)
+         m = nn / 2 + 1
+         allocate(y(m))
+         y = full(1:m)
+      end function fft_rfft
+
+
+      function fft_irfft(x, n) result(y)
+         complex(kind=dp), intent(in) :: x(:)
+         integer, intent(in), optional :: n
+         real(kind=dp), allocatable :: y(:)
+         complex(kind=dp), allocatable :: full(:), ctmp(:)
+         integer :: k, m, nn, idx
+
+         if (present(n)) then
+            nn = n
+         else
+            nn = 2 * max(0, size(x) - 1)
+         end if
+         if (nn < 0) nn = 0
+         allocate(full(nn))
+         full = cmplx(0.0_dp, 0.0_dp, kind=dp)
+         if (nn == 0) then
+            allocate(y(0))
+            return
+         end if
+         m = min(size(x), nn / 2 + 1)
+         if (m > 0) full(1:m) = x(1:m)
+         do k = 2, m - 1
+            idx = nn - k + 2
+            if (1 <= idx .and. idx <= nn) then
+               full(idx) = conjg(x(k))
+            end if
+         end do
+         ctmp = fft_ifft(full, nn)
+         allocate(y(nn))
+         y = real(ctmp, kind=dp)
+      end function fft_irfft
+
+
+      function fft_fftfreq(n, d) result(f)
+         integer, intent(in) :: n
+         real(kind=dp), intent(in), optional :: d
+         real(kind=dp), allocatable :: f(:)
+         integer :: i, k
+         real(kind=dp) :: dopt, den
+
+         dopt = 1.0_dp
+         if (present(d)) dopt = d
+         if (n < 0) then
+            allocate(f(0))
+            return
+         end if
+         allocate(f(n))
+         if (n == 0) return
+         den = real(n, kind=dp) * dopt
+         do i = 1, n
+            k = i - 1
+            if (k <= (n - 1) / 2) then
+               f(i) = real(k, kind=dp) / den
+            else
+               f(i) = real(k - n, kind=dp) / den
+            end if
+         end do
+      end function fft_fftfreq
+
+
+      function fft_rfftfreq(n, d) result(f)
+         integer, intent(in) :: n
+         real(kind=dp), intent(in), optional :: d
+         real(kind=dp), allocatable :: f(:)
+         integer :: i, m
+         real(kind=dp) :: dopt, den
+
+         dopt = 1.0_dp
+         if (present(d)) dopt = d
+         if (n < 0) then
+            allocate(f(0))
+            return
+         end if
+         m = n / 2 + 1
+         allocate(f(m))
+         if (m == 0) return
+         den = real(max(1, n), kind=dp) * dopt
+         do i = 1, m
+            f(i) = real(i - 1, kind=dp) / den
+         end do
+      end function fft_rfftfreq
 
 end module python_mod

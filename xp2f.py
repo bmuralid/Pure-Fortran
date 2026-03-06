@@ -526,6 +526,46 @@ def _strict_lambda_diagnostics(src_text):
     return diags
 
 
+def _strict_ifexp_diagnostics(src_text):
+    """
+    Strict rule:
+    - Conditional expressions should not mix branch ranks.
+    """
+    diags = []
+    tree = ast.parse(src_text)
+    tr = translator(
+        emit(),
+        params=find_parameters(tree),
+        context="flat",
+        list_counts=build_list_count_map(tree),
+    )
+    tr.prescan(tree.body)
+    for st in tree.body:
+        if isinstance(st, ast.FunctionDef):
+            tr.prescan(st.body)
+
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.IfExp):
+            continue
+        rb = tr._rank_expr(n.body)
+        ro = tr._rank_expr(n.orelse)
+        if rb == ro:
+            continue
+        ln = getattr(n, "lineno", 1)
+        col = getattr(n, "col_offset", 0) + 1
+        seg = ast.get_source_segment(src_text, n)
+        diags.append({
+            "line": ln,
+            "col": col,
+            "rule": "ifexp_rank_mismatch",
+            "message": f"IfExp branch rank mismatch ({rb} vs {ro}); strict mode requires explicit rank-stable conditionals",
+            "snippet": seg.strip() if isinstance(seg, str) else "a if cond else b",
+            "suggestion": "rewrite as an explicit if/else block assigning rank-compatible expressions",
+        })
+    diags.sort(key=lambda d: (d["line"], d["col"]))
+    return diags
+
+
 def _strict_expr_family(node):
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bool):
@@ -716,6 +756,7 @@ def _run_strict_check(src_text, path_label):
     diags.extend(_strict_polymorphic_function_diagnostics(src_text))
     diags.extend(_strict_type_rebind_diagnostics(src_text))
     diags.extend(_strict_lambda_diagnostics(src_text))
+    diags.extend(_strict_ifexp_diagnostics(src_text))
     diags.sort(key=lambda d: (d["line"], d["col"]))
     if not diags:
         print(f"Strict: PASS ({path_label})")
@@ -2873,6 +2914,25 @@ def detect_needed_helpers(tree):
                 and node.func.attr in np_helper_map
             ):
                 needed.update(np_helper_map[node.func.attr])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "fft"
+            ):
+                if node.func.attr == "fft":
+                    needed.add("fft_fft")
+                elif node.func.attr == "ifft":
+                    needed.add("fft_ifft")
+                elif node.func.attr == "rfft":
+                    needed.add("fft_rfft")
+                elif node.func.attr == "irfft":
+                    needed.add("fft_irfft")
+                elif node.func.attr == "fftfreq":
+                    needed.add("fft_fftfreq")
+                elif node.func.attr == "rfftfreq":
+                    needed.add("fft_rfftfreq")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -5624,6 +5684,17 @@ class translator(ast.NodeVisitor):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "fft"
+            ):
+                if node.func.attr in {"fft", "ifft", "rfft"}:
+                    return "complex"
+                if node.func.attr in {"irfft", "fftfreq", "rfftfreq"}:
+                    return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "array"
@@ -6575,7 +6646,7 @@ class translator(ast.NodeVisitor):
             return max(self._rank_expr(node.left), self._rank_expr(node.right))
         if isinstance(node, ast.UnaryOp):
             return self._rank_expr(node.operand)
-        if isinstance(node, ast.Attribute) and node.attr == "T":
+        if isinstance(node, ast.Attribute) and node.attr in {"T", "real", "imag"}:
             return self._rank_expr(node.value)
         if isinstance(node, ast.Call):
             def _is_rng_rank_source(src):
@@ -6651,6 +6722,15 @@ class translator(ast.NodeVisitor):
                     if len(node.args) >= 1:
                         return max(1, self._rank_expr(node.args[0]))
                     return 1
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "fft"
+                and node.func.attr in {"fft", "ifft", "rfft", "irfft", "fftfreq", "rfftfreq"}
+            ):
+                return 1
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -7477,6 +7557,15 @@ class translator(ast.NodeVisitor):
             ko = self._expr_kind(node.orelse)
             if kb == "char" or ko == "char":
                 raise NotImplementedError("unsupported expr: IfExp with character result")
+            # Python IfExp short-circuits; Fortran MERGE does not guarantee that.
+            # Keep MERGE use to simple branch atoms only.
+            if not (
+                isinstance(node.body, (ast.Name, ast.Constant))
+                and isinstance(node.orelse, (ast.Name, ast.Constant))
+            ):
+                raise NotImplementedError(
+                    "unsupported expr: IfExp requires statement-level lowering for non-atomic branches"
+                )
             return f"merge({self.expr(node.body)}, {self.expr(node.orelse)}, {self.expr(node.test)})"
 
         if isinstance(node, ast.Compare):
@@ -7710,9 +7799,19 @@ class translator(ast.NodeVisitor):
             # Logical mask indexing (NumPy): a[mask] -> pack(a, mask)
             slice_rank = self._rank_expr(node.slice)
             if slice_rank > 0 and self._expr_kind(node.slice) == "logical":
+                if self._rank_expr(node.value) == 2 and self._rank_expr(node.slice) == 1:
+                    m = self.expr(node.slice)
+                    return (
+                        f"transpose(reshape(pack(transpose({base}), "
+                        f"spread({m}, dim=1, ncopies=size({base},2))), "
+                        f"[size({base},2), count({m})]))"
+                    )
                 return f"pack({base}, {self.expr(node.slice)})"
             # Integer/vector indexing for rank-1 arrays.
             if slice_rank > 0 and self._rank_expr(node.value) == 1:
+                if self._rank_expr(node.slice) > 1:
+                    s = self.expr(node.slice)
+                    return f"reshape({base}(reshape({s} + 1, [size({s})])), shape({s}))"
                 return f"{base}(({self.expr(node.slice)} + 1))"
             # Python emitters in this project use 0-based forms like (i)-1;
             # map those back to natural Fortran 1-based indexing.
@@ -10026,6 +10125,42 @@ class translator(ast.NodeVisitor):
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 return f"sqrt({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and isinstance(node.func.value.value, ast.Name)
+                and node.func.value.value.id == "np"
+                and node.func.value.attr == "fft"
+            ):
+                name = node.func.attr
+                if name in {"fft", "ifft", "rfft", "irfft"} and len(node.args) >= 1:
+                    a0 = self.expr(node.args[0])
+                    n_txt = None
+                    if len(node.args) >= 2:
+                        n_txt = self.expr(node.args[1])
+                    for kw in node.keywords:
+                        if kw.arg == "n":
+                            n_txt = self.expr(kw.value)
+                            break
+                    if name == "fft":
+                        return f"fft_fft({a0}, int({n_txt}))" if n_txt is not None else f"fft_fft({a0})"
+                    if name == "ifft":
+                        return f"fft_ifft({a0}, int({n_txt}))" if n_txt is not None else f"fft_ifft({a0})"
+                    if name == "rfft":
+                        return f"fft_rfft({a0}, int({n_txt}))" if n_txt is not None else f"fft_rfft({a0})"
+                    return f"fft_irfft({a0}, int({n_txt}))" if n_txt is not None else f"fft_irfft({a0})"
+                if name in {"fftfreq", "rfftfreq"} and len(node.args) >= 1:
+                    n0 = self.expr(node.args[0])
+                    d_txt = None
+                    if len(node.args) >= 2:
+                        d_txt = self.expr(node.args[1])
+                    for kw in node.keywords:
+                        if kw.arg == "d":
+                            d_txt = self.expr(kw.value)
+                            break
+                    if name == "fftfreq":
+                        return f"fft_fftfreq(int({n0}), {d_txt})" if d_txt is not None else f"fft_fftfreq(int({n0}))"
+                    return f"fft_rfftfreq(int({n0}), {d_txt})" if d_txt is not None else f"fft_rfftfreq(int({n0}))"
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
@@ -11769,6 +11904,35 @@ class translator(ast.NodeVisitor):
         ):
             # No-op self-cast in Python (`x = float(x)`) can force invalid
             # Fortran assignment to INTENT(IN) dummies; skip emission.
+            return
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr in {"ravel", "flatten"}
+            and isinstance(v.func.value, ast.Call)
+            and isinstance(v.func.value.func, ast.Attribute)
+            and isinstance(v.func.value.func.value, ast.Name)
+            and v.func.value.func.value.id == "np"
+            and v.func.value.func.attr in {"asarray", "array"}
+            and len(v.func.value.args) >= 1
+            and isinstance(v.func.value.args[0], ast.Name)
+            and v.func.value.args[0].id == t.id
+        ):
+            # No-op self-normalization (`x = np.asarray(x,...).ravel()`) can force
+            # invalid INTENT(INOUT) dummies for call sites where x is intent(in).
+            return
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "np"
+            and v.func.attr in {"asarray", "array"}
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Name)
+            and v.args[0].id == t.id
+        ):
             return
         if isinstance(t, ast.Name):
             if is_none(v):
@@ -14474,6 +14638,19 @@ class translator(ast.NodeVisitor):
         # NEW: fallback for name = <simple expr>  (e.g., largest = i)
         if isinstance(t, ast.Name):
             if isinstance(v, ast.IfExp):
+                rb = self._rank_expr(v.body)
+                ro = self._rank_expr(v.orelse)
+                if (rb == 0 and ro > 0) or (ro == 0 and rb > 0):
+                    nm = t.id
+                    if (
+                        nm in self.alloc_reals
+                        or nm in self.alloc_ints
+                        or nm in self.alloc_logs
+                        or nm in self.alloc_complexes
+                        or nm in self.alloc_chars
+                    ):
+                        arr_expr = self.expr(v.body if rb > 0 else v.orelse)
+                        self.o.w(f"if (.not. allocated({nm})) allocate({nm}, mold={arr_expr})")
                 self.o.w(f"if ({self.expr(v.test)}) then")
                 self.o.push()
                 self.o.w(f"{t.id} = {self.expr(v.body)}")
