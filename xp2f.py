@@ -4314,30 +4314,54 @@ def specialize_lambda_function_args(exec_body, local_funcs):
 
     class _CallSpecializer(ast.NodeTransformer):
         def visit_Call(self, node):
+            nonlocal counter
             self.generic_visit(node)
             if not (isinstance(node.func, ast.Name) and node.func.id in fn_map):
                 return node
             fn = fn_map[node.func.id]
             args = list(node.args)
             for i, a in enumerate(args):
+                lam = None
                 if isinstance(a, ast.Name) and a.id in lambda_env:
                     lam = lambda_env[a.id]
-                    if i >= len(fn.args.args):
+                elif isinstance(a, ast.Lambda):
+                    lam = a
+                if lam is None:
+                    continue
+                if i >= len(fn.args.args):
+                    continue
+                counter += 1
+                new_name = f"{fn.name}_lam_{counter}"
+                new_fn = _specialize_local_fn_with_lambda(fn, i, lam, new_name)
+                if new_fn is None:
+                    continue
+                fn_map[new_name] = new_fn
+                specialized.append(new_fn)
+                rewritten_calls[fn.name] = rewritten_calls.get(fn.name, 0) + 1
+                node.func = ast.Name(id=new_name, ctx=ast.Load())
+                del node.args[i]
+                # Remove keyword for removed param if used.
+                pname = fn.args.args[i].arg
+                node.keywords = [kw for kw in node.keywords if kw.arg != pname]
+                break
+            else:
+                # Also support inline lambda passed by keyword, e.g. f(..., g=lambda x: ...)
+                for kw in list(node.keywords):
+                    if kw.arg is None or not isinstance(kw.value, ast.Lambda):
                         continue
-                    nonlocal counter
+                    idx = next((j for j, aa in enumerate(fn.args.args) if aa.arg == kw.arg), -1)
+                    if idx < 0:
+                        continue
                     counter += 1
                     new_name = f"{fn.name}_lam_{counter}"
-                    new_fn = _specialize_local_fn_with_lambda(fn, i, lam, new_name)
+                    new_fn = _specialize_local_fn_with_lambda(fn, idx, kw.value, new_name)
                     if new_fn is None:
                         continue
                     fn_map[new_name] = new_fn
                     specialized.append(new_fn)
                     rewritten_calls[fn.name] = rewritten_calls.get(fn.name, 0) + 1
                     node.func = ast.Name(id=new_name, ctx=ast.Load())
-                    del node.args[i]
-                    # Remove keyword for removed param if used.
-                    pname = fn.args.args[i].arg
-                    node.keywords = [kw for kw in node.keywords if kw.arg != pname]
+                    node.keywords = [k for k in node.keywords if k.arg != kw.arg]
                     break
             return node
 
