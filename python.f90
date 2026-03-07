@@ -189,6 +189,9 @@ public :: allclose_integer !@pyapi kind=function ret=logical args=a:integer(:):i
 public :: cov2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="2x2 covariance matrix for two real vectors"
 public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),ddof:integer:intent(in):optional desc="covariance matrix for observations in rows (numpy rowvar=False)"
 public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
+public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D convolution with mode full/same/valid"
+public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional desc="1D integer convolution with mode full/same/valid"
+public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional desc="load whitespace-delimited real matrix text file"
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
 public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
 public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional desc="m-th derivative coefficients for descending-order polynomial"
@@ -323,6 +326,11 @@ interface optval
    module procedure optval_char
 end interface optval
 
+interface convolve
+   module procedure convolve_real
+   module procedure convolve_int
+end interface convolve
+
 interface fft_fft
    module procedure fft_fft_real
    module procedure fft_fft_complex
@@ -453,6 +461,77 @@ contains
          call random_seed(put=seed_buf)
          deallocate(seed_buf)
       end subroutine seed_rng
+
+      function loadtxt_real_2d(path, skiprows) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows
+         real(kind=dp), allocatable :: x(:,:)
+         integer :: u, ios, nskip, nrow, ncol, irow, i
+         character(len=4096) :: line
+
+         nskip = optval(skiprows, 0)
+         open(newunit=u, file=trim(path), status="old", action="read", iostat=ios)
+         if (ios /= 0) then
+            allocate(x(0,0))
+            return
+         end if
+         do i = 1, nskip
+            read(u, "(A)", iostat=ios) line
+            if (ios /= 0) exit
+         end do
+
+         nrow = 0
+         ncol = 0
+         do
+            read(u, "(A)", iostat=ios) line
+            if (ios /= 0) exit
+            if (len_trim(line) == 0) cycle
+            nrow = nrow + 1
+            if (ncol == 0) ncol = count_tokens(line)
+         end do
+
+         if (nrow <= 0 .or. ncol <= 0) then
+            close(u)
+            allocate(x(0,0))
+            return
+         end if
+
+         rewind(u)
+         do i = 1, nskip
+            read(u, "(A)", iostat=ios) line
+            if (ios /= 0) exit
+         end do
+
+         allocate(x(nrow, ncol))
+         irow = 0
+         do
+            read(u, "(A)", iostat=ios) line
+            if (ios /= 0) exit
+            if (len_trim(line) == 0) cycle
+            irow = irow + 1
+            read(line, *, iostat=ios) x(irow, :)
+            if (ios /= 0) x(irow, :) = 0.0_dp
+         end do
+         close(u)
+      contains
+         pure integer function count_tokens(s) result(n)
+            character(len=*), intent(in) :: s
+            integer :: i
+            logical :: in_tok
+            n = 0
+            in_tok = .false.
+            do i = 1, len_trim(s)
+               if (s(i:i) /= " " .and. s(i:i) /= achar(9)) then
+                  if (.not. in_tok) then
+                     n = n + 1
+                     in_tok = .true.
+                  end if
+               else
+                  in_tok = .false.
+               end if
+            end do
+         end function count_tokens
+      end function loadtxt_real_2d
 
       pure integer function optval_int(x, default) result(v)
          integer, intent(in), optional :: x
@@ -3912,6 +3991,99 @@ contains
             r(2,1) = r(1,2)
          end if
       end function corrcoef2_real
+
+      function convolve_real(x, h, mode) result(y)
+         real(kind=dp), intent(in) :: x(:), h(:)
+         character(len=*), intent(in), optional :: mode
+         real(kind=dp), allocatable :: y(:), full(:)
+         integer :: i, j, nx, nh, ny, start, stop
+         character(len=:), allocatable :: m
+         nx = size(x)
+         nh = size(h)
+         if (nx <= 0 .or. nh <= 0) then
+            allocate(y(0))
+            return
+         end if
+         allocate(full(nx + nh - 1))
+         full = 0.0_dp
+         do i = 1, nx
+            do j = 1, nh
+               full(i + j - 1) = full(i + j - 1) + x(i) * h(j)
+            end do
+         end do
+         m = "full"
+         if (present(mode)) m = to_lower(trim(mode))
+         if (m == "full") then
+            y = full
+            return
+         end if
+         if (m == "same") then
+            ny = nx
+            start = nh / 2 + 1
+            stop = start + ny - 1
+            y = full(start:stop)
+            return
+         end if
+         if (m == "valid") then
+            ny = max(nx, nh) - min(nx, nh) + 1
+            if (ny <= 0) then
+               allocate(y(0))
+            else
+               start = min(nx, nh)
+               stop = start + ny - 1
+               y = full(start:stop)
+            end if
+            return
+         end if
+         y = full
+      end function convolve_real
+
+
+      function convolve_int(x, h, mode) result(y)
+         integer, intent(in) :: x(:), h(:)
+         character(len=*), intent(in), optional :: mode
+         integer, allocatable :: y(:), full(:)
+         integer :: i, j, nx, nh, ny, start, stop
+         character(len=:), allocatable :: m
+         nx = size(x)
+         nh = size(h)
+         if (nx <= 0 .or. nh <= 0) then
+            allocate(y(0))
+            return
+         end if
+         allocate(full(nx + nh - 1))
+         full = 0
+         do i = 1, nx
+            do j = 1, nh
+               full(i + j - 1) = full(i + j - 1) + x(i) * h(j)
+            end do
+         end do
+         m = "full"
+         if (present(mode)) m = to_lower(trim(mode))
+         if (m == "full") then
+            y = full
+            return
+         end if
+         if (m == "same") then
+            ny = nx
+            start = nh / 2 + 1
+            stop = start + ny - 1
+            y = full(start:stop)
+            return
+         end if
+         if (m == "valid") then
+            ny = max(nx, nh) - min(nx, nh) + 1
+            if (ny <= 0) then
+               allocate(y(0))
+            else
+               start = min(nx, nh)
+               stop = start + ny - 1
+               y = full(start:stop)
+            end if
+            return
+         end if
+         y = full
+      end function convolve_int
 
       pure real(kind=dp) function polyval_real_scalar(p, x) result(y)
          real(kind=dp), intent(in) :: p(:)
