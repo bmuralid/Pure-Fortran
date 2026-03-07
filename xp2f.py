@@ -6193,6 +6193,14 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
+                and node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "arctan2"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
                 and node.func.attr == "array"
                 and len(node.args) >= 1
             ):
@@ -7425,8 +7433,10 @@ class translator(ast.NodeVisitor):
                     return 2 if r0 <= 1 else r0
                 if node.func.attr == "unravel_index" and len(node.args) >= 2:
                     return 1
-                if node.func.attr in {"sin", "cos", "tan", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 1:
+                if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
+                if node.func.attr == "arctan2" and len(node.args) >= 2:
+                    return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
                 if node.func.attr in {"cumsum", "cumprod", "unique"} and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "repeat" and len(node.args) >= 1:
@@ -10931,6 +10941,35 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "math"
+                and node.func.attr in {"atan", "asin", "acos", "tan", "sin", "cos"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                fmap = {"atan": "atan", "asin": "asin", "acos": "acos", "tan": "tan", "sin": "sin", "cos": "cos"}
+                return f"{fmap[node.func.attr]}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "math"
+                and node.func.attr == "atan2"
+                and len(node.args) == 2
+            ):
+                y0 = self.expr(node.args[0])
+                x0 = self.expr(node.args[1])
+                ky = self._expr_kind(node.args[0])
+                kx = self._expr_kind(node.args[1])
+                if ky in {"int", "logical"}:
+                    y0 = f"real({y0}, kind=dp)"
+                if kx in {"int", "logical"}:
+                    x0 = f"real({x0}, kind=dp)"
+                return f"atan2({y0}, {x0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "platform"
                 and node.func.attr == "python_version"
                 and len(node.args) == 0
@@ -10989,6 +11028,35 @@ class translator(ast.NodeVisitor):
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
                 return f"sqrt({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                fmap = {"sin": "sin", "cos": "cos", "tan": "tan", "arctan": "atan", "arcsin": "asin", "arccos": "acos"}
+                return f"{fmap[node.func.attr]}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr == "arctan2"
+                and len(node.args) == 2
+            ):
+                y0 = self.expr(node.args[0])
+                x0 = self.expr(node.args[1])
+                ky = self._expr_kind(node.args[0])
+                kx = self._expr_kind(node.args[1])
+                if ky in {"int", "logical"}:
+                    y0 = f"real({y0}, kind=dp)"
+                if kx in {"int", "logical"}:
+                    x0 = f"real({x0}, kind=dp)"
+                return f"atan2({y0}, {x0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
@@ -16691,6 +16759,23 @@ class translator(ast.NodeVisitor):
             self.o.pop()
             self.o.w("end if")
             return
+
+        # Plotting/visualization calls are side-effect only and can be safely
+        # ignored for numeric transpilation workflows.
+        if isinstance(c.func, ast.Attribute):
+            attr = c.func.attr
+            vis_noop = {
+                "plot", "scatter", "hist", "bar", "imshow", "contour", "contourf",
+                "figure", "subplots", "subplot", "show", "savefig", "close", "clf",
+                "cla", "grid", "legend", "xlabel", "ylabel", "title", "xlim", "ylim",
+                "xticks", "yticks", "suptitle", "tight_layout", "pause",
+            }
+            if attr in vis_noop:
+                base = c.func.value
+                is_plt = isinstance(base, ast.Name) and base.id in {"plt", "pyplot"}
+                is_fig_ax = isinstance(base, ast.Name) and (base.id.startswith("ax") or base.id.startswith("fig"))
+                if is_plt or is_fig_ax:
+                    return
 
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
