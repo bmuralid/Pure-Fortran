@@ -2177,6 +2177,20 @@ def promote_immediate_scalar_constants(lines):
     )
     asn_re = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
     tok_re = re.compile(r"\b[A-Za-z_]\w*\b")
+    func_hdr_re = re.compile(r"^\s*.*\bfunction\s+([A-Za-z_]\w*)\s*\(", flags=re.IGNORECASE)
+    res_re = re.compile(r"\bresult\s*\(\s*([A-Za-z_]\w*)\s*\)", flags=re.IGNORECASE)
+
+    def _is_scope_start(code):
+        if start_re.match(code):
+            return True
+        lc = code.lower()
+        if lc.startswith("end "):
+            return False
+        # Accept prefixed/type-specified procedure headers such as:
+        # "pure elemental function ...", "real(kind=dp) function ...".
+        if re.search(r"\b(function|subroutine)\b", code, flags=re.IGNORECASE):
+            return True
+        return False
 
     # Structural depth per line (scope open/close).
     depth = 0
@@ -2186,7 +2200,7 @@ def promote_immediate_scalar_constants(lines):
         if end_re.match(code):
             depth = max(0, depth - 1)
         depth_at[i] = depth
-        if start_re.match(code):
+        if _is_scope_start(code):
             depth += 1
 
     def _rhs_is_const(rhs):
@@ -2208,6 +2222,25 @@ def promote_immediate_scalar_constants(lines):
                 continue
             return False
         return True
+
+    def _enclosing_function_result_name(idx, depth_here):
+        """Return enclosing function result variable name (lowercase) or None."""
+        for h in range(idx - 1, -1, -1):
+            if depth_at[h] >= depth_here:
+                continue
+            code_h = out[h].split("!", 1)[0].strip()
+            if not code_h:
+                continue
+            if code_h.lower().startswith("end "):
+                continue
+            mh = func_hdr_re.match(code_h)
+            if not mh:
+                continue
+            fname = mh.group(1)
+            mr = res_re.search(code_h)
+            rname = mr.group(1) if mr else fname
+            return rname.lower()
+        return None
 
     i = 0
     while i < n:
@@ -2240,6 +2273,12 @@ def promote_immediate_scalar_constants(lines):
             continue
         rhs = masn.group(2).strip()
         if not _rhs_is_const(rhs):
+            i += 1
+            continue
+
+        # Never promote a function result variable to PARAMETER.
+        encl_res = _enclosing_function_result_name(i, d)
+        if encl_res is not None and nm.lower() == encl_res:
             i += 1
             continue
 
@@ -11771,6 +11810,10 @@ class translator(ast.NodeVisitor):
                     if spec == "alloc_real":
                         self._mark_alloc_real(t.id, rank=max(1, rr_v))
                     elif spec == "alloc_int":
+                        self.reals.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_real_rank.pop(t.id, None)
                         self._mark_alloc_int(t.id, rank=max(1, rr_v))
                     elif spec == "alloc_log":
                         self._mark_alloc_log(t.id, rank=max(1, rr_v))
@@ -11780,6 +11823,10 @@ class translator(ast.NodeVisitor):
                         else:
                             self._mark_real(t.id)
                     elif spec == "int":
+                        self.reals.discard(t.id)
+                        self.complexes.discard(t.id)
+                        self.alloc_reals.discard(t.id)
+                        self.alloc_real_rank.pop(t.id, None)
                         if rr_v > 0:
                             self._mark_alloc_int(t.id, rank=rr_v)
                         else:
@@ -19229,6 +19276,51 @@ def generate_flat(
             return "logical"
         if nm in tr_local.chars or nm in tr_local.alloc_chars:
             return "char"
+        # Common text-argument naming in scientific scripts.
+        nm_l = nm.lower()
+        if nm_l in {"title", "label", "header", "filename", "file_name"}:
+            return "char"
+        # Index/shape usage strongly implies integer.
+        for st in fn.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Subscript):
+                    for sn in ast.walk(n.slice):
+                        if isinstance(sn, ast.Name) and sn.id == nm:
+                            return "int"
+                if isinstance(n, ast.Slice):
+                    for part in (n.lower, n.upper, n.step):
+                        if isinstance(part, ast.Name) and part.id == nm:
+                            return "int"
+                if isinstance(n, ast.Call):
+                    # range(n), range(a, n, s), ...
+                    if isinstance(n.func, ast.Name) and n.func.id == "range":
+                        if any(isinstance(a, ast.Name) and a.id == nm for a in n.args):
+                            return "int"
+                    # numpy shape-bearing constructors.
+                    if (
+                        isinstance(n.func, ast.Attribute)
+                        and isinstance(n.func.value, ast.Name)
+                        and n.func.value.id == "np"
+                        and n.func.attr in {"zeros", "ones", "empty", "full"}
+                        and n.args
+                    ):
+                        a0 = n.args[0]
+                        if isinstance(a0, ast.Name) and a0.id == nm:
+                            return "int"
+                        if isinstance(a0, ast.Tuple) and any(isinstance(e, ast.Name) and e.id == nm for e in a0.elts):
+                            return "int"
+                    # np.linspace(..., num=nm) / np.linspace(a,b,nm)
+                    if (
+                        isinstance(n.func, ast.Attribute)
+                        and isinstance(n.func.value, ast.Name)
+                        and n.func.value.id == "np"
+                        and n.func.attr == "linspace"
+                    ):
+                        if len(n.args) >= 3 and isinstance(n.args[2], ast.Name) and n.args[2].id == nm:
+                            return "int"
+                        for kw in n.keywords:
+                            if kw.arg == "num" and isinstance(kw.value, ast.Name) and kw.value.id == nm:
+                                return "int"
         # Usage-based fallback: infer from arithmetic partners in this function.
         for st in fn.body:
             for n in ast.walk(st):
@@ -19415,10 +19507,17 @@ def generate_flat(
             max(base_ranks[i], (hint_ranks[i] if i < len(hint_ranks) else 0))
             for i in range(len(base_ranks))
         ]
-        local_func_arg_kinds[fn.name] = [
-            (hint_kinds[i] if i < len(hint_kinds) else None) or _infer_arg_kind_in_fn(fn, local_func_arg_names[fn.name][i])
-            for i in range(len(base_ranks))
-        ]
+        merged_kinds = []
+        for i in range(len(base_ranks)):
+            hk = hint_kinds[i] if i < len(hint_kinds) else None
+            bk = _infer_arg_kind_in_fn(fn, local_func_arg_names[fn.name][i])
+            # Index/shape usage must remain integer even if call-site kind
+            # heuristics drifted to real from weak evidence.
+            if bk == "int" and hk in {None, "real"}:
+                merged_kinds.append("int")
+            else:
+                merged_kinds.append(hk or bk)
+        local_func_arg_kinds[fn.name] = merged_kinds
     # Propagate argument-rank requirements across local wrapper calls, e.g.:
     #   def outer(x): return inner(x, ...)
     # so inner's dummy rank can be learned from outer's call-site rank.
