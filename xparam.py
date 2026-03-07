@@ -564,13 +564,15 @@ def analyze_unit(
                     exclusions[name] = "pointer/target declaration"
                     local_ok[name] = False
                 elif "allocatable" in attrs:
-                    # Optional promotion path, gated by CLI flag.
-                    if not allow_alloc_promotion:
-                        exclusions[name] = "allocatable declaration (enable with --fix-alloc)"
-                        local_ok[name] = False
-                    elif not (has_shape and shape_text == "(:)"):
-                        exclusions[name] = "allocatable declaration is not rank-1 deferred-shape"
-                        local_ok[name] = False
+                    # Allow safe allocatable promotions by default:
+                    # - scalar allocatable
+                    # - rank-1 deferred-shape allocatable (:)
+                    if has_shape:
+                        if shape_text == "(:)":
+                            local_ok.setdefault(name, True)
+                        else:
+                            exclusions[name] = "allocatable declaration is not rank-1 deferred-shape"
+                            local_ok[name] = False
                     else:
                         local_ok.setdefault(name, True)
                 elif has_shape and (":" in shape_text or "*" in shape_text):
@@ -858,12 +860,6 @@ def apply_fixes_for_file(
         if not target_chunk:
             skipped.append(FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "ambiguous declaration entity"))
             continue
-        if len(entities) != 1 and not aggressive:
-            skipped.append(
-                FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "declaration has multiple entities; split manually first")
-            )
-            continue
-
         expr = c.first_write_expr.strip()
         if not expr:
             skipped.append(FixSkip(c.path, c.unit_kind, c.unit_name, c.name, "missing first-write expression"))
@@ -888,6 +884,12 @@ def apply_fixes_for_file(
 
         indent = re.match(r"^\s*", decl_raw).group(0) if decl_raw else ""
         left_clean = remove_nonparameter_attrs(left.strip())
+        left_clean = re.sub(
+            r"character\s*\(\s*len\s*=\s*:\s*\)",
+            "character(len=*)",
+            left_clean,
+            flags=re.IGNORECASE,
+        )
         left_new = add_parameter_attr(left_clean)
         target_new = re.sub(r"=\s*.*$", "", target_chunk).strip()
         target_new = re.sub(r"=>\s*.*$", "", target_new).strip()
@@ -987,6 +989,12 @@ def build_param_decl_suggestion(lines: List[str], c: Candidate) -> Optional[str]
 
     indent = re.match(r"^\s*", decl_raw).group(0) if decl_raw else ""
     left_clean = remove_nonparameter_attrs(left.strip())
+    left_clean = re.sub(
+        r"character\s*\(\s*len\s*=\s*:\s*\)",
+        "character(len=*)",
+        left_clean,
+        flags=re.IGNORECASE,
+    )
     left_new = add_parameter_attr(left_clean)
     target_new = re.sub(r"=\s*.*$", "", target_chunk).strip()
     target_new = re.sub(r"=>\s*.*$", "", target_new).strip()
