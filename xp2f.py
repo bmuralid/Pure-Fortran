@@ -3100,6 +3100,7 @@ def detect_needed_helpers(tree):
             ):
                 needed.add("diag")
             if isinstance(node.func, ast.Name) and node.func.id == "print":
+                needed.add("print_matrix")
                 if len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "primes":
                     needed.add("print_int_list")
             if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
@@ -15090,7 +15091,7 @@ class translator(ast.NodeVisitor):
                 self.o.w("end if")
                 self.o.pop()
                 self.o.w("end do")
-                self.o.w(f"{name}(i_am) = best_j")
+                self.o.w(f"{name}(i_am) = best_j - 1")
                 self.o.pop()
                 self.o.w("end do")
                 self.o.pop()
@@ -16069,7 +16070,20 @@ class translator(ast.NodeVisitor):
         if len(call.args) == 0:
             self.o.w("print *")
             return
+        if len(call.args) == 1:
+            a0 = call.args[0]
+            if self._rank_expr(a0) == 2 and self._expr_kind(a0) == "real":
+                self.o.w(f"call print_matrix({self.expr(a0)})")
+                return
         if len(call.args) != 1:
+            if (
+                len(call.args) == 2
+                and is_const_str(call.args[0])
+                and self._rank_expr(call.args[1]) == 2
+                and self._expr_kind(call.args[1]) == "real"
+            ):
+                self.o.w(f"call print_matrix({fstr(call.args[0].value)}, {self.expr(call.args[1])})")
+                return
             # Conservative multi-argument handling.
             # If list outputs are mixed with other args, emit in parts.
             has_list = any(isinstance(a, ast.Name) and a.id in self.list_counts for a in call.args)
