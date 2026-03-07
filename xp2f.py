@@ -19052,6 +19052,20 @@ def generate_flat(
 
     # Generic overloads for 1-arg value-returning functions called with mixed
     # kinds/ranks (e.g. twice(3), twice(3.1), twice([10,20])).
+    def _fn_requires_rank1_arg(fn_node, arg_name):
+        for st in ast.walk(fn_node):
+            if (
+                isinstance(st, ast.Assign)
+                and len(st.targets) == 1
+                and isinstance(st.targets[0], (ast.Tuple, ast.List))
+                and isinstance(st.value, ast.Name)
+                and st.value.id == arg_name
+            ):
+                return True
+            if isinstance(st, ast.Subscript) and isinstance(st.value, ast.Name) and st.value.id == arg_name:
+                return True
+        return False
+
     for fn in (local_funcs or []):
         if fn.name in local_overload_specs:
             continue
@@ -19063,12 +19077,20 @@ def generate_flat(
             continue
         if len(fn.args.args) != 1:
             continue
+        arg0 = fn.args.args[0].arg
+        req_rank = 0
+        if fn.name in base_func_arg_ranks and base_func_arg_ranks[fn.name]:
+            req_rank = int(base_func_arg_ranks[fn.name][0])
+        if _fn_requires_rank1_arg(fn, arg0):
+            req_rank = max(req_rank, 1)
         pairs = set(call_kind_rank_pairs.get(fn.name, [set()])[0])
         triads = set(call_kind_rank_islist.get(fn.name, [set()])[0])
         pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char"} and r in {0, 1}}
+        if req_rank > 0:
+            pairs = {(k, r) for (k, r) in pairs if int(r) == req_rank}
+            triads = {(k, r, is_list) for (k, r, is_list) in triads if int(r) == req_rank}
         if len(pairs) <= 1:
             continue
-        arg0 = fn.args.args[0].arg
         specs = []
         dmap = {}
         seen = set()
