@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 import re
 import argparse
+import glob
 import shlex
 import subprocess
 import time
@@ -664,6 +665,15 @@ def _strict_fix_overloads(src_text):
 
     class _CallRewriter(ast.NodeTransformer):
         def visit_Call(self, node):
+            is_print_like = (
+                (isinstance(node.func, ast.Name) and node.func.id == "print")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "pprint"
+                    and node.func.attr == "pprint"
+                )
+            )
             self.generic_visit(node)
             if isinstance(node.func, ast.Name) and node.func.id in rename_by_fn:
                 fn = node.func.id
@@ -2783,19 +2793,36 @@ def detect_needed_helpers(tree):
         def visit_Assign(self, node):
             if (
                 isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and isinstance(node.value.func.value, ast.Attribute)
-                and isinstance(node.value.func.value.value, ast.Name)
-                and node.value.func.value.value.id == "np"
-                and node.value.func.value.attr == "random"
-                and node.value.func.attr == "default_rng"
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
+                and (
+                    (
+                        isinstance(node.value.func, ast.Attribute)
+                        and isinstance(node.value.func.value, ast.Attribute)
+                        and isinstance(node.value.func.value.value, ast.Name)
+                        and node.value.func.value.value.id == "np"
+                        and node.value.func.value.attr == "random"
+                        and node.value.func.attr == "default_rng"
+                    )
+                    or (
+                        isinstance(node.value.func, ast.Name)
+                        and node.value.func.id == "default_rng"
+                    )
+                )
             ):
                 self.rng_names.add(node.targets[0].id)
             self.generic_visit(node)
 
         def visit_Call(self, node):
+            is_print_like = (
+                (isinstance(node.func, ast.Name) and node.func.id == "print")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "pprint"
+                    and node.func.attr == "pprint"
+                )
+            )
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -2868,6 +2895,11 @@ def detect_needed_helpers(tree):
                 and node.func.value.value.id == "np"
                 and node.func.value.attr == "random"
                 and node.func.attr == "default_rng"
+            ):
+                needed.add("seed_rng")
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "default_rng"
             ):
                 needed.add("seed_rng")
             if (
@@ -3165,7 +3197,7 @@ def detect_needed_helpers(tree):
                 and node.args[0].value == "ii->"
             ):
                 needed.add("diag")
-            if isinstance(node.func, ast.Name) and node.func.id == "print":
+            if is_print_like:
                 needed.add("print_matrix")
                 if len(node.args) == 1 and isinstance(node.args[0], ast.Name) and node.args[0].id == "primes":
                     needed.add("print_int_list")
@@ -13611,12 +13643,20 @@ class translator(ast.NodeVisitor):
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
-            and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Attribute)
-            and isinstance(v.func.value.value, ast.Name)
-            and v.func.value.value.id == "np"
-            and v.func.value.attr == "random"
-            and v.func.attr == "default_rng"
+            and (
+                (
+                    isinstance(v.func, ast.Attribute)
+                    and isinstance(v.func.value, ast.Attribute)
+                    and isinstance(v.func.value.value, ast.Name)
+                    and v.func.value.value.id == "np"
+                    and v.func.value.attr == "random"
+                    and v.func.attr == "default_rng"
+                )
+                or (
+                    isinstance(v.func, ast.Name)
+                    and v.func.id == "default_rng"
+                )
+            )
         ):
             seed_node = None
             if v.args:
@@ -16198,6 +16238,16 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("print not allowed in compute procedure")
             self._emit_print_call(c)
             return
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Name)
+            and c.func.value.id == "pprint"
+            and c.func.attr == "pprint"
+        ):
+            if self.context == "compute":
+                raise NotImplementedError("print not allowed in compute procedure")
+            self._emit_print_call(c)
+            return
 
         if isinstance(c.func, ast.Name) and c.func.id in self.local_void_funcs:
             args_nodes = self._build_local_call_actual_nodes(c.func.id, c)
@@ -16317,7 +16367,8 @@ class translator(ast.NodeVisitor):
             self.o.w("end if")
             return
 
-        raise NotImplementedError("unsupported expression call")
+        call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
+        raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
     def _emit_print_call(self, call):
         if len(call.args) == 0:
@@ -20251,6 +20302,17 @@ def main():
         help='compiler command, e.g. "gfortran -O2 -Wall"',
     )
     args = ap.parse_args()
+    if any(ch in args.input_py for ch in "*?[]"):
+        matches = sorted(glob.glob(args.input_py, recursive=True))
+        matches = [m for m in matches if Path(m).is_file()]
+        if not matches:
+            print(f"Input: FAIL (glob matched no files: {args.input_py})")
+            return 1
+        if len(matches) > 1:
+            print(f"Input: FAIL (glob matched {len(matches)} files; xp2f.py expects one file)")
+            print("Hint: use xp2f_batch.py for multi-file globs.")
+            return 1
+        args.input_py = matches[0]
     if args.tee_both:
         args.tee = True
     if args.time_both:
