@@ -4755,6 +4755,7 @@ class translator(ast.NodeVisitor):
         self.reserved_names = {"dp"}
         self.name_aliases = {}
         self.fortran_name_owner = {}
+        self.synthetic_alias_names = set()
         self.rng_vars = set()
         self.python_list_vars = set()
         self.list_aliases = {}
@@ -4804,6 +4805,12 @@ class translator(ast.NodeVisitor):
     def _aliased_name(self, name):
         if name in self.name_aliases:
             return self.name_aliases[name]
+        if (
+            name in self.synthetic_alias_names
+            and name.lower() in self.fortran_name_owner
+            and self.fortran_name_owner[name.lower()] != name
+        ):
+            return name
         if name in self.reserved_names:
             base = f"{name}_v"
         else:
@@ -7741,6 +7748,50 @@ class translator(ast.NodeVisitor):
             b = b0
             lr = max(self._rank_expr(node.left), self._decl_rank_expr(node.left))
             rr = max(self._rank_expr(node.right), self._decl_rank_expr(node.right))
+            def _broadcast_none_full_view(expr_node, other_node):
+                # Broadcast views like a[:, :, None] / a[None, :, None] by
+                # expanding singleton inserted axes to match the peer shape.
+                if not isinstance(expr_node, ast.Subscript):
+                    return None
+                sl = expr_node.slice
+                if not isinstance(sl, ast.Tuple):
+                    return None
+                final_rank = len(sl.elts)
+                if final_rank <= 0:
+                    return None
+                def _is_full_slice(e):
+                    return (
+                        isinstance(e, ast.Slice)
+                        and e.lower is None
+                        and e.upper is None
+                        and e.step is None
+                    )
+                if not all(is_none(e) or _is_full_slice(e) for e in sl.elts):
+                    return None
+                none_pos = [i + 1 for i, e in enumerate(sl.elts) if is_none(e)]
+                if not none_pos:
+                    return None
+                try:
+                    base_expr = self.expr(expr_node.value)
+                    other_expr = self.expr(other_node)
+                except Exception:
+                    return None
+                base_rank = max(self._rank_expr(expr_node.value), self._decl_rank_expr(expr_node.value))
+                if int(base_rank) != int(final_rank - len(none_pos)):
+                    return None
+                out = base_expr
+                for d in none_pos:
+                    out = f"spread({out}, dim={d}, ncopies=size({other_expr},{d}))"
+                return out
+
+            if lr == rr and lr >= 2:
+                a_none = _broadcast_none_full_view(node.left, node.right)
+                if a_none is not None:
+                    a = a_none
+                b_none = _broadcast_none_full_view(node.right, node.left)
+                if b_none is not None:
+                    b = b_none
+
             def _match_none_axis_2d_view(expr_node):
                 if not isinstance(expr_node, ast.Subscript):
                     return None
@@ -8937,6 +8988,7 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
+                a0_kind = self._expr_kind(node.args[0])
                 axis_node = None
                 keepdims = False
                 for kw in node.keywords:
@@ -8945,9 +8997,14 @@ class translator(ast.NodeVisitor):
                     elif kw.arg == "keepdims":
                         keepdims = bool(isinstance(kw.value, ast.Constant) and kw.value.value is True)
                 if axis_node is None:
+                    if a0_kind == "logical":
+                        return f"count({a0})"
                     return f"sum({a0})"
                 dim_expr = f"({self.expr(axis_node)} + 1)"
-                reduced = f"sum({a0}, dim={dim_expr})"
+                if a0_kind == "logical":
+                    reduced = f"count({a0}, dim={dim_expr})"
+                else:
+                    reduced = f"sum({a0}, dim={dim_expr})"
                 if keepdims:
                     return f"spread({reduced}, dim={dim_expr}, ncopies=1)"
                 return reduced
@@ -10768,6 +10825,7 @@ class translator(ast.NodeVisitor):
                     and node.targets[0].id in self.reserved_names
                 ):
                     alias = self._aliased_name(node.targets[0].id)
+                    self.synthetic_alias_names.add(alias)
                     fake = ast.Assign(
                         targets=[ast.Name(id=alias, ctx=node.targets[0].ctx)],
                         value=node.value,
@@ -17292,6 +17350,19 @@ def _emit_local_function(
                         return True
         return False
 
+    def _arg_arith_context(nm):
+        for st in fn.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod)):
+                    if _name_used(n.left, nm) or _name_used(n.right, nm):
+                        return True
+                if isinstance(n, ast.UnaryOp) and _name_used(n.operand, nm):
+                    return True
+                if isinstance(n, ast.Compare):
+                    if _name_used(n.left, nm) or any(_name_used(c, nm) for c in n.comparators):
+                        return True
+        return False
+
     def _arg_array_rank(nm):
         rr = 0
         for st in fn.body:
@@ -17386,15 +17457,20 @@ def _emit_local_function(
             # Ignore benign normalization rebinds like:
             #   a = np.asarray(a, ...)
             #   a = a.reshape(...)
+            def _is_np_array_like_of_name(node):
+                return (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "np"
+                    and node.func.attr in {"asarray", "array"}
+                    and len(node.args) >= 1
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == nm
+                )
+
             if (
-                isinstance(rhs, ast.Call)
-                and isinstance(rhs.func, ast.Attribute)
-                and isinstance(rhs.func.value, ast.Name)
-                and rhs.func.value.id == "np"
-                and rhs.func.attr in {"asarray", "array"}
-                and len(rhs.args) >= 1
-                and isinstance(rhs.args[0], ast.Name)
-                and rhs.args[0].id == nm
+                _is_np_array_like_of_name(rhs)
             ):
                 return True
             if (
@@ -17402,7 +17478,15 @@ def _emit_local_function(
                 and isinstance(rhs.func, ast.Attribute)
                 and isinstance(rhs.func.value, ast.Name)
                 and rhs.func.value.id == nm
-                and rhs.func.attr in {"reshape", "copy"}
+                and rhs.func.attr in {"reshape", "copy", "ravel", "flatten"}
+            ):
+                return True
+            if (
+                isinstance(rhs, ast.Call)
+                and isinstance(rhs.func, ast.Attribute)
+                and rhs.func.attr in {"ravel", "flatten"}
+                and len(rhs.args) == 0
+                and _is_np_array_like_of_name(rhs.func.value)
             ):
                 return True
             if (
@@ -17467,6 +17551,8 @@ def _emit_local_function(
     arg_meta = {}
     optional_none_aliases = []
     optional_none_copyback = []
+    ret_spec_hint = local_return_specs.get(fn.name) if (local_return_specs is not None) else None
+    prefer_real_unknown_args = (ret_spec_hint in {"real", "alloc_real"}) and (force_arg_kinds is None)
     for arg in args:
         if arg in callback_specs:
             cb = callback_specs[arg]
@@ -17555,7 +17641,10 @@ def _emit_local_function(
             elif ann_is_float or hint_kind == "real" or arg in tr.reals or _arg_real_context(arg):
                 arg_kind = "real(kind=dp)"
             else:
-                arg_kind = "integer"
+                if prefer_real_unknown_args and _arg_arith_context(arg):
+                    arg_kind = "real(kind=dp)"
+                else:
+                    arg_kind = "integer"
             arg_decl = f"{arg_kind}, intent(in) :: {arg}"
             decl_kind = arg_kind
         elif arg in tr.alloc_ints:
@@ -17623,7 +17712,10 @@ def _emit_local_function(
             ):
                 arg_kind = "real(kind=dp)"
             else:
-                arg_kind = "integer"
+                if prefer_real_unknown_args and _arg_arith_context(arg):
+                    arg_kind = "real(kind=dp)"
+                else:
+                    arg_kind = "integer"
             if arr_rank > 0:
                 dims = ",".join(":" for _ in range(arr_rank))
                 arg_decl = f"{arg_kind}, intent({intent_txt}) :: {arg}({dims})"
@@ -18560,6 +18652,18 @@ def generate_flat(
     if local_funcs:
         tr_seed = translator(emit(), params=params, context="flat", list_counts=list_counts)
         tr_seed.prescan(tree.body)
+        def _promote_kind_hint(cur, newk):
+            if newk is None:
+                return cur
+            if cur is None:
+                return newk
+            if cur == newk:
+                return cur
+            if "real" in {cur, newk} and "logical" not in {cur, newk}:
+                return "real"
+            if "complex" in {cur, newk}:
+                return "complex"
+            return cur
         def _name_possible_specs(_tr, _nm):
             specs = set()
             t0 = _tr.var_type_initial_spec.get(_nm, None)
@@ -18617,6 +18721,10 @@ def generate_flat(
                                 if pk in {"int", "real", "logical", "char"}:
                                     is_list = bool(tr_seed._is_python_list_expr(a))
                                     krl[i].add((pk, pr, is_list))
+                                    rr[i] = max(rr[i], int(pr))
+                                    rrs[i].add(int(pr))
+                                    rks[i].add(pk)
+                                    rk[i] = _promote_kind_hint(rk[i], pk)
                 if n.keywords:
                     name_to_idx = {nm: i for i, nm in enumerate(local_arg_names_map.get(callee, []))}
                     for kw in n.keywords:
@@ -18645,6 +18753,10 @@ def generate_flat(
                                     if pk in {"int", "real", "logical", "char"}:
                                         is_list = bool(tr_seed._is_python_list_expr(kw.value))
                                         krl[i].add((pk, pr, is_list))
+                                        rr[i] = max(rr[i], int(pr))
+                                        rrs[i].add(int(pr))
+                                        rks[i].add(pk)
+                                        rk[i] = _promote_kind_hint(rk[i], pk)
 
     local_return_specs, local_return_ranks, tuple_return_out_kinds, tuple_return_out_ranks = _local_return_maps(
         local_funcs,
