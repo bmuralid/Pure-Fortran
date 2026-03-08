@@ -5210,6 +5210,7 @@ class translator(ast.NodeVisitor):
         self.none_vars = set()
         self.lambda_vars = {}
         self.tuple_loop_literals = {}
+        self.callable_aliases = {}
 
     def _resolve_list_alias(self, name):
         cur = name
@@ -5276,6 +5277,16 @@ class translator(ast.NodeVisitor):
         self.name_aliases[name] = alias
         self.fortran_name_owner[alias.lower()] = name
         return alias
+
+    def _is_local_callable_symbol(self, name):
+        """True when `name` refers to a locally transpilable procedure symbol."""
+        return (
+            (name in self.local_return_specs)
+            or (name in self.local_void_funcs)
+            or (name in self.tuple_return_funcs)
+            or (name in self.local_elemental_funcs)
+            or (name in self.local_generic_overloads)
+        )
 
     def _coerce_local_actual_kind(self, callee, idx, arg_node, arg_expr):
         if callee in self.local_generic_overloads:
@@ -8243,6 +8254,8 @@ class translator(ast.NodeVisitor):
                 return ".true."
             if node.id == "False":
                 return ".false."
+            if node.id in self.callable_aliases:
+                return self.callable_aliases[node.id]
             return self._aliased_name(self._resolve_list_alias(node.id))
 
         if isinstance(node, ast.Constant):
@@ -11866,6 +11879,25 @@ class translator(ast.NodeVisitor):
                 self._mark_alloc_char("sys_argv", rank=1)
                 return "sys_argv"
             if (
+                node.attr in {"epsilon", "eps"}
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "sys"
+                and node.value.attr == "float_info"
+            ):
+                # Python: sys.float_info.epsilon
+                return "epsilon(1.0_dp)"
+            if (
+                node.attr == "eps"
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id in {"np", "numpy"}
+                and node.value.func.attr == "finfo"
+            ):
+                # NumPy: np.finfo(float).eps
+                return "epsilon(1.0_dp)"
+            if (
                 isinstance(node.value, ast.Name)
                 and node.value.id in self.dict_typed_vars
             ):
@@ -13871,6 +13903,13 @@ class translator(ast.NodeVisitor):
                 self.lambda_vars[t.id] = v
                 return
             self.lambda_vars.pop(t.id, None)
+            if isinstance(v, ast.Name) and self._is_local_callable_symbol(v.id):
+                # Python allows rebinding callables (f = f_01; call g(f)).
+                # For Fortran, carry a simple alias and pass the procedure
+                # symbol directly at call sites.
+                self.callable_aliases[t.id] = self._aliased_name(v.id)
+                return
+            self.callable_aliases.pop(t.id, None)
         if isinstance(t, ast.Name):
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
             if rk is not None and t.id in set(self.tuple_return_out_names or []):
@@ -21390,6 +21429,18 @@ def generate_flat(
     passed_as_actual = set()
     local_fn_names = {f.name for f in (local_funcs or []) if isinstance(f, ast.FunctionDef)}
     _scan_for_actuals = list(tree.body) + list(local_funcs or [])
+    alias_to_local_fn = {}
+    # Track simple callable aliases like `f = f_01` so we can avoid marking
+    # aliased callbacks as ELEMENTAL (non-intrinsic elemental procedures cannot
+    # be passed as actual procedure arguments).
+    for _st in _scan_for_actuals:
+        for _n in ast.walk(_st):
+            if not isinstance(_n, ast.Assign):
+                continue
+            if len(_n.targets) != 1 or (not isinstance(_n.targets[0], ast.Name)):
+                continue
+            if isinstance(_n.value, ast.Name) and _n.value.id in local_fn_names:
+                alias_to_local_fn[_n.targets[0].id] = _n.value.id
     for _st in _scan_for_actuals:
         for _n in ast.walk(_st):
             if not isinstance(_n, ast.Call):
@@ -21397,11 +21448,15 @@ def generate_flat(
             for _a in getattr(_n, "args", []):
                 if isinstance(_a, ast.Name) and _a.id in local_fn_names:
                     passed_as_actual.add(_a.id)
+                elif isinstance(_a, ast.Name) and _a.id in alias_to_local_fn:
+                    passed_as_actual.add(alias_to_local_fn[_a.id])
             for _kw in getattr(_n, "keywords", []):
                 if _kw.arg is None:
                     continue
                 if isinstance(_kw.value, ast.Name) and _kw.value.id in local_fn_names:
                     passed_as_actual.add(_kw.value.id)
+                elif isinstance(_kw.value, ast.Name) and _kw.value.id in alias_to_local_fn:
+                    passed_as_actual.add(alias_to_local_fn[_kw.value.id])
     for fn in (local_funcs or []):
         if fn.name in tuple_return_funcs:
             continue
