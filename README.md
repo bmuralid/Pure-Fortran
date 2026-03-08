@@ -31,6 +31,7 @@ Main programs:
 - `ximplicit_none.py` - suggest/apply `implicit none` in program units.
 - `xuse_only.py` - suggest/apply `use ..., only: ...` imports from broad `use` statements.
 - `xunset.py` - advisory checker for likely use-before-set variables.
+- `xautofix.py` - compile/runtime-driven auto-fixer for common Fortran issues (including allocatable deallocate guards and formatted I/O mismatches).
 - `xunused.py` - advisory checker for likely unused set variables/constants, with optional conservative fix mode.
 - `xparam.py` - advisory checker for variables that can be made named constants (`parameter`), with optional fix modes.
 - `xrepeated_if.py` - advisory checker/fixer for consecutive repeated IF conditions.
@@ -328,6 +329,28 @@ Notes:
 - Tracks partial array initialization with element-level diagnostics (rank 1-3 when extents are inferable).
 - Checks allocatable-use state (`allocate`/`deallocate`) and warns on uses while unallocated.
 - Treats inquiry intrinsics (for example `size`, `lbound`, `ubound`, `shape`, `kind`, `rank`, `allocated`) as non-value reads.
+
+### 9a) `xautofix.py`
+
+Compile/runtime-driven first-pass auto-fixer for common Fortran errors.
+
+Typical commands:
+
+```bash
+python xautofix.py foo.f90
+python xautofix.py foo.f90 --in-place --diff
+python xautofix.py foo.f90 --runtime
+python xautofix.py foo.f90 --runtime --run --tee-both
+```
+
+Notes:
+
+- Supports compile-time and runtime fix loops (bounded by `--max-iter`).
+- Applies static allocatable safety fixes before build loops:
+  - guards unsafe `deallocate(x)` as `if (allocated(x)) deallocate(x)`.
+  - inserts guarded `deallocate` before `allocate(x(...))` in loop contexts.
+- Includes formatted-I/O mismatch fixes from static analysis and runtime diagnostics.
+- `--runtime` defaults to in-place editing unless `--out` is explicitly provided.
 
 ### 10) `xunused.py`
 
