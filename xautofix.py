@@ -21,6 +21,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional, Tuple
+
+import xformat_mismatch as xfmm
 
 
 LOC_RE = re.compile(r"^(.*?):(\d+):(\d+):")
@@ -528,6 +531,14 @@ def _fmt_desc_for_kind(kind: str) -> str:
     return "g0.6"
 
 
+def _normalize_format_comma_spacing(fmt: str) -> str:
+    # Keep formatting simple and consistent: comma followed by one space.
+    s = re.sub(r"\s*,\s*", ", ", fmt)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    return s.strip()
+
+
 def _fix_runtime_rebuild_print_format(path: Path, line_no_1: int) -> bool:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if line_no_1 < 1 or line_no_1 > len(lines):
@@ -550,11 +561,128 @@ def _fix_runtime_rebuild_print_format(path: Path, line_no_1: int) -> bool:
         kind, cnt = kc
         desc = _fmt_desc_for_kind(kind)
         if cnt <= 1:
-            parts.append(f"({desc},1x)")
+            parts.append(f"{desc},1x")
         else:
             parts.append(f"{cnt}({desc},1x)")
-    new_fmt = "(" + ", ".join(parts) + ")"
-    lines[line_no_1 - 1] = f'{m.group(1)}print "{new_fmt}", {args_s}'
+    new_fmt = _normalize_format_comma_spacing("(" + ", ".join(parts) + ")")
+    new_line = f'{m.group(1)}print "{new_fmt}", {args_s}'
+    if new_line == old:
+        return False
+    lines[line_no_1 - 1] = new_line
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _static_format_mismatches(path: Path) -> list[Tuple[int, str]]:
+    infos, _ = xfmm.fscan.load_source_files([path])
+    if not infos:
+        return []
+    finfo = infos[0]
+    findings = []
+    for u in xfmm.collect_units(finfo):
+        findings.extend(xfmm.analyze_unit(u))
+    findings = [f for f in findings if f.certainty == "definite"]
+    findings.sort(key=lambda f: (f.line, f.detail))
+    out: list[Tuple[int, str]] = []
+    seen: set[Tuple[int, str]] = set()
+    for f in findings:
+        k = (f.line, f.detail)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out
+
+
+def _fix_static_format_mismatch_with_xfmm(path: Path, line_no_1: int) -> bool:
+    infos, _ = xfmm.fscan.load_source_files([path])
+    if not infos:
+        return False
+    finfo = infos[0]
+    units = xfmm.collect_units(finfo)
+    target_unit = None
+    target_stmt = None
+    for u in units:
+        for ln, stmt in u.body:
+            if ln == line_no_1:
+                target_unit = u
+                target_stmt = stmt
+                break
+        if target_stmt is not None:
+            break
+    if target_unit is None or target_stmt is None:
+        return False
+    code = xfmm.strip_comment(target_stmt).strip()
+    parsed = xfmm.parse_print_stmt(code)
+    is_print = True
+    if parsed is None:
+        parsed = xfmm.parse_write_stmt(code)
+        is_print = False
+    if parsed is None:
+        return False
+    fmt_expr, iolist = parsed
+    named_fmts = xfmm.parse_named_format_constants(target_unit)
+    fmt_text = xfmm.normalize_format_expr(fmt_expr, named_fmts)
+    if fmt_text is None:
+        return False
+    types = xfmm.build_local_types(target_unit)
+    sizes = xfmm.build_local_sizes(target_unit)
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False
+    # Prefer declaration-driven arg grouping for simple variable lists.
+    arg_names = _split_top_level_commas(iolist)
+    simple = True
+    fmt_parts: list[str] = []
+    for a in arg_names:
+        if not re.fullmatch(r"[A-Za-z_]\w*", a.strip()):
+            simple = False
+            break
+        kc = _var_kind_and_count(lines, line_no_1, a.strip())
+        if kc is None:
+            simple = False
+            break
+        kind, cnt = kc
+        desc = _fmt_desc_for_kind(kind)
+        if cnt <= 1:
+            fmt_parts.append(f"{desc},1x")
+        else:
+            fmt_parts.append(f"{cnt}({desc},1x)")
+    if not simple:
+        arg_kinds = xfmm.iolist_arg_kinds(iolist, types, sizes)
+        if not arg_kinds:
+            return False
+        if any(k == "unknown" for k in arg_kinds):
+            return False
+        if len(arg_kinds) > 64:
+            return False
+        fmt_parts = []
+        i = 0
+        while i < len(arg_kinds):
+            k = arg_kinds[i]
+            j = i + 1
+            while j < len(arg_kinds) and arg_kinds[j] == k:
+                j += 1
+            cnt = j - i
+            desc = _fmt_desc_for_kind(k)
+            if cnt == 1:
+                fmt_parts.append(f"{desc},1x")
+            else:
+                fmt_parts.append(f"{cnt}({desc},1x)")
+            i = j
+    new_fmt = _normalize_format_comma_spacing("(" + ", ".join(fmt_parts) + ")")
+
+    old = lines[line_no_1 - 1]
+    if is_print:
+        m = re.match(r'^(\s*print\s*)"([^"]*)"(.*)$', old, re.IGNORECASE)
+    else:
+        m = re.match(r'^(\s*write\s*\(\s*\*\s*,\s*)"([^"]*)"(.*)$', old, re.IGNORECASE)
+    if not m:
+        return False
+    new_line = f'{m.group(1)}"{new_fmt}"{m.group(3)}'
+    if new_line == old:
+        return False
+    lines[line_no_1 - 1] = new_line
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return True
 
@@ -580,6 +708,33 @@ def _normalize_format_spacing(path: Path) -> bool:
         new_fmt = re.sub(rf"(?<![\w\)])(\d+)\s*({tok_re})\b", r"\1(\2,1x)", new_fmt, flags=re.IGNORECASE)
         # bare token -> (token,1x)
         new_fmt = re.sub(rf"(?<![\w\)])\b({tok_re})\b", r"(\1,1x)", new_fmt, flags=re.IGNORECASE)
+        if new_fmt != fmt:
+            lines[i] = f'{prefix}"{new_fmt}"{suffix}'
+            changed_any = True
+    if changed_any:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return changed_any
+
+
+def _normalize_redundant_format_parens(path: Path) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    changed_any = False
+    tok_re = r"(?:i0|g0\.\d+|f0\.\d+|l1|a)"
+    for i, old in enumerate(lines):
+        m = re.match(r'^(\s*(?:print|write\s*\(\s*\*\s*,)\s*)"([^"]+)"(.*)$', old, re.IGNORECASE)
+        if not m:
+            continue
+        prefix, fmt, suffix = m.group(1), m.group(2), m.group(3)
+        # Remove redundant singleton grouping: (g0.6,1x) -> g0.6,1x
+        # Keep repeated groups such as 3(i0,1x).
+        new_fmt = re.sub(
+            rf"(?<!\d)\(\s*({tok_re}\s*,\s*1x)\s*\)",
+            r"\1",
+            fmt,
+            flags=re.IGNORECASE,
+        )
+        new_fmt = re.sub(r"\s+", " ", new_fmt).strip()
+        new_fmt = _normalize_format_comma_spacing(new_fmt)
         if new_fmt != fmt:
             lines[i] = f'{prefix}"{new_fmt}"{suffix}'
             changed_any = True
@@ -833,6 +988,14 @@ def main() -> int:
                     edits += 1
                     print(f"Fix: normalized explicit format spacing in {work_target}.")
                     continue
+                before_par = _read_lines(work_target) if args.diff else []
+                par_changed = _normalize_redundant_format_parens(work_target)
+                if par_changed:
+                    if args.diff:
+                        _print_unified_diff(work_target, before_par, _read_lines(work_target))
+                    edits += 1
+                    print(f"Fix: normalized redundant format parentheses in {work_target}.")
+                    continue
                 print(f"Run: PASS after {edits} edit(s).")
                 if args.run:
                     rr = _build_and_run_program(build_inputs, work_target.stem, tee_both=args.tee_both)
@@ -886,6 +1049,31 @@ def main() -> int:
         if args.tee_both:
             _emit_cp_output(cp, prefix=f"[{it}] Build ")
         if cp.returncode == 0:
+            static_mismatches = _static_format_mismatches(src)
+            if static_mismatches:
+                fixed_one = False
+                for line_no, detail in static_mismatches:
+                    before_static = _read_lines(src) if args.diff else []
+                    changed = _fix_static_format_mismatch_with_xfmm(src, line_no)
+                    if not changed:
+                        changed = _fix_runtime_rebuild_print_format(src, line_no)
+                    if changed:
+                        if args.diff:
+                            _print_unified_diff(src, before_static, _read_lines(src))
+                        edits += 1
+                        print(f"Fix: static format/type mismatch at {src}:{line_no} ({detail}).")
+                        fixed_one = True
+                        break
+                if fixed_one:
+                    continue
+            before_par = _read_lines(src) if args.diff else []
+            par_changed = _normalize_redundant_format_parens(src)
+            if par_changed:
+                if args.diff:
+                    _print_unified_diff(src, before_par, _read_lines(src))
+                edits += 1
+                print(f"Fix: normalized redundant format parentheses in {src}.")
+                continue
             print(f"Build: PASS after {edits} edit(s).")
             if args.run:
                 rr = _build_and_run_program(build_inputs, work_target.stem, tee_both=args.tee_both)
