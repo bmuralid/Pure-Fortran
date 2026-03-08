@@ -41,6 +41,7 @@ from fortran_scan import (
 )
 
 SHOW_TRANSLATION_NOTES = False
+AUTO_ELEMENTAL = False
 SHOW_NOOP_NOTES = False
 
 
@@ -9472,9 +9473,16 @@ class translator(ast.NodeVisitor):
                         if self._rank_expr(node.args[0]) > 0:
                             return f"{node.func.id}val({a0})"
                         return a0
-                    acc = self.expr(node.args[0])
+                    kinds = [self._expr_kind(a) for a in node.args]
+                    promote_real = ("real" in kinds) and (all(k in {"int", "real", "logical", None} for k in kinds))
+                    def _mx_arg_txt(a):
+                        txt = self.expr(a)
+                        if promote_real and self._expr_kind(a) in {"int", "logical"}:
+                            return f"real({txt}, kind=dp)"
+                        return txt
+                    acc = _mx_arg_txt(node.args[0])
                     for a in node.args[1:]:
-                        acc = f"{node.func.id}({acc}, {self.expr(a)})"
+                        acc = f"{node.func.id}({acc}, {_mx_arg_txt(a)})"
                     return acc
                 if node.func.id == "callable" and len(node.args) == 1:
                     a0 = node.args[0]
@@ -18419,6 +18427,7 @@ def _emit_local_function(
     force_arg_ranks=None,
     force_list_args=None,
     elemental_funcs=None,
+    force_non_elemental_funcs=None,
     local_tuple_return_out_names=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
@@ -18622,6 +18631,8 @@ def _emit_local_function(
     # earlier procedures leak into the first emitted statement.
     tr._last_comment_line = getattr(fn, "lineno", 0)
     is_elemental_fn = fn.name in set(elemental_funcs or set())
+    if fn.name in set(force_non_elemental_funcs or set()):
+        is_elemental_fn = False
     for anm, tnm in (dict_arg_types or {}).items():
         tr.dict_typed_vars[anm] = tnm
         if tnm in (dict_type_components or {}):
@@ -19488,13 +19499,40 @@ def _emit_local_function(
                 return True
             return False
 
+        def _base_name(expr):
+            cur = expr
+            while isinstance(cur, (ast.Subscript, ast.Attribute)):
+                cur = cur.value
+            return cur.id if isinstance(cur, ast.Name) else None
+
+        for st in fn.body:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Assign):
+                    for tg in n.targets:
+                        if isinstance(tg, (ast.Subscript, ast.Attribute)) and _base_name(tg) == nm:
+                            return True
+                        if isinstance(tg, ast.Name) and tg.id == nm:
+                            if _is_self_normalization_assign(n.value):
+                                continue
+                            # Python name assignment is local rebinding, not a
+                            # caller-visible mutation; keep INTENT(IN).
+                            continue
+                if isinstance(n, ast.AugAssign):
+                    if isinstance(n.target, (ast.Subscript, ast.Attribute)) and _base_name(n.target) == nm:
+                        return True
+                    if isinstance(n.target, ast.Name) and n.target.id == nm:
+                        # Scalar rebinding via +=/-= is local in Python; array
+                        # dummies can be caller-visible and need INOUT.
+                        if _arg_array_rank(nm) > 0:
+                            return True
+        return False
+
+    def _arg_is_rebound_name(nm):
         for st in fn.body:
             for n in ast.walk(st):
                 if isinstance(n, ast.Assign):
                     for tg in n.targets:
                         if isinstance(tg, ast.Name) and tg.id == nm:
-                            if _is_self_normalization_assign(n.value):
-                                continue
                             return True
                 if isinstance(n, ast.AugAssign):
                     if isinstance(n.target, ast.Name) and n.target.id == nm:
@@ -19536,6 +19574,7 @@ def _emit_local_function(
             tr.alloc_real_rank[_arg] = _rr
 
     optional_default_aliases = []
+    local_rebind_aliases = []
     arg_meta = {}
     optional_none_aliases = []
     optional_none_copyback = []
@@ -19754,6 +19793,16 @@ def _emit_local_function(
             )
         arg_meta[arg] = (decl_kind, int(arr_rank), intent_txt)
         o.w(arg_decl + (f" ! {argument_comment(arg, 'in')}" if not no_comment else ""))
+        if (
+            intent_txt == "in"
+            and int(arr_rank) == 0
+            and _arg_is_rebound_name(arg)
+            and decl_kind is not None
+            and (not str(decl_kind).lower().startswith("type("))
+        ):
+            alias = f"{arg}_local"
+            local_rebind_aliases.append((arg, alias, decl_kind))
+            tr.name_aliases[arg] = alias
         if (
             arg in optional_args
             and arg in defaults_map
@@ -20082,11 +20131,28 @@ def _emit_local_function(
         rr = max(1, tr.alloc_char_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"character(len=:), allocatable :: {nm}({dims})")
+    for arg, alias, decl_kind in local_rebind_aliases:
+        if "character" in str(decl_kind).lower():
+            o.w(f"character(len=:), allocatable :: {alias}")
+            tr._mark_char(alias)
+        else:
+            o.w(f"{decl_kind} :: {alias}")
+            lk = str(decl_kind).lower()
+            if "logical" in lk:
+                tr._mark_log(alias)
+            elif "complex" in lk:
+                tr._mark_complex(alias)
+            elif "real" in lk:
+                tr._mark_real(alias)
+            else:
+                tr._mark_int(alias)
     if tr.uses_sys_argv:
         if needed_helpers is not None:
             needed_helpers.add("sys_argv_init")
             needed_helpers.add("sys_argv_delete")
         o.w("sys_argv = sys_argv_init()")
+    for arg, alias, _decl_kind in local_rebind_aliases:
+        o.w(f"{alias} = {arg}")
     for arg, alias, dflt_expr, arr_rank in optional_default_inits:
         if int(arr_rank) == 0:
             if needed_helpers is not None:
@@ -21422,84 +21488,90 @@ def generate_flat(
     local_generic_overloads = set(local_overload_specs.keys())
     pure_local_calls = set(known_pure_calls or set()) | set((user_class_types or {}).keys())
 
-    elemental_targets = set(translator.global_vectorize_aliases.values())
+    elemental_targets = set()
     # A non-intrinsic ELEMENTAL procedure cannot be passed as an actual
     # procedure argument in standard Fortran. Keep such local callbacks
     # non-elemental to preserve compilability.
     passed_as_actual = set()
     local_fn_names = {f.name for f in (local_funcs or []) if isinstance(f, ast.FunctionDef)}
-    _scan_for_actuals = list(tree.body) + list(local_funcs or [])
     alias_to_local_fn = {}
     # Track simple callable aliases like `f = f_01` so we can avoid marking
     # aliased callbacks as ELEMENTAL (non-intrinsic elemental procedures cannot
     # be passed as actual procedure arguments).
-    for _st in _scan_for_actuals:
-        for _n in ast.walk(_st):
-            if not isinstance(_n, ast.Assign):
+    for _n in ast.walk(tree):
+        if not isinstance(_n, ast.Assign):
+            continue
+        if len(_n.targets) != 1 or (not isinstance(_n.targets[0], ast.Name)):
+            continue
+        if isinstance(_n.value, ast.Name) and _n.value.id in local_fn_names:
+            alias_to_local_fn.setdefault(_n.targets[0].id, set()).add(_n.value.id)
+    for _n in ast.walk(tree):
+        if not isinstance(_n, ast.Call):
+            continue
+        for _a in getattr(_n, "args", []):
+            if isinstance(_a, ast.Name) and _a.id in local_fn_names:
+                passed_as_actual.add(_a.id)
+            elif isinstance(_a, ast.Name) and _a.id in alias_to_local_fn:
+                passed_as_actual.update(alias_to_local_fn[_a.id])
+        for _kw in getattr(_n, "keywords", []):
+            if _kw.arg is None:
                 continue
-            if len(_n.targets) != 1 or (not isinstance(_n.targets[0], ast.Name)):
+            if isinstance(_kw.value, ast.Name) and _kw.value.id in local_fn_names:
+                passed_as_actual.add(_kw.value.id)
+            elif isinstance(_kw.value, ast.Name) and _kw.value.id in alias_to_local_fn:
+                passed_as_actual.update(alias_to_local_fn[_kw.value.id])
+    if AUTO_ELEMENTAL:
+        elemental_targets = set(translator.global_vectorize_aliases.values())
+        for fn in (local_funcs or []):
+            if fn.name in tuple_return_funcs:
                 continue
-            if isinstance(_n.value, ast.Name) and _n.value.id in local_fn_names:
-                alias_to_local_fn[_n.targets[0].id] = _n.value.id
-    for _st in _scan_for_actuals:
-        for _n in ast.walk(_st):
-            if not isinstance(_n, ast.Call):
+            if fn.name in dict_return_specs:
                 continue
-            for _a in getattr(_n, "args", []):
-                if isinstance(_a, ast.Name) and _a.id in local_fn_names:
-                    passed_as_actual.add(_a.id)
-                elif isinstance(_a, ast.Name) and _a.id in alias_to_local_fn:
-                    passed_as_actual.add(alias_to_local_fn[_a.id])
-            for _kw in getattr(_n, "keywords", []):
-                if _kw.arg is None:
-                    continue
-                if isinstance(_kw.value, ast.Name) and _kw.value.id in local_fn_names:
-                    passed_as_actual.add(_kw.value.id)
-                elif isinstance(_kw.value, ast.Name) and _kw.value.id in alias_to_local_fn:
-                    passed_as_actual.add(alias_to_local_fn[_kw.value.id])
-    for fn in (local_funcs or []):
-        if fn.name in tuple_return_funcs:
-            continue
-        if fn.name in dict_return_specs:
-            continue
-        # Skip elemental auto-marking for user-defined class/dataclass typed signatures.
-        has_user_type = False
-        for a in fn.args.args:
-            if a.annotation is not None and hasattr(ast, "unparse") and ast.unparse(a.annotation) in dict(user_class_types or {}):
-                has_user_type = True
-                break
-        if (not has_user_type) and fn.returns is not None and hasattr(ast, "unparse"):
-            has_user_type = ast.unparse(fn.returns) in dict(user_class_types or {})
-        if has_user_type:
-            continue
-        if not function_is_pure(fn, known_pure_calls=pure_local_calls):
-            continue
-        rs = local_return_specs.get(fn.name)
-        if rs in {"alloc_real", "alloc_int", "alloc_log"}:
-            # Elemental functions must have scalar result.
-            continue
-        base_ranks = base_func_arg_ranks.get(fn.name, [])
-        if any(int(rr) > 0 for rr in base_ranks):
-            continue
-        # Do not force elemental for functions that reassign dummy arguments.
-        arg_names = {a.arg for a in fn.args.args}
-        assigns_dummy = False
-        for st in ast.walk(fn):
-            if isinstance(st, ast.Assign):
-                for tg in st.targets:
-                    if isinstance(tg, ast.Name) and tg.id in arg_names:
-                        assigns_dummy = True
-                        break
-                if assigns_dummy:
+            # Skip elemental auto-marking for user-defined class/dataclass typed signatures.
+            has_user_type = False
+            for a in fn.args.args:
+                if a.annotation is not None and hasattr(ast, "unparse") and ast.unparse(a.annotation) in dict(user_class_types or {}):
+                    has_user_type = True
                     break
-            if isinstance(st, ast.AugAssign) and isinstance(st.target, ast.Name) and st.target.id in arg_names:
-                assigns_dummy = True
-                break
-        if assigns_dummy:
-            continue
-        if fn.name in passed_as_actual:
-            continue
-        elemental_targets.add(fn.name)
+            if (not has_user_type) and fn.returns is not None and hasattr(ast, "unparse"):
+                has_user_type = ast.unparse(fn.returns) in dict(user_class_types or {})
+            if has_user_type:
+                continue
+            if not function_is_pure(fn, known_pure_calls=pure_local_calls):
+                continue
+            rs = local_return_specs.get(fn.name)
+            if rs in {"alloc_real", "alloc_int", "alloc_log"}:
+                # Elemental functions must have scalar result.
+                continue
+            base_ranks = base_func_arg_ranks.get(fn.name, [])
+            if any(int(rr) > 0 for rr in base_ranks):
+                continue
+            # Do not force elemental for functions that reassign dummy arguments.
+            arg_names = {a.arg for a in fn.args.args}
+            assigns_dummy = False
+            for st in ast.walk(fn):
+                if isinstance(st, ast.Assign):
+                    for tg in st.targets:
+                        if isinstance(tg, ast.Name) and tg.id in arg_names:
+                            assigns_dummy = True
+                            break
+                    if assigns_dummy:
+                        break
+                if isinstance(st, ast.AugAssign) and isinstance(st.target, ast.Name) and st.target.id in arg_names:
+                    assigns_dummy = True
+                    break
+            if assigns_dummy:
+                continue
+            if fn.name in passed_as_actual:
+                continue
+            elemental_targets.add(fn.name)
+        elemental_targets -= passed_as_actual
+        # Conservative safeguard for Burkardt-style callback test functions.
+        # These names are commonly passed as procedure actuals (possibly through
+        # aliases), where non-intrinsic ELEMENTAL procedures are not permitted.
+        for _nm in list(elemental_targets):
+            if re.match(r"^f_\d+$", str(_nm)):
+                elemental_targets.discard(_nm)
     for gname in local_generic_overloads:
         elemental_targets.discard(gname)
 
@@ -21692,6 +21764,7 @@ def generate_flat(
                         force_arg_ranks=forced_ranks,
                         force_list_args=forced_list_args,
                         elemental_funcs=elemental_targets,
+                        force_non_elemental_funcs=passed_as_actual,
                         local_tuple_return_out_names=local_tuple_return_out_names,
                     )
             else:
@@ -21723,6 +21796,7 @@ def generate_flat(
                     user_class_types=user_class_types,
                     local_func_dict_arg_types=local_func_dict_arg_types,
                     elemental_funcs=elemental_targets,
+                    force_non_elemental_funcs=passed_as_actual,
                     local_tuple_return_out_names=local_tuple_return_out_names,
                 )
         om.w(f"end module {proc_mod_name}")
@@ -21907,6 +21981,7 @@ def generate_flat(
                 user_class_types=user_class_types,
                 local_func_dict_arg_types=local_func_dict_arg_types,
                 elemental_funcs=elemental_targets,
+                force_non_elemental_funcs=passed_as_actual,
                 local_tuple_return_out_names=local_tuple_return_out_names,
             )
 
