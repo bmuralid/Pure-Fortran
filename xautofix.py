@@ -46,6 +46,7 @@ IF_GUARDED_DEALLOC_RE = re.compile(
 )
 DO_START_RE = re.compile(r"^\s*do\b", re.IGNORECASE)
 END_DO_RE = re.compile(r"^\s*end\s*do\b|^\s*enddo\b", re.IGNORECASE)
+DO_ITER_RE = re.compile(r"^\s*do\b(?:\s+\d+)?\s*([a-z_][a-z0-9_]*)\s*=", re.IGNORECASE)
 
 
 def _q(path: Path) -> str:
@@ -209,9 +210,10 @@ def _parse_deallocate_targets(line: str) -> list[str]:
     return out
 
 
-def _fix_unallocated_deallocate_guards(path: Path) -> int:
+def _fix_unallocated_deallocate_guards(path: Path, drop_deallocate: bool = False) -> int:
     """Guard definitely unsafe DEALLOCATE on allocatables."""
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    drop_marker = "__XAUTOFIX_DROP_DEALLOC_LINE__"
     allocatables: set[str] = set()
     allocated_now: set[str] = set()
     edits = 0
@@ -238,17 +240,28 @@ def _fix_unallocated_deallocate_guards(path: Path) -> int:
             continue
         unsafe = [nm for nm in dnames if nm in allocatables and nm not in allocated_now]
         if unsafe:
-            indent = re.match(r"^\s*", old).group(0)
-            comment = ""
-            if "!" in old:
-                comment = old[old.find("!") :]
-            guards = [f"if (allocated({nm})) deallocate({nm})" for nm in dnames]
-            lines[i] = f"{indent}{'; '.join(guards)}{(' ' + comment) if comment else ''}"
+            if drop_deallocate:
+                # Keep any trailing comment as a comment-only line for traceability.
+                if "!" in old:
+                    indent = re.match(r"^\s*", old).group(0)
+                    comment = old[old.find("!") :]
+                    lines[i] = f"{indent}{comment}"
+                else:
+                    lines[i] = drop_marker
+            else:
+                indent = re.match(r"^\s*", old).group(0)
+                comment = ""
+                if "!" in old:
+                    comment = old[old.find("!") :]
+                guards = [f"if (allocated({nm})) deallocate({nm})" for nm in dnames]
+                lines[i] = f"{indent}{'; '.join(guards)}{(' ' + comment) if comment else ''}"
             edits += 1
         for nm in dnames:
             allocated_now.discard(nm)
 
     if edits:
+        if drop_deallocate:
+            lines = [ln for ln in lines if ln != drop_marker]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return edits
 
@@ -307,6 +320,145 @@ def _fix_allocate_inside_loop_with_guard(path: Path) -> int:
 
     if edits:
         path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return edits
+
+
+def _prev_nonblank_idx(lines: list[str], i: int) -> int:
+    j = i - 1
+    while j >= 0:
+        if lines[j].strip():
+            return j
+        j -= 1
+    return -1
+
+
+def _next_nonblank_idx(lines: list[str], i: int, hi: int) -> int:
+    j = i
+    while j <= hi:
+        if lines[j].strip():
+            return j
+        j += 1
+    return -1
+
+
+def _allocate_single_target(line: str) -> tuple[str, str] | None:
+    m = ALLOCATE_STMT_RE.match(line.split("!", 1)[0])
+    if not m:
+        return None
+    objs: list[str] = []
+    for chunk in _split_top_level_commas(m.group(1)):
+        s = chunk.strip()
+        if not s:
+            continue
+        if re.match(r"^[a-z_][a-z0-9_]*\s*=", s, re.IGNORECASE):
+            continue
+        objs.append(s)
+    if len(objs) != 1:
+        return None
+    obj = objs[0]
+    mm = re.match(r"^\s*([a-z_][a-z0-9_]*)\s*\((.*)\)\s*$", obj, re.IGNORECASE)
+    if not mm:
+        return None
+    return mm.group(1).lower(), mm.group(2).strip()
+
+
+def _hoist_loop_allocate(path: Path, drop_deallocate: bool = False) -> int:
+    """Hoist simple loop-local allocate patterns out of DO loops.
+
+    Pattern (conservative):
+      do i = ...
+         [if (allocated(x)) deallocate(x)]
+         allocate(x(...))
+         ...
+      end do
+
+    Rewrites to:
+      [if (allocated(x)) deallocate(x)]
+      allocate(x(...))
+      do i = ...
+         ...
+      end do
+    """
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    edits = 0
+    while True:
+        allocatables: set[str] = set()
+        stack: list[tuple[int, str]] = []
+        found = None
+        for i, old in enumerate(lines):
+            code = old.split("!", 1)[0]
+            low = code.strip().lower()
+            if not low:
+                continue
+            for nm in _declared_allocatables(code):
+                allocatables.add(nm)
+            mdo = DO_ITER_RE.match(low)
+            if mdo:
+                stack.append((i, mdo.group(1).lower()))
+                continue
+            if END_DO_RE.match(low) and stack:
+                do_start, loop_var = stack.pop()
+                body_lo = do_start + 1
+                body_hi = i - 1
+                if body_lo > body_hi:
+                    continue
+                first = _next_nonblank_idx(lines, body_lo, body_hi)
+                if first < 0:
+                    continue
+                guard_idx = -1
+                alloc_idx = -1
+                first_code = lines[first].split("!", 1)[0]
+                d0 = _parse_deallocate_targets(first_code)
+                if d0 and len(d0) == 1 and _line_has_guard_for_var(first_code, d0[0]):
+                    guard_idx = first
+                    alloc_idx = _next_nonblank_idx(lines, first + 1, body_hi)
+                else:
+                    alloc_idx = first
+                if alloc_idx < 0:
+                    continue
+                alloc_pair = _allocate_single_target(lines[alloc_idx])
+                if not alloc_pair:
+                    continue
+                var, spec = alloc_pair
+                if var not in allocatables:
+                    continue
+                if re.search(rf"\b{re.escape(loop_var)}\b", spec, re.IGNORECASE):
+                    continue
+                bad = False
+                for t in range(body_lo, body_hi + 1):
+                    if t == alloc_idx or t == guard_idx:
+                        continue
+                    code_t = lines[t].split("!", 1)[0]
+                    if var in _parse_allocate_targets(code_t) or var in _parse_deallocate_targets(code_t):
+                        bad = True
+                        break
+                if bad:
+                    continue
+                found = (do_start, i, guard_idx, alloc_idx, var)
+                break
+        if found is None:
+            break
+        do_start, do_end, guard_idx, alloc_idx, var = found
+        do_indent = re.match(r"^\s*", lines[do_start]).group(0)
+        alloc_line = lines[alloc_idx].lstrip()
+        hoist_lines: list[str] = []
+        pidx = _prev_nonblank_idx(lines, do_start)
+        if (not drop_deallocate) and (pidx < 0 or not _line_has_guard_for_var(lines[pidx], var)):
+            hoist_lines.append(f"{do_indent}if (allocated({var})) deallocate({var})")
+        hoist_lines.append(f"{do_indent}{alloc_line}")
+        lines[do_start:do_start] = hoist_lines
+        shift = len(hoist_lines)
+        do_end += shift
+        if guard_idx >= 0:
+            del lines[guard_idx + shift]
+            do_end -= 1
+            if alloc_idx > guard_idx:
+                alloc_idx -= 1
+        del lines[alloc_idx + shift]
+        edits += 1
+
+    if edits:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return edits
 
 
@@ -1065,11 +1217,42 @@ def main() -> int:
         help="Print unified diff for each applied edit.",
     )
     ap.add_argument(
+        "--tee-orig",
+        action="store_true",
+        help="Print original source of the target Fortran file.",
+    )
+    ap.add_argument(
+        "--tee",
+        action="store_true",
+        help="Print transformed source of the target Fortran file.",
+    )
+    ap.add_argument(
         "--tee-both",
         action="store_true",
-        help="Print both stdout and stderr from build/run steps each iteration.",
+        help="Print original+transformed source and both stdout/stderr from build/run steps.",
+    )
+    ap.add_argument(
+        "--hoist-loop-allocate",
+        action="store_true",
+        help="Conservatively hoist simple allocatable ALLOCATE statements out of DO loops.",
+    )
+    ap.add_argument(
+        "--drop-deallocate",
+        action="store_true",
+        help="When a DEALLOCATE is definitely unsafe/redundant, drop it instead of guarding with allocated(...).",
     )
     args = ap.parse_args()
+    tee_orig = args.tee_orig or args.tee_both
+    tee_src = args.tee or args.tee_both
+
+    def _emit_source(label: str, p: Path) -> None:
+        print(f"{label} ({p}):")
+        try:
+            txt = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as ex:
+            print(f"<unable to read source: {ex}>")
+            return
+        print(txt.rstrip("\n"))
 
     # Runtime mode is primarily intended to patch the target source directly.
     # Keep --out available when explicitly requested, but default to in-place.
@@ -1096,6 +1279,8 @@ def main() -> int:
     else:
         target = srcs[0]
         target_index = 0
+    if tee_orig:
+        _emit_source("Original source", target)
     if args.in_place:
         stem = target.name + ".bak"
         bak = target.with_name(stem)
@@ -1114,14 +1299,30 @@ def main() -> int:
     build_inputs = list(srcs)
     build_inputs[target_index] = work_target
 
+    def _ret(code: int) -> int:
+        if tee_src and work_target.exists():
+            _emit_source("Transformed source", work_target)
+        return code
+
     edits = 0
     before_guard = _read_lines(work_target) if args.diff else []
-    guard_edits = _fix_unallocated_deallocate_guards(work_target)
+    guard_edits = _fix_unallocated_deallocate_guards(work_target, drop_deallocate=args.drop_deallocate)
     if guard_edits:
         if args.diff:
             _print_unified_diff(work_target, before_guard, _read_lines(work_target))
         edits += guard_edits
-        print(f"Fix: added {guard_edits} allocatable DEALLOCATE guard(s) via static analysis.")
+        if args.drop_deallocate:
+            print(f"Fix: dropped {guard_edits} unsafe/redundant DEALLOCATE line(s) via static analysis.")
+        else:
+            print(f"Fix: added {guard_edits} allocatable DEALLOCATE guard(s) via static analysis.")
+    if args.hoist_loop_allocate:
+        before_hoist = _read_lines(work_target) if args.diff else []
+        hoist_edits = _hoist_loop_allocate(work_target, drop_deallocate=args.drop_deallocate)
+        if hoist_edits:
+            if args.diff:
+                _print_unified_diff(work_target, before_hoist, _read_lines(work_target))
+            edits += hoist_edits
+            print(f"Fix: hoisted {hoist_edits} loop-local ALLOCATE pattern(s).")
     before_loop_guard = _read_lines(work_target) if args.diff else []
     loop_guard_edits = _fix_allocate_inside_loop_with_guard(work_target)
     if loop_guard_edits:
@@ -1149,7 +1350,7 @@ def main() -> int:
                 if action is None:
                     print("Build: FAIL; no supported autofix for current error.")
                     print(err.strip())
-                    return cpb.returncode or 1
+                    return _ret(cpb.returncode or 1)
                 afile = Path(action["file"])  # type: ignore[index]
                 if not afile.exists():
                     afile = src
@@ -1219,7 +1420,7 @@ def main() -> int:
                         continue
                 print("Build: FAIL; matched rule but no edit was applied.")
                 print(err.strip())
-                return cpb.returncode or 1
+                return _ret(cpb.returncode or 1)
 
             print(f"[{it}] Run: {exe}")
             cpr = subprocess.run(
@@ -1251,15 +1452,15 @@ def main() -> int:
                 print(f"Run: PASS after {edits} edit(s).")
                 if args.run:
                     rr = _build_and_run_program(build_inputs, work_target.stem, tee_both=args.tee_both)
-                    return 0 if rr == 0 else rr
-                return 0
+                    return _ret(0 if rr == 0 else rr)
+                return _ret(0)
 
             run_log = (cpr.stdout or "") + "\n" + (cpr.stderr or "")
             action = _parse_runtime_fmt_mismatch(run_log)
             if action is None:
                 print("Run: FAIL; no supported runtime autofix for current error.")
                 print(run_log.strip())
-                return cpr.returncode or 1
+                return _ret(cpr.returncode or 1)
             afile_from_log = Path(action["file"])  # type: ignore[index]
             if args.in_place and afile_from_log.exists():
                 afile = afile_from_log
@@ -1293,7 +1494,7 @@ def main() -> int:
                 continue
             print("Run: FAIL; matched runtime rule but no edit was applied.")
             print(run_log.strip())
-            return cpr.returncode or 1
+            return _ret(cpr.returncode or 1)
 
         cmd = args.compile_cmd.format(src=_q(src), srcs=srcs_str)
         print(f"[{it}] Build: {cmd}")
@@ -1337,15 +1538,15 @@ def main() -> int:
             print(f"Build: PASS after {edits} edit(s).")
             if args.run:
                 rr = _build_and_run_program(build_inputs, work_target.stem, tee_both=args.tee_both)
-                return 0 if rr == 0 else rr
-            return 0
+                return _ret(0 if rr == 0 else rr)
+            return _ret(0)
 
         err = cp.stderr or cp.stdout or ""
         action = _find_first_action(err, src)
         if action is None:
             print("Build: FAIL; no supported autofix for current error.")
             print(err.strip())
-            return cp.returncode or 1
+            return _ret(cp.returncode or 1)
 
         afile = Path(action["file"])  # type: ignore[index]
         if not afile.exists():
@@ -1417,10 +1618,10 @@ def main() -> int:
 
         print("Build: FAIL; matched rule but no edit was applied.")
         print(err.strip())
-        return cp.returncode or 1
+        return _ret(cp.returncode or 1)
 
     print(f"Stopped after max iterations ({args.max_iter}); edits={edits}.")
-    return 1
+    return _ret(1)
 
 
 if __name__ == "__main__":
