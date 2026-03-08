@@ -414,8 +414,22 @@ contains
 
       pure elemental real(kind=dp) function special_binom(n, k) result(v)
          real(kind=dp), intent(in) :: n, k
-         if (k < 0.0_dp .or. n < k) then
+         integer :: ni, ki
+         logical :: n_int, k_int
+         if (k < 0.0_dp) then
             v = 0.0_dp
+            return
+         end if
+         ni = nint(n)
+         ki = nint(k)
+         n_int = abs(n - real(ni, kind=dp)) <= 1.0e-12_dp
+         k_int = abs(k - real(ki, kind=dp)) <= 1.0e-12_dp
+         if (n_int .and. k_int) then
+            if (ki < 0 .or. ni < 0 .or. ki > ni) then
+               v = 0.0_dp
+               return
+            end if
+            v = special_comb(real(ni, kind=dp), real(ki, kind=dp), exact=.true.)
             return
          end if
          v = gamma(n + 1.0_dp) / (gamma(k + 1.0_dp) * gamma(n - k + 1.0_dp))
@@ -424,23 +438,50 @@ contains
       pure elemental real(kind=dp) function special_comb(n, k, exact, repetition) result(v)
          real(kind=dp), intent(in) :: n, k
          logical, intent(in), optional :: exact, repetition
-         logical :: repetition_opt
+         logical :: repetition_opt, exact_opt, n_int, k_int
          real(kind=dp) :: nn, kk
+         integer :: ni, ki, i, kwork
          nn = n
          kk = k
          repetition_opt = .false.
+         exact_opt = .false.
          if (present(repetition)) repetition_opt = repetition
+         if (present(exact)) exact_opt = exact
          if (repetition_opt) then
             nn = n + k - 1.0_dp
          end if
-         if (kk < 0.0_dp .or. nn < kk) then
+         if (kk < 0.0_dp) then
             v = 0.0_dp
             return
          end if
-         v = gamma(nn + 1.0_dp) / (gamma(kk + 1.0_dp) * gamma(nn - kk + 1.0_dp))
-         if (present(exact)) then
-            if (exact) v = real(nint(v), kind=dp)
+         ni = nint(nn)
+         ki = nint(kk)
+         n_int = abs(nn - real(ni, kind=dp)) <= 1.0e-12_dp
+         k_int = abs(kk - real(ki, kind=dp)) <= 1.0e-12_dp
+         if (exact_opt) then
+            if ((.not. n_int) .or. (.not. k_int)) then
+               v = ieee_value(0.0_dp, ieee_quiet_nan)
+               return
+            end if
+            if (ni < 0 .or. ki < 0 .or. ki > ni) then
+               v = 0.0_dp
+               return
+            end if
+            kwork = ki
+            if (kwork > ni - kwork) kwork = ni - kwork
+            v = 1.0_dp
+            do i = 1, kwork
+               v = v * real(ni - kwork + i, kind=dp) / real(i, kind=dp)
+            end do
+            return
          end if
+         if (n_int .and. k_int) then
+            if (ni < 0 .or. ki < 0 .or. ki > ni) then
+               v = 0.0_dp
+               return
+            end if
+         end if
+         v = gamma(nn + 1.0_dp) / (gamma(kk + 1.0_dp) * gamma(nn - kk + 1.0_dp))
       end function special_comb
 
       subroutine print_int_list(a, n)
