@@ -3085,8 +3085,8 @@ def detect_needed_helpers(tree):
         "cov": {"cov2_real", "cov_matrix_rows_real"},
         "corrcoef": {"corrcoef2_real"},
         "convolve": {"convolve_real", "convolve_int"},
-        "loadtxt": {"loadtxt_real_2d"},
-        "genfromtxt": {"loadtxt_real_2d"},
+        "loadtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
+        "genfromtxt": {"loadtxt_real_2d", "loadtxt_real_1d", "loadtxt_int_2d", "loadtxt_int_1d", "loadtxt_logical_2d", "loadtxt_logical_1d"},
         "savetxt": {"savetxt_real_2d"},
         "pad": {"pad2d_int", "pad2d_real"},
         "allclose": {"allclose"},
@@ -6230,10 +6230,29 @@ class translator(ast.NodeVisitor):
                 elif (
                     isinstance(kw.value, ast.Attribute)
                     and isinstance(kw.value.value, ast.Name)
-                    and kw.value.value.id == "np"
                 ):
                     dtype_txt = kw.value.attr.lower()
         return dtype_txt
+
+    def _np_dtype_kind(self, call_node):
+        dtype_txt = self._np_dtype_text(call_node)
+        if "bool" in dtype_txt:
+            return "logical"
+        if "int" in dtype_txt:
+            return "int"
+        return "real"
+
+    def _loadtxt_usecols_scalar(self, call_node):
+        for kw in getattr(call_node, "keywords", []):
+            if kw.arg != "usecols":
+                continue
+            uc = kw.value
+            if isinstance(uc, ast.Constant) and isinstance(uc.value, int):
+                return True
+            if isinstance(uc, (ast.Tuple, ast.List)):
+                return False
+            return self._rank_expr(uc) == 0
+        return False
 
     def _expr_kind(self, node):
         if isinstance(node, ast.Constant):
@@ -6762,7 +6781,23 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"loadtxt", "genfromtxt"}
                 and len(node.args) >= 1
             ):
-                return "real"
+                return self._np_dtype_kind(node)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "array"
+                and len(node.args) >= 1
+            ):
+                tcode = ""
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    tcode = node.args[0].value
+                t0 = (tcode[:1].lower() if tcode else "")
+                if t0 in {"f", "d"}:
+                    return "real"
+                if t0 in {"i", "l", "q", "h", "b"}:
+                    return "int"
+                if len(node.args) >= 2:
+                    return self._expr_kind(node.args[1])
+                return "int"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -7337,6 +7372,17 @@ class translator(ast.NodeVisitor):
                     if len(node.args) >= 1 and self._expr_kind(node.args[0]) == "complex":
                         return "complex"
                     return "real"
+                if node.func.value.id == "math" and node.func.attr in {"floor", "ceil", "trunc"}:
+                    return "int"
+                if node.func.value.id == "math" and node.func.attr in {"expm1", "log1p"}:
+                    return "real"
+                if node.func.value.id == "math" and node.func.attr == "isclose":
+                    return "logical"
+                if node.func.value.id == "math" and node.func.attr == "prod" and len(node.args) >= 1:
+                    k0 = self._expr_kind(node.args[0])
+                    if k0 in {"real", "complex"}:
+                        return k0
+                    return "int"
                 if node.func.value.id == "random" and node.func.attr == "random":
                     return "real"
             if isinstance(node.func, ast.Name) and node.func.id == "norm" and len(node.args) >= 1:
@@ -8025,7 +8071,15 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "convolve" and len(node.args) >= 2:
                     return 1
                 if node.func.attr in {"loadtxt", "genfromtxt"} and len(node.args) >= 1:
+                    if self._loadtxt_usecols_scalar(node):
+                        return 1
                     return 2
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "array"
+                and len(node.args) >= 1
+            ):
+                return 1
                 if node.func.attr == "append" and len(node.args) >= 2:
                     axis_node = None
                     if len(node.args) >= 3:
@@ -9832,6 +9886,22 @@ class translator(ast.NodeVisitor):
                 if isinstance(a0, ast.Name) and a0.id in self.list_counts:
                     return self.list_counts[a0.id]
                 return f"size({self.expr(a0)})"
+            if isinstance(node.func, ast.Name) and node.func.id == "array":
+                if len(node.args) < 1:
+                    raise NotImplementedError("array(...) expects at least typecode argument")
+                src_node = node.args[1] if len(node.args) >= 2 else ast.List(elts=[], ctx=ast.Load())
+                src_expr = self.expr(src_node)
+                if self._rank_expr(src_node) == 0:
+                    src_expr = f"[{src_expr}]"
+                tcode = ""
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    tcode = node.args[0].value
+                t0 = (tcode[:1].lower() if tcode else "")
+                if t0 in {"f", "d"} and self._expr_kind(src_node) in {"int", "logical"}:
+                    return f"real({src_expr}, kind=dp)"
+                if t0 in {"i", "l", "q", "h", "b"} and self._expr_kind(src_node) in {"real", "logical"}:
+                    return f"int({src_expr})"
+                return src_expr
             if isinstance(node.func, ast.Name) and node.func.id == "set":
                 if len(node.args) == 0:
                     return "unique_int([integer ::])"
@@ -11833,9 +11903,12 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 skiprows_txt = None
+                max_rows_txt = None
+                skip_footer_txt = None
                 delimiter_txt = None
                 comments_txt = None
                 usecols_txt = None
+                scalar_usecol_txt = None
                 if len(node.args) >= 2 and node.func.attr == "loadtxt":
                     if isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, int):
                         skiprows_txt = self.expr(node.args[1])
@@ -11844,6 +11917,10 @@ class translator(ast.NodeVisitor):
                         skiprows_txt = self.expr(kw.value)
                     elif kw.arg == "skip_header":
                         skiprows_txt = self.expr(kw.value)
+                    elif kw.arg == "max_rows":
+                        max_rows_txt = self.expr(kw.value)
+                    elif kw.arg == "skip_footer":
+                        skip_footer_txt = self.expr(kw.value)
                     elif kw.arg == "delimiter":
                         if not is_none(kw.value):
                             delimiter_txt = self.expr(kw.value)
@@ -11853,7 +11930,7 @@ class translator(ast.NodeVisitor):
                     elif kw.arg == "usecols":
                         uc = kw.value
                         if isinstance(uc, ast.Constant) and isinstance(uc.value, int):
-                            usecols_txt = f"[{int(uc.value)}]"
+                            scalar_usecol_txt = f"int({self.expr(uc)})"
                         elif isinstance(uc, (ast.Tuple, ast.List)):
                             vals = []
                             ok = True
@@ -11866,19 +11943,40 @@ class translator(ast.NodeVisitor):
                             if ok:
                                 usecols_txt = "[" + ", ".join(vals) + "]"
                             else:
-                                raise NotImplementedError("np.loadtxt/genfromtxt usecols currently requires constant integer tuple/list")
+                                usecols_txt = self.expr(uc)
                         else:
-                            raise NotImplementedError("np.loadtxt/genfromtxt usecols currently requires constant integer tuple/list")
+                            if self._rank_expr(uc) == 0:
+                                scalar_usecol_txt = f"int({self.expr(uc)})"
+                            else:
+                                usecols_txt = self.expr(uc)
+                dtype_kind = self._np_dtype_kind(node)
+                if dtype_kind == "int":
+                    helper_base = "loadtxt_int"
+                elif dtype_kind == "logical":
+                    helper_base = "loadtxt_logical"
+                else:
+                    helper_base = "loadtxt_real"
+                scalar_usecols = scalar_usecol_txt is not None
                 parts = [self.expr(node.args[0])]
+                if scalar_usecols:
+                    parts.append(scalar_usecol_txt)
                 if skiprows_txt is not None:
                     parts.append(f"skiprows=int({skiprows_txt})")
+                if max_rows_txt is not None:
+                    parts.append(f"max_rows=int({max_rows_txt})")
+                if skip_footer_txt is not None:
+                    parts.append(f"skip_footer=int({skip_footer_txt})")
                 if delimiter_txt is not None:
                     parts.append(f"delimiter={delimiter_txt}")
                 if comments_txt is not None:
                     parts.append(f"comments={comments_txt}")
-                if usecols_txt is not None:
+                if (not scalar_usecols) and usecols_txt is not None:
                     parts.append(f"usecols={usecols_txt}")
-                return "loadtxt_real_2d(" + ", ".join(parts) + ")"
+                if scalar_usecols:
+                    helper_name = f"{helper_base}_1d"
+                else:
+                    helper_name = f"{helper_base}_2d"
+                return helper_name + "(" + ", ".join(parts) + ")"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -11965,6 +12063,84 @@ class translator(ast.NodeVisitor):
                 if kx in {"int", "logical"}:
                     x0 = f"real({x0}, kind=dp)"
                 return f"atan2({y0}, {x0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "math"
+                and node.func.attr in {"expm1", "log1p"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if node.func.attr == "expm1":
+                    return f"(exp({a0}) - 1.0_dp)"
+                return f"log(1.0_dp + ({a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "math"
+                and node.func.attr in {"floor", "ceil", "trunc"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    return f"int({a0})"
+                if node.func.attr == "floor":
+                    return f"int(floor({a0}))"
+                if node.func.attr == "ceil":
+                    return f"int(ceiling({a0}))"
+                return f"int({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "math"
+                and node.func.attr == "prod"
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                start_txt = None
+                if len(node.args) >= 2:
+                    start_txt = self.expr(node.args[1])
+                for kw in node.keywords:
+                    if kw.arg == "start":
+                        start_txt = self.expr(kw.value)
+                        break
+                ptxt = f"product({a0})" if self._rank_expr(node.args[0]) > 0 else a0
+                if start_txt is not None:
+                    ptxt = f"({ptxt}) * ({start_txt})"
+                return ptxt
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "math"
+                and node.func.attr == "isclose"
+                and len(node.args) >= 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                ka = self._expr_kind(node.args[0])
+                kb = self._expr_kind(node.args[1])
+                if ka in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if kb in {"int", "logical"}:
+                    b0 = f"real({b0}, kind=dp)"
+                rel_tol = "1e-9_dp"
+                abs_tol = "0.0_dp"
+                if len(node.args) >= 3:
+                    rel_tol = self.expr(node.args[2])
+                if len(node.args) >= 4:
+                    abs_tol = self.expr(node.args[3])
+                for kw in node.keywords:
+                    if kw.arg == "rel_tol":
+                        rel_tol = self.expr(kw.value)
+                    elif kw.arg == "abs_tol":
+                        abs_tol = self.expr(kw.value)
+                return (
+                    f"(abs(({a0}) - ({b0})) <= max(({abs_tol}), ({rel_tol}) * max(abs({a0}), abs({b0}))))"
+                )
             if (
                 isinstance(node.func, ast.Attribute)
                 and self._is_scipy_special_call_attr(node.func)
@@ -14333,6 +14509,44 @@ class translator(ast.NodeVisitor):
                 self._mark_alloc_char("sys_argv", rank=1)
                 idx0 = self.expr(t.slice)
                 self.o.w(f"call sys_argv_delete(sys_argv, int({idx0}) + 1)")
+                continue
+            if (
+                isinstance(t, ast.Subscript)
+                and isinstance(t.value, ast.Name)
+            ):
+                name = self._resolve_list_alias(t.value.id)
+                if self._rank_expr(ast.Name(id=name, ctx=ast.Load())) != 1:
+                    raise NotImplementedError("delete currently supports only rank-1 arrays")
+                idx0 = self.expr(t.slice)
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: n_del, pos_del")
+                self.o.w(f"if (.not. allocated({name})) stop 'delete from empty list'")
+                self.o.w(f"n_del = size({name})")
+                self.o.w("if (n_del <= 0) stop 'delete from empty list'")
+                self.o.w(f"pos_del = int({idx0})")
+                self.o.w("if (pos_del < 0) pos_del = n_del + pos_del")
+                self.o.w("if (pos_del < 0 .or. pos_del >= n_del) stop 'delete index out of range'")
+                self.o.w("if (n_del == 1) then")
+                self.o.push()
+                self.o.w(f"deallocate({name})")
+                self.o.w(f"allocate({name}(0))")
+                self.o.pop()
+                self.o.w("elseif (pos_del == 0) then")
+                self.o.push()
+                self.o.w(f"{name} = {name}(2:)")
+                self.o.pop()
+                self.o.w("elseif (pos_del == n_del - 1) then")
+                self.o.push()
+                self.o.w(f"{name} = {name}(:n_del - 1)")
+                self.o.pop()
+                self.o.w("else")
+                self.o.push()
+                self.o.w(f"{name} = [{name}(:pos_del), {name}(pos_del + 2:)]")
+                self.o.pop()
+                self.o.w("end if")
+                self.o.pop()
+                self.o.w("end block")
                 continue
             raise NotImplementedError("unsupported delete target")
 
@@ -18453,6 +18667,78 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{name}(1) = {val}")
             self.o.pop()
             self.o.w("end if")
+            return
+
+        if isinstance(c.func, ast.Attribute) and c.func.attr == "extend":
+            if not isinstance(c.func.value, ast.Name):
+                raise NotImplementedError("extend target must be a name")
+            name = self._resolve_list_alias(c.func.value.id)
+            if len(c.args) != 1:
+                raise NotImplementedError("extend expects exactly one argument")
+            if self._rank_expr(c.args[0]) == 0:
+                raise NotImplementedError("extend expects a rank-1 iterable argument")
+            vals = self.expr(c.args[0])
+            cnt = self.list_counts.get(name, None)
+            if cnt is not None:
+                self.o.w("block")
+                self.o.push()
+                self.o.w("integer :: i_ext")
+                self.o.w(f"do i_ext = 1, size({vals})")
+                self.o.push()
+                self.o.w(f"{cnt} = {cnt} + 1")
+                self.o.w(f"{name}({cnt}) = {vals}(i_ext)")
+                self.o.pop()
+                self.o.w("end do")
+                self.o.pop()
+                self.o.w("end block")
+                return
+            if self._rank_expr(ast.Name(id=name, ctx=ast.Load())) != 1:
+                raise NotImplementedError("extend currently supports only rank-1 arrays")
+            if (
+                name not in self.alloc_ints
+                and name not in self.alloc_reals
+                and name not in self.alloc_logs
+                and name not in self.alloc_chars
+                and name not in self.alloc_complexes
+            ):
+                raise NotImplementedError("extend without count mapping")
+            self.o.w(f"if (allocated({name})) then")
+            self.o.push()
+            self.o.w(f"{name} = [{name}, {vals}]")
+            self.o.pop()
+            self.o.w("else")
+            self.o.push()
+            self.o.w(f"{name} = {vals}")
+            self.o.pop()
+            self.o.w("end if")
+            return
+
+        if isinstance(c.func, ast.Attribute) and c.func.attr == "insert":
+            if not isinstance(c.func.value, ast.Name):
+                raise NotImplementedError("insert target must be a name")
+            name = self._resolve_list_alias(c.func.value.id)
+            if len(c.args) != 2:
+                raise NotImplementedError("insert expects exactly two arguments")
+            if self._rank_expr(c.args[1]) > 0:
+                raise NotImplementedError("insert currently supports only scalar inserted value")
+            if self.list_counts.get(name, None) is not None:
+                raise NotImplementedError("insert with count-mapped lists is not yet supported")
+            if self._rank_expr(ast.Name(id=name, ctx=ast.Load())) != 1:
+                raise NotImplementedError("insert currently supports only rank-1 arrays")
+            idx = self.expr(c.args[0])
+            val = self.expr(c.args[1])
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: n_ins, pos_ins")
+            self.o.w(f"if (.not. allocated({name})) allocate({name}(0))")
+            self.o.w(f"n_ins = size({name})")
+            self.o.w(f"pos_ins = int({idx})")
+            self.o.w("if (pos_ins < 0) pos_ins = n_ins + pos_ins")
+            self.o.w("if (pos_ins < 0) pos_ins = 0")
+            self.o.w("if (pos_ins > n_ins) pos_ins = n_ins")
+            self.o.w(f"{name} = [{name}(:pos_ins), {val}, {name}(pos_ins + 1:)]")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         if isinstance(c.func, ast.Attribute) and c.func.attr == "pop":
@@ -23310,31 +23596,6 @@ def _tree_uses_shell_exec(tree):
 def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False, list_directed_io=False):
     src = Path(py_path).read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
-    def _find_scipy_import(t):
-        for n in ast.walk(t):
-            if isinstance(n, ast.Import):
-                for al in n.names:
-                    mod = (al.name or "").strip()
-                    if mod == "scipy":
-                        return n, mod
-                    if mod.startswith("scipy."):
-                        # Allow scipy.integrate subset (quad lowering path).
-                        if mod == "scipy.integrate" or mod.startswith("scipy.integrate."):
-                            continue
-                        return n, mod
-            elif isinstance(n, ast.ImportFrom):
-                mod = (n.module or "").strip()
-                if mod == "scipy":
-                    return n, (mod or "scipy")
-                if mod.startswith("scipy."):
-                    if mod == "scipy.integrate" or mod.startswith("scipy.integrate."):
-                        continue
-                    return n, (mod or "scipy")
-        return None, ""
-    scipy_node, scipy_mod = _find_scipy_import(tree)
-    # Allow SciPy imports to pass parsing; unsupported APIs are rejected at
-    # expression/call lowering with specific diagnostics.
-    _ = (scipy_node, scipy_mod)
     translator.global_synthetic_slices = {}
     translator.global_vectorize_aliases = {}
     translator.global_linalg_aliases = set()
