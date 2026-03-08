@@ -108,6 +108,7 @@ public :: ends_with !@pyapi kind=function ret=logical args=s:character:intent(in
 public :: str_find !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="0-based find index or -1"
 public :: str_rfind !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="0-based reverse find index or -1"
 public :: str_replace !@pyapi kind=function ret=character args=s:character:intent(in),old:character:intent(in),new:character:intent(in) desc="replace all occurrences"
+public :: str_zfill !@pyapi kind=function ret=character args=s:character:intent(in),width:integer:intent(in) desc="left-pad string with zeros to given width"
 public :: str_split !@pyapi kind=function ret=type(strvec_t) args=s:character:intent(in),sep:character:intent(in):optional desc="split into string vector"
 public :: str_join !@pyapi kind=function ret=character args=sep:character:intent(in),items:type(strvec_t):intent(in) desc="join string vector with separator"
 public :: str_count !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="count non-overlapping occurrences"
@@ -2745,6 +2746,30 @@ contains
             out = acc
          end if
       end function str_replace
+
+      function str_zfill(s, width) result(out)
+         character(len=*), intent(in) :: s
+         integer, intent(in) :: width
+         character(len=:), allocatable :: out
+         character(len=:), allocatable :: t
+         character(len=1) :: sign
+         integer :: n, w
+         t = trim(s)
+         n = len(t)
+         w = max(width, n)
+         if (n >= 1 .and. (t(1:1) == "+" .or. t(1:1) == "-")) then
+            sign = t(1:1)
+            if (w <= n) then
+               out = t
+            else
+               out = sign // repeat("0", w - n) // t(2:)
+            end if
+         else if (w <= n) then
+            out = t
+         else
+            out = repeat("0", w - n) // t
+         end if
+      end function str_zfill
 
       subroutine append_strvec(items, tok)
          type(strvec_t), intent(inout) :: items

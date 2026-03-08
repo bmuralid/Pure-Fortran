@@ -3481,7 +3481,7 @@ def detect_needed_helpers(tree):
                 needed.add("py_str")
             if (
                 isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper"}
+                and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "split", "join"}
             ):
                 if node.func.attr == "strip":
                     needed.add("str_strip")
@@ -3491,8 +3491,16 @@ def detect_needed_helpers(tree):
                     needed.add("str_rstrip")
                 elif node.func.attr == "lower":
                     needed.add("to_lower")
-                else:
+                elif node.func.attr == "upper":
                     needed.add("to_upper")
+                elif node.func.attr == "replace":
+                    needed.add("str_replace")
+                elif node.func.attr == "zfill":
+                    needed.add("str_zfill")
+                elif node.func.attr == "split":
+                    needed.add("str_split")
+                else:
+                    needed.add("str_join")
             self.generic_visit(node)
 
         def visit_Set(self, node):
@@ -6369,12 +6377,17 @@ class translator(ast.NodeVisitor):
                 return "char"
             if (
                 isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper"}
-                and len(node.args) <= 1
+                and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "join"}
             ):
                 bk = self._expr_kind(node.func.value)
                 if bk == "char":
                     return "char"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "split"
+                and len(node.args) <= 1
+            ):
+                return None
             if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
                 return self._expr_kind(node.func.value)
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
@@ -9376,10 +9389,14 @@ class translator(ast.NodeVisitor):
             ):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
-                if attr in {"strip", "lstrip", "rstrip", "lower", "upper"}:
-                    if len(node.args) > 1:
+                if attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "split", "join"}:
+                    if attr in {"replace"} and len(node.args) not in {2, 3}:
+                        raise NotImplementedError("replace() expects 2 or 3 arguments")
+                    if attr in {"zfill", "join"} and len(node.args) != 1:
+                        raise NotImplementedError(f"{attr}() expects exactly one argument")
+                    if attr in {"strip", "lstrip", "rstrip", "lower", "upper", "split"} and len(node.args) > 1:
                         raise NotImplementedError(f"{attr}() supports at most one argument")
-                    arg0 = self.expr(node.args[0]) if len(node.args) == 1 else None
+                    arg0 = self.expr(node.args[0]) if len(node.args) >= 1 else None
                     if attr == "strip":
                         return f"str_strip({base_expr}, {arg0})" if arg0 is not None else f"str_strip({base_expr})"
                     if attr == "lstrip":
@@ -9388,7 +9405,16 @@ class translator(ast.NodeVisitor):
                         return f"str_rstrip({base_expr}, {arg0})" if arg0 is not None else f"str_rstrip({base_expr})"
                     if attr == "lower":
                         return f"to_lower({base_expr})"
-                    return f"to_upper({base_expr})"
+                    if attr == "upper":
+                        return f"to_upper({base_expr})"
+                    if attr == "replace":
+                        arg1 = self.expr(node.args[1])
+                        return f"str_replace({base_expr}, {arg0}, {arg1})"
+                    if attr == "zfill":
+                        return f"str_zfill({base_expr}, int({arg0}))"
+                    if attr == "split":
+                        return f"str_split({base_expr}, {arg0})" if arg0 is not None else f"str_split({base_expr})"
+                    return f"str_join({base_expr}, {arg0})"
                 if attr == "sum":
                     axis_node = None
                     keepdims = False
@@ -11711,11 +11737,16 @@ class translator(ast.NodeVisitor):
                 return "py_ctime()"
             if (
                 isinstance(node.func, ast.Attribute)
-                and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper"}
-                and len(node.args) <= 1
+                and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "split", "join"}
             ):
                 base = self.expr(node.func.value)
-                arg0 = self.expr(node.args[0]) if len(node.args) == 1 else None
+                if node.func.attr in {"replace"} and len(node.args) not in {2, 3}:
+                    raise NotImplementedError("replace() expects 2 or 3 arguments")
+                if node.func.attr in {"zfill", "join"} and len(node.args) != 1:
+                    raise NotImplementedError(f"{node.func.attr}() expects exactly one argument")
+                if node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "split"} and len(node.args) > 1:
+                    raise NotImplementedError(f"{node.func.attr}() supports at most one argument")
+                arg0 = self.expr(node.args[0]) if len(node.args) >= 1 else None
                 if node.func.attr == "strip":
                     return f"str_strip({base}, {arg0})" if arg0 is not None else f"str_strip({base})"
                 if node.func.attr == "lstrip":
@@ -11724,7 +11755,16 @@ class translator(ast.NodeVisitor):
                     return f"str_rstrip({base}, {arg0})" if arg0 is not None else f"str_rstrip({base})"
                 if node.func.attr == "lower":
                     return f"to_lower({base})"
-                return f"to_upper({base})"
+                if node.func.attr == "upper":
+                    return f"to_upper({base})"
+                if node.func.attr == "replace":
+                    arg1 = self.expr(node.args[1])
+                    return f"str_replace({base}, {arg0}, {arg1})"
+                if node.func.attr == "zfill":
+                    return f"str_zfill({base}, int({arg0}))"
+                if node.func.attr == "split":
+                    return f"str_split({base}, {arg0})" if arg0 is not None else f"str_split({base})"
+                return f"str_join({base}, {arg0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -17822,6 +17862,14 @@ class translator(ast.NodeVisitor):
         if not isinstance(node.value, ast.Call):
             raise NotImplementedError("only call expressions supported")
         c = node.value
+
+        # Standalone string-method calls have no side effects in Python
+        # (strings are immutable), so when result is unused treat as no-op.
+        if (
+            isinstance(c.func, ast.Attribute)
+            and c.func.attr in {"lower", "upper", "strip", "lstrip", "rstrip", "replace", "zfill", "split", "join"}
+        ):
+            return
 
         cmd_node = _shell_command_node(c)
         if cmd_node is not None:
