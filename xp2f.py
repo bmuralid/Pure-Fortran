@@ -43,6 +43,7 @@ from fortran_scan import (
 SHOW_TRANSLATION_NOTES = False
 AUTO_ELEMENTAL = False
 SHOW_NOOP_NOTES = False
+PERCENT_FLOAT_INT_FORMAT = False
 
 
 def run_capture(cmd, tee=False, stream_line_filter=None):
@@ -571,6 +572,59 @@ def _strict_ifexp_diagnostics(src_text):
     return diags
 
 
+def _shell_command_node(call_node):
+    """Return command AST node for supported shell-exec calls, else None."""
+    if not isinstance(call_node, ast.Call):
+        return None
+    fn = call_node.func
+    # os.system(cmd)
+    if (
+        isinstance(fn, ast.Attribute)
+        and fn.attr == "system"
+        and isinstance(fn.value, ast.Name)
+        and fn.value.id == "os"
+    ):
+        return call_node.args[0] if len(call_node.args) >= 1 else None
+    # subprocess.run/call/check_call/Popen(...)
+    if (
+        isinstance(fn, ast.Attribute)
+        and fn.attr in {"run", "call", "check_call", "Popen"}
+        and isinstance(fn.value, ast.Name)
+        and fn.value.id == "subprocess"
+    ):
+        if len(call_node.args) >= 1:
+            return call_node.args[0]
+        for kw in call_node.keywords:
+            if kw.arg == "args":
+                return kw.value
+    return None
+
+
+def _strict_shell_exec_diagnostics(src_text):
+    diags = []
+    tree = ast.parse(src_text)
+    lines = src_text.splitlines()
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        if _shell_command_node(n) is None:
+            continue
+        ln = getattr(n, "lineno", 1)
+        col = getattr(n, "col_offset", 0) + 1
+        seg = ast.get_source_segment(src_text, n)
+        snippet = seg.strip() if isinstance(seg, str) else (lines[ln - 1].strip() if 1 <= ln <= len(lines) else "shell call")
+        diags.append({
+            "line": ln,
+            "col": col,
+            "rule": "shell_exec_call",
+            "message": "shell execution call used (os.system/subprocess.*); strict mode flags non-portable side-effect process execution",
+            "snippet": snippet,
+            "suggestion": "replace with pure computation or isolate behind a platform-specific wrapper",
+        })
+    diags.sort(key=lambda d: (d["line"], d["col"]))
+    return diags
+
+
 def _strict_tuple_output_rank_mismatch_diagnostics(src_text):
     diags = []
     try:
@@ -886,6 +940,7 @@ def _run_strict_check(src_text, path_label):
     diags.extend(_strict_type_rebind_diagnostics(src_text))
     diags.extend(_strict_lambda_diagnostics(src_text))
     diags.extend(_strict_ifexp_diagnostics(src_text))
+    diags.extend(_strict_shell_exec_diagnostics(src_text))
     diags.extend(_strict_tuple_output_rank_mismatch_diagnostics(src_text))
     diags.sort(key=lambda d: (d["line"], d["col"]))
     if not diags:
@@ -11913,6 +11968,9 @@ class translator(ast.NodeVisitor):
                         return "0"
                 if node.func.attr in {"add_subplot", "add_axes", "subplot", "gca", "gcf", "twinx", "twiny"}:
                     return "0"
+            cmd_node = _shell_command_node(node)
+            if cmd_node is not None:
+                return f"exec_cmd_status({self.expr(cmd_node)})"
             call_txt = ast.unparse(node) if hasattr(ast, "unparse") else ast.dump(node, include_attributes=False)
             raise NotImplementedError(f"unsupported call: {call_txt}")
         if isinstance(node, ast.Attribute):
@@ -14075,6 +14133,18 @@ class translator(ast.NodeVisitor):
                 self.python_set_vars.discard(t.id)
         if isinstance(t, ast.Name):
             t = ast.Name(id=self._aliased_name(t.id), ctx=t.ctx)
+
+        cmd_node = _shell_command_node(v)
+        if cmd_node is not None:
+            lhs = self.expr(t)
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: exitstat_cmd")
+            self.o.w(f"call execute_command_line({self.expr(cmd_node)}, wait=.true., exitstat=exitstat_cmd)")
+            self.o.w(f"{lhs} = exitstat_cmd")
+            self.o.pop()
+            self.o.w("end block")
+            return
 
         def _is_rng_source(src):
             if (
@@ -17753,6 +17823,11 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("only call expressions supported")
         c = node.value
 
+        cmd_node = _shell_command_node(c)
+        if cmd_node is not None:
+            self.o.w(f"call execute_command_line({self.expr(cmd_node)})")
+            return
+
         # Common side-effect-only calls in Burkardt-style drivers.
         # Keep as no-ops in transpiled Fortran.
         if isinstance(c.func, ast.Name) and c.func.id == "timestamp":
@@ -18162,20 +18237,29 @@ class translator(ast.NodeVisitor):
                 cl = code.lower()
                 if cl in {"d", "i", "o", "u", "x"}:
                     if width is not None:
-                        items.append(("desc", f"i{width}", an))
+                        items.append(("desc", f"i{width}", an, False))
                     else:
-                        items.append(("desc", "i0", an))
+                        items.append(("desc", "i0", an, False))
                 elif cl in {"e", "f", "g"}:
-                    if width is not None and prec is not None:
-                        items.append(("desc", f"{cl}{width}.{prec}", an))
-                    elif width is not None:
-                        # Width-only float descriptors are not directly portable
-                        # to standard Fortran edit descriptors; use g0.
-                        items.append(("desc", "g0", an))
+                    ak = self._expr_kind(an)
+                    ar = self._rank_expr(an)
+                    int_scalar = (ak == "int" and ar == 0)
+                    if int_scalar and PERCENT_FLOAT_INT_FORMAT:
+                        if width is not None:
+                            items.append(("desc", f"i{width}", an, False))
+                        else:
+                            items.append(("desc", "i0", an, False))
                     else:
-                        items.append(("desc", "g0", an))
+                        if width is not None and prec is not None:
+                            items.append(("desc", f"{cl}{width}.{prec}", an, int_scalar))
+                        elif width is not None:
+                            # Width-only float descriptors are not directly portable
+                            # to standard Fortran edit descriptors; use g0.
+                            items.append(("desc", "g0", an, int_scalar))
+                        else:
+                            items.append(("desc", "g0", an, int_scalar))
                 elif cl in {"c", "r", "s"}:
-                    items.append(("desc", "a", an))
+                    items.append(("desc", "a", an, False))
                 else:
                     raise NotImplementedError(f"unsupported old-style print format code '%{code}'")
                 i = j + 1
@@ -18194,7 +18278,10 @@ class translator(ast.NodeVisitor):
                     if prev_desc:
                         fmt_parts.append("1x")
                     fmt_parts.append(ent[1])
-                    write_args.append(self.expr(ent[2]))
+                    expr_txt = self.expr(ent[2])
+                    if len(ent) >= 4 and bool(ent[3]):
+                        expr_txt = f"real({expr_txt}, kind=dp)"
+                    write_args.append(expr_txt)
                     prev_desc = True
             if not fmt_parts:
                 fmt_parts = ["' '"]
@@ -18799,6 +18886,13 @@ def _emit_local_function(
         for st in fn.body:
             for n in ast.walk(st):
                 if (
+                    isinstance(n, ast.Attribute)
+                    and n.attr == "T"
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == nm
+                ):
+                    rr = max(rr, 2)
+                if (
                     isinstance(n, ast.BinOp)
                     and isinstance(n.op, ast.MatMult)
                     and (_node_uses_name(n.left, nm) or _node_uses_name(n.right, nm))
@@ -18807,6 +18901,10 @@ def _emit_local_function(
                 if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
                     left_has = _node_uses_name(n.left, nm)
                     right_has = _node_uses_name(n.right, nm)
+                    if left_has and isinstance(n.right, ast.Call) and isinstance(n.right.func, ast.Name) and n.right.func.id == "matmul":
+                        rr = max(rr, 1)
+                    if right_has and isinstance(n.left, ast.Call) and isinstance(n.left.func, ast.Name) and n.left.func.id == "matmul":
+                        rr = max(rr, 1)
                     if left_has and isinstance(n.right, ast.Name) and _name_in_matmul(n.right.id):
                         rr = max(rr, 1)
                     if right_has and isinstance(n.left, ast.Name) and _name_in_matmul(n.left.id):
@@ -19607,6 +19705,13 @@ def _emit_local_function(
         for st in fn.body:
             for n in ast.walk(st):
                 if (
+                    isinstance(n, ast.Attribute)
+                    and n.attr == "T"
+                    and isinstance(n.value, ast.Name)
+                    and n.value.id == nm
+                ):
+                    rr = max(rr, 2)
+                if (
                     isinstance(n, ast.BinOp)
                     and isinstance(n.op, ast.MatMult)
                     and (_name_used(n.left, nm) or _name_used(n.right, nm))
@@ -19615,6 +19720,10 @@ def _emit_local_function(
                 if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
                     left_has = _name_used(n.left, nm)
                     right_has = _name_used(n.right, nm)
+                    if left_has and isinstance(n.right, ast.Call) and isinstance(n.right.func, ast.Name) and n.right.func.id == "matmul":
+                        rr = max(rr, 1)
+                    if right_has and isinstance(n.left, ast.Call) and isinstance(n.left.func, ast.Name) and n.left.func.id == "matmul":
+                        rr = max(rr, 1)
                     if left_has and isinstance(n.right, ast.Name) and _pre_arg_rank(n.right.id) > 0:
                         rr = max(rr, 1)
                     if right_has and isinstance(n.left, ast.Name) and _pre_arg_rank(n.left.id) > 0:
@@ -22762,7 +22871,61 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
                 auto_added.append(lapack_s)
         else:
             missing_modules.append(("lapack_d_external", lapack_s))
+    # When linking with cached python.o, LAPACK references inside python_mod
+    # may still need lapack_d at link time even if current source doesn't call
+    # linalg wrappers directly.
+    if any(Path(h).name.lower() == "python.f90" for h in helper_files):
+        lapack_src = Path("lapack_d.f90")
+        lapack_s = str(lapack_src)
+        if lapack_src.exists() and lapack_s not in helper_files:
+            helper_files.append(lapack_s)
+            auto_added.append(lapack_s)
     return helper_files, auto_added, missing_modules
+
+
+def _prepare_helper_link_inputs(helper_files, compiler_parts):
+    """Return link inputs for helpers, compiling cached helper objects when needed.
+
+    For helper Fortran sources, reuse <basename>.o in current directory when present
+    together with required .mod files. Otherwise compile once to that object.
+    """
+    link_inputs = []
+    for hf in helper_files:
+        hp = Path(hf)
+        if hp.suffix.lower() not in {".f90", ".f95", ".f03", ".f08", ".f", ".for"}:
+            link_inputs.append(str(hp))
+            continue
+        obj = Path(hp.name).with_suffix(".o")
+        src_text = hp.read_text(encoding="utf-8", errors="ignore")
+        mods = sorted(_modules_defined_in_source(src_text))
+        mod_files = [Path(f"{m}.mod") for m in mods]
+        cache_ok = obj.exists() and all(mf.exists() for mf in mod_files)
+        if cache_ok:
+            try:
+                src_m = hp.stat().st_mtime
+                obj_m = obj.stat().st_mtime
+                mod_mins = min(mf.stat().st_mtime for mf in mod_files) if mod_files else obj_m
+                if obj_m < src_m or mod_mins < src_m:
+                    cache_ok = False
+            except OSError:
+                cache_ok = False
+        if cache_ok:
+            link_inputs.append(str(obj))
+            continue
+        helper_cmd = compiler_parts + ["-c", str(hp), "-o", str(obj)]
+        print("Build helper:", " ".join(helper_cmd))
+        hcp = subprocess.run(helper_cmd, capture_output=True, text=True)
+        if hcp.returncode != 0:
+            return None, hcp, helper_cmd
+        link_inputs.append(str(obj))
+    return link_inputs, None, None
+
+
+def _tree_uses_shell_exec(tree):
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and _shell_command_node(n) is not None:
+            return True
+    return False
 
 
 def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False):
@@ -22915,6 +23078,8 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
     needed = detect_needed_helpers(helper_scan_tree)
+    if _tree_uses_shell_exec(helper_scan_tree):
+        needed.add("exec_cmd_status")
     list_counts = build_list_count_map(effective_tree)
     if list_counts:
         needed.add("print_int_list")
@@ -23001,180 +23166,6 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
                     user_class_types=user_class_types,
                 )
                 used_flat_fallback = True
-
-    if stem == "zero_muller":
-        f90 = re.sub(
-            r"(pure\s+function\s+func0[12]\(x\)\s+result\(fx\)\s*\n)\s*real\(kind=dp\), intent\(in\) :: x\s*\n\s*real\(kind=dp\) :: fx",
-            r"\1   complex(kind=dp), intent(in) :: x\n   complex(kind=dp) :: fx",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        f90 = re.sub(
-            r"(function\s+func03\(z\)\s+result\(fz\)\s*\n)\s*complex\(kind=dp\), intent\(in\) :: z\s*\n\s*integer :: fz",
-            r"\1   complex(kind=dp), intent(in) :: z\n   complex(kind=dp) :: fz",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        f90 = re.sub(
-            r"(function\s+func03\(z\)\s+result\(fz\)[\s\S]*?\n)\s*real\(kind=dp\)\s*::\s*me,\s*mo,\s*of,\s*x\s*\n\s*complex\(kind=dp\)\s*::\s*a,\s*b,\s*eps,\s*eta,\s*ok,\s*one",
-            r"\1   real(kind=dp) :: me, mo, x\n   complex(kind=dp) :: a, b, eps, eta, of, ok, one",
-            f90,
-            flags=re.IGNORECASE,
-        )
-
-    if stem == "cg_rc":
-        # cg_rc reverse-communication control/state values are scalars.
-        # Keep vector work arrays as rank-1 and force scalar control args/outs.
-        f90 = re.sub(r"\binteger,\s*intent\(in\)\s*::\s*job\(:\)", "integer, intent(in) :: job", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\binteger,\s*intent\(in\)\s*::\s*iterate\(:\)", "integer, intent(in) :: iterate", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*intent\(in\)\s*::\s*rho\(:\)", "real(kind=dp), intent(in) :: rho", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*intent\(in\)\s*::\s*rho_old\(:\)", "real(kind=dp), intent(in) :: rho_old", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\binteger,\s*intent\(in\)\s*::\s*rlbl\(:\)", "integer, intent(in) :: rlbl", f90, flags=re.IGNORECASE)
-
-        f90 = re.sub(r"\binteger,\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_6\(:\)", "integer, intent(out) :: cg_rc_out_6", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_7\(:\)", "integer, intent(out) :: cg_rc_out_7", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_8\(:\)", "real(kind=dp), intent(out) :: cg_rc_out_8", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_9\(:\)", "real(kind=dp), intent(out) :: cg_rc_out_9", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\binteger,\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_10\(:\)", "integer, intent(out) :: cg_rc_out_10", f90, flags=re.IGNORECASE)
-
-        f90 = re.sub(r"\binteger,\s*allocatable\s*::\s*job\(:\)", "integer :: job", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\binteger,\s*allocatable\s*::\s*rlbl\(:\)", "integer :: rlbl", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*iterate\(:\)", "integer :: iterate", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*rho\(:\)", "real(kind=dp) :: rho", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*rho_old\(:\)", "real(kind=dp) :: rho_old", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\bwathen\(\s*nx\s*,\s*ny\s*,\s*real\(\s*n\s*,\s*kind=dp\s*\)\s*\)", "wathen(nx, ny, n)", f90, flags=re.IGNORECASE)
-        # cg_rc mutates iterative state and work vectors.
-        for _nm in ("x", "r", "z", "p", "q"):
-            f90 = re.sub(
-                rf"\breal\(kind=dp\),\s*intent\(in\)\s*::\s*{_nm}\(:\)",
-                f"real(kind=dp), intent(inout) :: {_nm}(:)",
-                f90,
-                flags=re.IGNORECASE,
-            )
-        for _nm in ("job", "iterate", "rho", "rho_old", "rlbl"):
-            f90 = re.sub(
-                rf"\b(integer|real\(kind=dp\)),\s*intent\(in\)\s*::\s*{_nm}\b",
-                lambda m: f"{m.group(1)}, intent(inout) :: {_nm}",
-                f90,
-                flags=re.IGNORECASE,
-            )
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*alpha\(:\)", "real(kind=dp) :: alpha", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*beta\(:\)", "real(kind=dp) :: beta", f90, flags=re.IGNORECASE)
-        # Rewrite cg_rc as true reverse-communication subroutine with only
-        # in/inout dummies (drop tuple-return lowering outputs).
-        f90 = re.sub(
-            r"pure subroutine cg_rc\(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl,\s*&\s*\n\s*&\s*cg_rc_out_1.*?cg_rc_out_10\)",
-            "pure subroutine cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)",
-            f90,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_1\(:\)", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_2\(:\)", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_3\(:\)", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_4\(:\)", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_5\(:\)", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*integer, intent\(out\) :: cg_rc_out_6", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*integer, intent\(out\) :: cg_rc_out_7", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*real\(kind=dp\), intent\(out\) :: cg_rc_out_8", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*real\(kind=dp\), intent\(out\) :: cg_rc_out_9", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(r"\n\s*integer, intent\(out\) :: cg_rc_out_10", "", f90, flags=re.IGNORECASE)
-        f90 = re.sub(
-            r"\n\s*cg_rc_out_1 = x\s*\n\s*cg_rc_out_2 = r\s*\n\s*cg_rc_out_3 = z\s*\n\s*cg_rc_out_4 = p\s*\n\s*cg_rc_out_5 = q\s*\n\s*cg_rc_out_6 = job\s*\n\s*cg_rc_out_7 = iterate\s*\n\s*cg_rc_out_8 = rho\s*\n\s*cg_rc_out_9 = rho_old\s*\n\s*cg_rc_out_10 = rlbl",
-            "",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        # Avoid aliasing same actual arguments as both INOUT and OUT in
-        # tuple-return lowered cg_rc calls.
-        f90 = re.sub(
-            r"integer :: tmp_out_6_(\d+)\s*\n\s*real\(kind=dp\) :: tmp_out_8_\1\s*\n\s*integer :: tmp_out_10_\1",
-            r"integer :: tmp_out_6_\1\n         integer :: tmp_out_7_\1\n         real(kind=dp) :: tmp_out_8_\1\n         real(kind=dp) :: tmp_out_9_\1\n         integer :: tmp_out_10_\1",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        f90 = re.sub(
-            r",\s*tmp_out_6_(\d+),\s*iterate,\s*tmp_out_8_\1,\s*rho_old,\s*&\s*\n\s*&\s*tmp_out_10_\1\)",
-            r", tmp_out_6_\1, tmp_out_7_\1, tmp_out_8_\1, tmp_out_9_\1, &\n            & tmp_out_10_\1)",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        f90 = re.sub(
-            r"job = tmp_out_6_(\d+)\s*\n\s*rho = tmp_out_8_\1\s*\n\s*rlbl = tmp_out_10_\1",
-            r"job = tmp_out_6_\1\n         iterate = tmp_out_7_\1\n         rho = tmp_out_8_\1\n         rho_old = tmp_out_9_\1\n         rlbl = tmp_out_10_\1",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        f90 = re.sub(
-            r"\s*block\s*\n\s*integer :: tmp_out_6_\d+\s*\n\s*integer :: tmp_out_7_\d+\s*\n\s*real\(kind=dp\) :: tmp_out_8_\d+\s*\n\s*real\(kind=dp\) :: tmp_out_9_\d+\s*\n\s*integer :: tmp_out_10_\d+\s*\n\s*call cg_rc\(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl, x, &\s*\n\s*& r, z, p, q, tmp_out_6_\d+, tmp_out_7_\d+, tmp_out_8_\d+, tmp_out_9_\d+, &\s*\n\s*& tmp_out_10_\d+\)\s*\n\s*job = tmp_out_6_\d+\s*\n\s*iterate = tmp_out_7_\d+\s*\n\s*rho = tmp_out_8_\d+\s*\n\s*rho_old = tmp_out_9_\d+\s*\n\s*rlbl = tmp_out_10_\d+\s*\n\s*end block",
-            "\n      call cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        # Final robust line-based cleanup for cg_rc tuple-return lowering artifacts.
-        _src_lines = f90.splitlines()
-        _dst_lines = []
-        _i = 0
-        while _i < len(_src_lines):
-            _ln = _src_lines[_i]
-            _s = _ln.strip()
-            if re.match(r"pure\s+subroutine\s+cg_rc\(", _s, flags=re.IGNORECASE):
-                _dst_lines.append("pure subroutine cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)")
-                if ")" in _src_lines[_i]:
-                    _i += 1
-                else:
-                    _i += 1
-                    while _i < len(_src_lines) and ")" not in _src_lines[_i]:
-                        _i += 1
-                    if _i < len(_src_lines):
-                        _i += 1
-                continue
-            if re.search(r"::\s*cg_rc_out_\d+\b", _ln):
-                _i += 1
-                continue
-            if re.search(r"\bcg_rc_out_\d+\s*=", _ln):
-                _i += 1
-                continue
-            if re.search(r"::\s*tmp_out_(6|7|8|9|10)_\d+\b", _ln):
-                _i += 1
-                continue
-            if re.search(r"\b(job|iterate|rho|rho_old|rlbl)\s*=\s*tmp_out_(6|7|8|9|10)_\d+\b", _ln):
-                _i += 1
-                continue
-            if ("call cg_rc(" in _ln) and ("tmp_out_6_" in "".join(_src_lines[_i:_i + 6]) or "cg_rc_out_1" in "".join(_src_lines[_i:_i + 6])):
-                _indent = re.match(r"\s*", _ln).group(0)
-                _dst_lines.append(_indent + "call cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)")
-                _i += 1
-                while _i < len(_src_lines) and ")" not in _src_lines[_i]:
-                    _i += 1
-                if _i < len(_src_lines):
-                    _i += 1
-                continue
-            if _s == "block":
-                _look = "".join(_src_lines[_i + 1:min(len(_src_lines), _i + 8)])
-                if ("tmp_out_6_" in _look) and ("call cg_rc(" in _look):
-                    _i += 1
-                    continue
-            if _s == "end block":
-                _lookb = "".join(_src_lines[max(0, _i - 10):_i])
-                if "call cg_rc(" in _lookb and "tmp_out_6_" in _lookb:
-                    _i += 1
-                    continue
-            _dst_lines.append(_ln)
-            _i += 1
-        f90 = "\n".join(_dst_lines)
-        # Ensure JOB-dispatch branch is present after simplified cg_rc call blocks.
-        f90 = re.sub(
-            r"(do while \(\.true\.\)\s*\n\s*call cg_rc\([^\n]*\)\s*\n)(\s*q\(1:n\)\s*=\s*[^\n]*\n\s*q\(1:\(n - 1\)\)\s*=\s*[^\n]*\n\s*q\(2:n\)\s*=\s*[^\n]*\n)\s*else",
-            r"\1      if ((job == 1)) then\n\2      else",
-            f90,
-            flags=re.IGNORECASE,
-        )
-        f90 = re.sub(
-            r"(do while \(\.true\.\)\s*\n\s*call cg_rc\([^\n]*\)\s*\n)\s*(?!if\s*\(\(job == 1\)\)\s*then)([^\n]+\n)\s*else",
-            r"\1      if ((job == 1)) then\n\2      else",
-            f90,
-            flags=re.IGNORECASE,
-        )
 
     f90 = remove_redundant_tail_returns(f90)
     f90 = simplify_size_dim_for_rank1_arrays(f90)
@@ -23390,6 +23381,12 @@ def main():
     ap.add_argument("--tee", action="store_true", help="stream output while running transpiled Fortran")
     ap.add_argument("--tee-orig", action="store_true", help="print original input source text")
     ap.add_argument("--tee-both", action="store_true", help="stream output while running both Python and Fortran")
+    ap.add_argument("--autofix", action="store_true", help="on compile/run failure, invoke xautofix.py on generated Fortran and retry")
+    ap.add_argument(
+        "--percent-float-int-format",
+        action="store_true",
+        help="for old-style %%f/%%e/%%g with integer args, emit integer descriptors instead of coercing args to real",
+    )
     ap.add_argument("--time", action="store_true", help="time transpile/compile/run stages (implies --run)")
     ap.add_argument("--time-both", action="store_true", help="time both original Python run and transpiled Fortran run (implies --run)")
     ap.add_argument("--comment", action="store_true", help="emit generated procedure/argument comments")
@@ -23399,6 +23396,8 @@ def main():
         help='compiler command, e.g. "gfortran -O2 -Wall"',
     )
     args = ap.parse_args()
+    global PERCENT_FLOAT_INT_FORMAT
+    PERCENT_FLOAT_INT_FORMAT = bool(args.percent_float_int_format)
     if any(ch in args.input_py for ch in "*?[]"):
         matches = sorted(glob.glob(args.input_py, recursive=True))
         matches = [m for m in matches if Path(m).is_file()]
@@ -23494,6 +23493,44 @@ def main():
     timings = {}
     t0_total = time.perf_counter()
     py_run = None
+    raw_build_status = "not_run"
+    raw_run_status = "not_run"
+    autofix_compile_status = "not_run"
+    autofix_runtime_status = "not_run"
+    final_build_status = "not_run"
+    final_run_status = "not_run"
+
+    def _emit_autofix_report():
+        if not args.autofix:
+            return
+        print("")
+        print("Autofix report:")
+        print(f"  raw_build: {raw_build_status}")
+        print(f"  raw_run: {raw_run_status}")
+        print(f"  autofix_compile: {autofix_compile_status}")
+        print(f"  autofix_runtime: {autofix_runtime_status}")
+        print(f"  final_build: {final_build_status}")
+        print(f"  final_run: {final_run_status}")
+
+    def _run_xautofix(sources, runtime=False):
+        xaf = Path(__file__).with_name("xautofix.py")
+        if not xaf.exists():
+            print(f"Autofix: FAIL (missing tool: {xaf})")
+            return 1
+        cmd = [sys.executable, str(xaf)]
+        if runtime:
+            cmd.append("--runtime")
+        cmd += [str(s) for s in sources]
+        cmd += ["--in-place"]
+        if args.tee:
+            cmd.append("--tee-both")
+        print("Autofix:", " ".join(cmd))
+        cp = subprocess.run(cmd, capture_output=True, text=True)
+        if cp.stdout.strip():
+            print(cp.stdout.rstrip())
+        if cp.stderr.strip():
+            print(cp.stderr.rstrip())
+        return cp.returncode
 
     def _emit_timing_summary():
         if not args.time:
@@ -23526,13 +23563,19 @@ def main():
         stage_w = max(len("stage"), max(len(name) for name, _ in rows))
         sec_vals = [f"{val:.6f}" for _name, val in rows]
         sec_w = max(len("seconds"), max(len(s) for s in sec_vals))
-        ratio_hdr = "ratio(vs python run)"
-        ratio_vals = [_ratio(val) for _name, val in rows]
-        ratio_w = max(len(r) for r in ratio_vals)
-        print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    {ratio_hdr}")
-        for name, val in rows:
-            rtxt = _ratio(val)
-            print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}    {rtxt:>{ratio_w}}")
+        show_ratio = "python_run" in timings
+        if show_ratio:
+            ratio_hdr = "ratio(vs python run)"
+            ratio_vals = [_ratio(val) for _name, val in rows]
+            ratio_w = max(len(ratio_hdr), max(len(r) for r in ratio_vals))
+            print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}    {ratio_hdr:>{ratio_w}}")
+            for name, val in rows:
+                rtxt = _ratio(val)
+                print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}    {rtxt:>{ratio_w}}")
+        else:
+            print(f"  {'stage':<{stage_w}}  {'seconds':>{sec_w}}")
+            for name, val in rows:
+                print(f"  {name:<{stage_w}}  {val:>{sec_w}.6f}")
 
     if args.time_both or args.run_both:
         py_cmd = [sys.executable, args.input_py]
@@ -23548,6 +23591,7 @@ def main():
             if (not py_live) and py_err.strip():
                 print(py_err.rstrip())
             _emit_timing_summary()
+            _emit_autofix_report()
             return py_rc
         print("Run (python): PASS")
         if (not py_live) and py_out.strip():
@@ -23626,6 +23670,7 @@ def main():
             timings["transpile"] = time.perf_counter() - t0_transpile
             print(f"Transpile: FAIL ({_format_transpile_error(e, src_text)})")
             _emit_timing_summary()
+            _emit_autofix_report()
             return 1
         try:
             out, partial_report = transpile_partial_file(
@@ -23642,6 +23687,7 @@ def main():
             timings["transpile"] = time.perf_counter() - t0_transpile
             print(f"Transpile: FAIL ({_format_transpile_error(pe, src_text)})")
             _emit_timing_summary()
+            _emit_autofix_report()
             return 1
     timings["transpile"] = time.perf_counter() - t0_transpile
     print(f"wrote {out}")
@@ -23685,24 +23731,68 @@ def main():
                 else:
                     print(f"  module '{mod}' required; no helper-file naming rule available")
             _emit_timing_summary()
+            _emit_autofix_report()
             return 1
-        cmd = compiler_parts + [*helper_files, str(out)]
+        t0_build = time.perf_counter()
+        helper_link_inputs, helper_cp, helper_cmd = _prepare_helper_link_inputs(helper_files, compiler_parts)
+        if helper_cp is not None:
+            print(f"Build: FAIL (helper compile exit {helper_cp.returncode})")
+            if helper_cp.stdout.strip():
+                print(helper_cp.stdout.rstrip())
+            if helper_cp.stderr.strip():
+                print(helper_cp.stderr.rstrip())
+            timings["compile"] = time.perf_counter() - t0_build
+            _emit_timing_summary()
+            _emit_autofix_report()
+            return helper_cp.returncode
+        cmd = compiler_parts + [*(helper_link_inputs or []), str(out)]
         if args.run:
             exe = out.with_suffix(".exe")
             cmd = cmd + ["-o", str(exe)]
         print("Build:", " ".join(cmd))
-        t0_build = time.perf_counter()
         cp = subprocess.run(cmd, capture_output=True, text=True)
         timings["compile"] = time.perf_counter() - t0_build
         if cp.returncode != 0:
+            raw_build_status = "fail"
             print(f"Build: FAIL (exit {cp.returncode})")
             if cp.stdout.strip():
                 print(cp.stdout.rstrip())
             if cp.stderr.strip():
                 print(cp.stderr.rstrip())
-            _emit_timing_summary()
-            return cp.returncode
-        print("Build: PASS")
+            if args.autofix:
+                autofix_compile_status = "attempted"
+                af_rc = _run_xautofix([out, *helper_files], runtime=False)
+                if af_rc == 0:
+                    autofix_compile_status = "pass"
+                    print("Build: RETRY", " ".join(cmd))
+                    t0_build_retry = time.perf_counter()
+                    cp = subprocess.run(cmd, capture_output=True, text=True)
+                    timings["compile"] += time.perf_counter() - t0_build_retry
+                    if cp.returncode != 0:
+                        final_build_status = "fail"
+                        print(f"Build: FAIL (exit {cp.returncode})")
+                        if cp.stdout.strip():
+                            print(cp.stdout.rstrip())
+                        if cp.stderr.strip():
+                            print(cp.stderr.rstrip())
+                        _emit_timing_summary()
+                        _emit_autofix_report()
+                        return cp.returncode
+                    print("Build: PASS")
+                else:
+                    autofix_compile_status = "fail"
+                    final_build_status = "fail"
+                    _emit_timing_summary()
+                    _emit_autofix_report()
+                    return cp.returncode
+            else:
+                _emit_timing_summary()
+                _emit_autofix_report()
+                return cp.returncode
+        else:
+            raw_build_status = "pass"
+            print("Build: PASS")
+        final_build_status = "pass"
         if args.run:
             t0_run = time.perf_counter()
             rp_rc, rp_out, rp_err, rp_live = run_capture(
@@ -23710,37 +23800,86 @@ def main():
             )
             timings["fortran_run"] = time.perf_counter() - t0_run
             if rp_rc != 0:
+                raw_run_status = "fail"
                 print(f"Run: FAIL (exit {rp_rc})")
                 if (not rp_live) and rp_out.strip():
                     print(_pretty_text(rp_out).rstrip())
                 if (not rp_live) and rp_err.strip():
                     print(_pretty_text(rp_err).rstrip())
-                # Automatic fallback: rebuild with debug checks/backtrace and rerun
-                dbg_flags = debug_flags_for_compiler(compiler_parts[0] if compiler_parts else "")
-                dbg_cmd = compiler_parts + dbg_flags + [*helper_files, str(out), "-o", str(exe)]
-                print("Debug rebuild:", " ".join(dbg_cmd))
-                dbg_cp = subprocess.run(dbg_cmd, capture_output=True, text=True)
-                if dbg_cp.returncode != 0:
-                    print(f"Debug rebuild: FAIL (exit {dbg_cp.returncode})")
-                    if dbg_cp.stdout.strip():
-                        print(dbg_cp.stdout.rstrip())
-                    if dbg_cp.stderr.strip():
-                        print(dbg_cp.stderr.rstrip())
-                else:
-                    print("Debug rebuild: PASS")
-                    dbg_rc, dbg_out, dbg_err, dbg_live = run_capture(
-                        [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None
-                    )
-                    if dbg_rc != 0:
-                        print(f"Debug run: FAIL (exit {dbg_rc})")
+                if args.autofix:
+                    autofix_runtime_status = "attempted"
+                    af_rc = _run_xautofix([*helper_files, out], runtime=True)
+                    if af_rc == 0:
+                        autofix_runtime_status = "pass"
+                        print("Build: RETRY", " ".join(cmd))
+                        t0_build_retry = time.perf_counter()
+                        cp = subprocess.run(cmd, capture_output=True, text=True)
+                        timings["compile"] = timings.get("compile", 0.0) + (time.perf_counter() - t0_build_retry)
+                        if cp.returncode != 0:
+                            final_run_status = "fail"
+                            final_build_status = "fail"
+                            print(f"Build: FAIL (exit {cp.returncode})")
+                            if cp.stdout.strip():
+                                print(cp.stdout.rstrip())
+                            if cp.stderr.strip():
+                                print(cp.stderr.rstrip())
+                            _emit_timing_summary()
+                            _emit_autofix_report()
+                            return rp_rc
+                        print("Build: PASS")
+                        t0_run_retry = time.perf_counter()
+                        rp_rc, rp_out, rp_err, rp_live = run_capture(
+                            [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None
+                        )
+                        timings["fortran_run"] = timings.get("fortran_run", 0.0) + (time.perf_counter() - t0_run_retry)
+                        if rp_rc != 0:
+                            final_run_status = "fail"
+                            print(f"Run: FAIL (exit {rp_rc})")
+                            if (not rp_live) and rp_out.strip():
+                                print(_pretty_text(rp_out).rstrip())
+                            if (not rp_live) and rp_err.strip():
+                                print(_pretty_text(rp_err).rstrip())
+                            _emit_timing_summary()
+                            _emit_autofix_report()
+                            return rp_rc
+                        print("Run: PASS")
                     else:
-                        print("Debug run: PASS")
-                    if (not dbg_live) and dbg_out.strip():
-                        print(_pretty_text(dbg_out).rstrip())
-                    if (not dbg_live) and dbg_err.strip():
-                        print(_pretty_text(dbg_err).rstrip())
-                _emit_timing_summary()
-                return rp_rc
+                        autofix_runtime_status = "fail"
+                        final_run_status = "fail"
+                        _emit_timing_summary()
+                        _emit_autofix_report()
+                        return rp_rc
+                else:
+                    # Automatic fallback: rebuild with debug checks/backtrace and rerun
+                    dbg_flags = debug_flags_for_compiler(compiler_parts[0] if compiler_parts else "")
+                    dbg_cmd = compiler_parts + dbg_flags + [*(helper_link_inputs or []), str(out), "-o", str(exe)]
+                    print("Debug rebuild:", " ".join(dbg_cmd))
+                    dbg_cp = subprocess.run(dbg_cmd, capture_output=True, text=True)
+                    if dbg_cp.returncode != 0:
+                        print(f"Debug rebuild: FAIL (exit {dbg_cp.returncode})")
+                        if dbg_cp.stdout.strip():
+                            print(dbg_cp.stdout.rstrip())
+                        if dbg_cp.stderr.strip():
+                            print(dbg_cp.stderr.rstrip())
+                    else:
+                        print("Debug rebuild: PASS")
+                        dbg_rc, dbg_out, dbg_err, dbg_live = run_capture(
+                            [str(exe)], tee=args.tee, stream_line_filter=_pretty_line if args.pretty else None
+                        )
+                        if dbg_rc != 0:
+                            print(f"Debug run: FAIL (exit {dbg_rc})")
+                        else:
+                            print("Debug run: PASS")
+                        if (not dbg_live) and dbg_out.strip():
+                            print(_pretty_text(dbg_out).rstrip())
+                        if (not dbg_live) and dbg_err.strip():
+                            print(_pretty_text(dbg_err).rstrip())
+                    _emit_timing_summary()
+                    _emit_autofix_report()
+                    return rp_rc
+            else:
+                raw_run_status = "pass"
+                final_run_status = "pass"
             print("Run: PASS")
             if (not rp_live) and rp_out.strip():
                 print(_pretty_text(rp_out).rstrip())
@@ -23783,7 +23922,10 @@ def main():
                         # keep diff compact
                         if dl.startswith("@@"):
                             break
+        elif args.compile:
+            final_run_status = "not_requested"
     _emit_timing_summary()
+    _emit_autofix_report()
     return 0
 
 

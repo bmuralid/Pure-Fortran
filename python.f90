@@ -97,6 +97,7 @@ public :: zeros_logical !@pyapi kind=function ret=logical(:) args=n:integer:inte
 public :: ones_logical !@pyapi kind=function ret=logical(:) args=n:integer:intent(in) desc="allocate and return length-n logical array initialized to .true."
 public :: strvec_t !@pyapi kind=type desc="string vector helper type"
 public :: py_str !@pyapi kind=function ret=character args=x:any:intent(in) desc="python-like str() conversion for scalar int/real/logical/char"
+public :: py_float !@pyapi kind=function ret=real(dp) args=s:character:intent(in) desc="parse string to real(dp), NaN on read failure"
 public :: to_lower !@pyapi kind=function ret=character args=s:character:intent(in) desc="lowercase string"
 public :: to_upper !@pyapi kind=function ret=character args=s:character:intent(in) desc="uppercase string"
 public :: str_strip !@pyapi kind=function ret=character args=s:character:intent(in),chars:character:intent(in):optional desc="strip leading/trailing characters"
@@ -114,6 +115,8 @@ public :: str_isdigit !@pyapi kind=function ret=logical args=s:character:intent(
 public :: str_isalpha !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are letters"
 public :: str_isalnum !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are alnum"
 public :: str_isspace !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are whitespace"
+public :: sys_argv_init !@pyapi kind=function ret=character(:) args= desc="capture process command arguments (including argv[0])"
+public :: sys_argv_delete !@pyapi kind=subroutine args=argv:character(:):intent(inout),idx1:integer:intent(in) desc="delete argv element at 1-based index"
 
 public :: cumsum_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative sum of real vector"
 public :: unique_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="sorted unique values of integer vector"
@@ -151,6 +154,7 @@ public :: intersect1d_char !@pyapi kind=function ret=character(:) args=a:charact
 public :: unique_int_inv_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),inv:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with inverse and counts"
 public :: unique_int_counts !@pyapi kind=subroutine args=a:integer(:):intent(in),u:integer(:):intent(out),cnt:integer(:):intent(out) desc="unique values with counts"
 public :: lexsort2_int !@pyapi kind=function ret=integer(:) args=key0:integer(:):intent(in),key1:integer(:):intent(in) desc="lexsort((key0,key1)): sort by key1 then key0, return 0-based indices"
+public :: lexsort2_real !@pyapi kind=function ret=integer(:) args=key0:real(dp)(:):intent(in),key1:real(dp)(:):intent(in) desc="lexsort((key0,key1)) for real keys: sort by key1 then key0, return 0-based indices"
 public :: ravel_multi_index_2d !@pyapi kind=function ret=integer args=rc:integer(:):intent(in),shape:integer(:):intent(in) desc="2D ravel_multi_index"
 public :: unravel_index_2d !@pyapi kind=function ret=integer(:) args=i:integer:intent(in),shape:integer(:):intent(in) desc="2D unravel_index"
 public :: kron_2d !@pyapi kind=function ret=integer(:,:) args=a:integer(:,:):intent(in),b:integer(:,:):intent(in) desc="2D Kronecker product for integer matrices"
@@ -218,6 +222,7 @@ public :: nanmax !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in
 public :: nanargmin !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmin ignoring NaN values; -1 when all NaN"
 public :: nanargmax !@pyapi kind=function ret=integer args=x:real(dp)(:):intent(in) desc="0-based argmax ignoring NaN values; -1 when all NaN"
 public :: optval !@pyapi kind=function ret=scalar args=x:scalar:intent(in):optional,default:scalar:intent(in) desc="return x when present, otherwise default"
+public :: exec_cmd_status !@pyapi kind=function ret=integer args=cmd:character:intent(in) desc="execute shell command via execute_command_line and return exit status"
 public :: py_time !@pyapi kind=function ret=real args= desc="wall-clock seconds from system_clock (Python time.time approximation)"
 public :: py_ctime !@pyapi kind=function ret=character args=t:real(dp):intent(in):optional desc="string timestamp approximation for Python time.ctime"
 public :: cumsum
@@ -662,6 +667,14 @@ contains
             v = default
          end if
       end function optval_char
+
+      function exec_cmd_status(cmd) result(status)
+         character(len=*), intent(in) :: cmd
+         integer :: status
+         integer :: cmdstat
+         call execute_command_line(cmd, wait=.true., exitstat=status, cmdstat=cmdstat)
+         if (cmdstat /= 0) status = cmdstat
+      end function exec_cmd_status
 
       subroutine random_normal_vec(x)
          ! fill x with N(0,1) variates using Box-Muller
@@ -2130,6 +2143,29 @@ contains
             idx(j+1) = t
          end do
       end function lexsort2_int
+
+      function lexsort2_real(key0, key1) result(idx)
+         real(kind=dp), intent(in) :: key0(:), key1(:)
+         integer, allocatable :: idx(:)
+         integer :: i, j, n, tmp
+
+         n = size(key0)
+         if (size(key1) /= n) error stop 'lexsort2_real: key size mismatch'
+         allocate(idx(n))
+         do i = 1, n
+            idx(i) = i - 1
+         end do
+         do i = 1, n - 1
+            do j = i + 1, n
+               if (key1(idx(j) + 1) < key1(idx(i) + 1) .or. &
+                   (key1(idx(j) + 1) == key1(idx(i) + 1) .and. key0(idx(j) + 1) < key0(idx(i) + 1))) then
+                  tmp = idx(i)
+                  idx(i) = idx(j)
+                  idx(j) = tmp
+               end if
+            end do
+         end do
+      end function lexsort2_real
 
       function ravel_multi_index_2d(rc, shape) result(i)
          integer, intent(in) :: rc(:), shape(:)
@@ -4546,5 +4582,53 @@ contains
             f(i) = real(i - 1, kind=dp) / den
          end do
       end function fft_rfftfreq
+
+
+      pure function py_float(s) result(x)
+         character(len=*), intent(in) :: s
+         real(kind=dp) :: x
+         integer :: ios
+
+         read(s, *, iostat=ios) x
+         if (ios /= 0) x = ieee_value(0.0_dp, ieee_quiet_nan)
+      end function py_float
+
+
+      function sys_argv_init() result(argv)
+         character(len=:), allocatable :: argv(:)
+         integer :: i, narg, l, maxlen
+
+         narg = command_argument_count() + 1
+         maxlen = 1
+         do i = 0, narg - 1
+            call get_command_argument(i, length=l)
+            if (l > maxlen) maxlen = l
+         end do
+         allocate(character(len=maxlen) :: argv(narg))
+         do i = 0, narg - 1
+            call get_command_argument(i, argv(i + 1))
+         end do
+      end function sys_argv_init
+
+
+      subroutine sys_argv_delete(argv, idx1)
+         character(len=:), allocatable, intent(inout) :: argv(:)
+         integer, intent(in) :: idx1
+         character(len=:), allocatable :: tmp(:)
+         integer :: n
+
+         if (.not. allocated(argv)) return
+         n = size(argv)
+         if (idx1 < 1 .or. idx1 > n) return
+         if (n == 1) then
+            deallocate(argv)
+            allocate(character(len=1) :: argv(0))
+            return
+         end if
+         allocate(character(len=len(argv)) :: tmp(n - 1))
+         if (idx1 > 1) tmp(1:idx1 - 1) = argv(1:idx1 - 1)
+         if (idx1 < n) tmp(idx1:n - 1) = argv(idx1 + 1:n)
+         call move_alloc(tmp, argv)
+      end subroutine sys_argv_delete
 
 end module python_mod
