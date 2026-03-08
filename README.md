@@ -147,7 +147,7 @@ Many fixer/checker scripts follow a shared CLI pattern.
 
 ## Tool-by-Tool
 
-### 1) `xintent.py`
+### `xintent.py`
 
 Suggests and optionally applies missing intent attributes on dummy arguments.
 
@@ -176,7 +176,7 @@ Notes:
 - Handles multi-entity declarations (for example `integer :: i, j`) when adding intents.
 - Detailed inference rules are documented in [intent.md](intent.md) and an example of module transformed by `xintent.py` is at [intent_example.md](intent_example.md).
 
-### 2) `xpure.py`
+### `xpure.py`
 
 Suggests and optionally applies `pure` to procedures not currently marked `pure`/`elemental`.
 
@@ -201,7 +201,7 @@ Notes:
 - On compile failure after fix, modified files can be rolled back from backups.
 - `--suggest-impure-elemental` is advisory-only and cannot be combined with `--fix`.
 
-### 3) `xprivate.py`
+### `xprivate.py`
 
 Suggests and optionally applies `private :: name` inside modules.
 
@@ -219,7 +219,7 @@ Notes:
 - Suggest mode is conservative around wildcard imports.
 - Fix mode is compile-validated and reverts candidate edits that break compilation.
 
-### 4) `xintent_pure.py`
+### `xintent_pure.py`
 
 Pipeline wrapper for:
 
@@ -233,7 +233,7 @@ Typical command:
 python xintent_pure.py --suggest-intent-out --suggest-elemental --compiler "gfortran -o foo.exe"
 ```
 
-### 5) `xprune.py`
+### `xprune.py`
 
 Compile-validated pruning tool that removes likely unused top-level procedures.
 
@@ -254,7 +254,7 @@ Notes:
 - The tool removes accepted procedures and updates matching `public` lists for removed names.
 - If a trial removal breaks compilation, it is reverted immediately.
 
-### 6) `ximplicit_none.py`
+### `ximplicit_none.py`
 
 Suggests and optionally inserts `implicit none` in:
 
@@ -272,7 +272,7 @@ python ximplicit_none.py --fix
 python ximplicit_none.py --fix --compiler "gfortran -o foo.exe"
 ```
 
-### 7) `xuse_only.py`
+### `xuse_only.py`
 
 Suggests and optionally rewrites broad imports such as:
 
@@ -296,7 +296,7 @@ Notes:
 - In `--fix` mode, compile checks can be used (`baseline` and `after-fix`) with rollback on failure.
 - Renamed imports (`=>`) are handled conservatively and may be skipped.
 
-### 8) `xintent_pure_private.py`
+### `xintent_pure_private.py`
 
 Full pipeline wrapper for:
 
@@ -311,7 +311,7 @@ Typical command:
 python xintent_pure_private.py --suggest-intent-out --suggest-elemental --compiler "gfortran -o foo.exe"
 ```
 
-### 9) `xunset.py`
+### `xunset.py`
 
 Advisory checker for likely use-before-set variables in procedures/program units.
 
@@ -330,7 +330,7 @@ Notes:
 - Checks allocatable-use state (`allocate`/`deallocate`) and warns on uses while unallocated.
 - Treats inquiry intrinsics (for example `size`, `lbound`, `ubound`, `shape`, `kind`, `rank`, `allocated`) as non-value reads.
 
-### 9a) `xautofix.py`
+### `xautofix.py`
 
 Compile/runtime-driven first-pass auto-fixer for common Fortran errors.
 
@@ -352,7 +352,7 @@ Notes:
 - Includes formatted-I/O mismatch fixes from static analysis and runtime diagnostics.
 - `--runtime` defaults to in-place editing unless `--out` is explicitly provided.
 
-### 10) `xunused.py`
+### `xunused.py`
 
 Advisory checker for likely unused set variables/constants.
 
@@ -374,7 +374,7 @@ Notes:
 - `--fix` is conservative by design and skips unsafe edits.
 - Dead-store warnings are advisory and branch-aware for `if/else` flows.
 
-### 11) `xparam.py`
+### `xparam.py`
 
 Advisory checker for variables that may be converted to named constants (`parameter`).
 
@@ -406,7 +406,7 @@ Notes:
 - By default, `allocatable` declarations are excluded; use `--fix-alloc` to opt in.
 - Full rule details are documented in [param.md](param.md).
 
-### 12) `xrepeated_if.py`
+### `xrepeated_if.py`
 
 Warns about consecutive lines of code (optionally separated by comments) that test the same `if` condition.
 
@@ -424,7 +424,7 @@ python xrepeated_if.py foo.f90 --fix
 python xrepeated_if.py foo.f90 --fix --diff
 ```
 
-### 13) `xfunc_print.py`
+### `xfunc_print.py`
 
 Warns when functions contain external output statements (`print`, `write(*,...)`).
 
@@ -455,7 +455,7 @@ Notes:
 - Fix strategies are intentionally explicit and mutually exclusive.
 - Detailed strategy behavior and caveats are documented in [func_print.md](func_print.md).
 
-### 14) `xnotrim.py`
+### `xnotrim.py`
 
 Warns about likely needless `trim(...)` in string `==`/`/=` (`.eq.`/`.ne.`) comparisons.
 
@@ -473,7 +473,7 @@ python xnotrim.py foo.f90 --fix
 python xnotrim.py foo.f90 --fix --diff
 ```
 
-### 15) `xstrip.py`
+### `xstrip.py`
 
 Utility for test preparation by stripping annotations.
 
@@ -487,7 +487,7 @@ python xstrip.py --strip pure
 
 By default summary output is off; enable with `--summary`.
 
-### 16) `xstrip_implicit_none.py`
+### `xstrip_implicit_none.py`
 
 Utility to remove `implicit none` statements for testing `ximplicit_none.py`.
 
@@ -498,7 +498,7 @@ python xstrip_implicit_none.py --fix
 python xstrip_implicit_none.py foo.f90 --fix --diff
 ```
 
-### 17) `xstrip_use_only.py`
+### `xstrip_use_only.py`
 
 Utility to remove `only:` clauses from `use` statements for testing `xuse_only.py`.
 
@@ -509,7 +509,7 @@ python xstrip_use_only.py --fix
 python xstrip_use_only.py foo.f90 --fix --diff
 ```
 
-### 18) `xdealloc.py`
+### `xdealloc.py`
 
 Advisory checker for local allocatables that may be safely deallocated earlier.
 
@@ -534,7 +534,7 @@ Notes:
 - Suggestions are conservative and skip common unsafe cases (for example function result variables, loop-local last uses, near-unit-end structural-only tails).
 - Edit modes create backups before modifying files (`.bak`, `.bak1`, ...).
 
-### 19) `xformat.py`
+### `xformat.py`
 
 Advisory checker/fixer for shorten-able Fortran format literals in `print`/`write` statements.
 
@@ -557,7 +557,7 @@ Notes:
 - Current matching is conservative and focuses on string-literal format specs.
 - Fix mode rewrites only unambiguous matches and creates backups before edits.
 
-### 20) `xadvance.py`
+### `xadvance.py`
 
 Advisory checker for simple indexed `do` loops that perform one non-advancing `write(..., advance="no")` per iteration and can be collapsed.
 
@@ -580,7 +580,7 @@ Notes:
 - Array-section output is suggested when possible; otherwise implied-do output is suggested.
 - `--annotate` creates backups before edits.
 
-### 21) `xset_array.py`
+### `xset_array.py`
 
 Advisory checker for runs of consecutive scalar element assignments that can be replaced by one array-constructor assignment.
 
@@ -607,7 +607,7 @@ Notes:
 - When full bounds are clearly covered, suggestions use whole-array LHS (for example `x = [...]`).
 - Detects vectorizable forms such as `f(a(i))` and suggests `f(a)`/`f(a(lo:hi))` when safe.
 
-### 22) `xarray.py`
+### `xarray.py`
 
 Advisory checker for simple `do` loops that can be replaced with array operations.
 
@@ -758,7 +758,7 @@ Notes:
 - Applies structural checks on marker placement and scope boundaries.
 - Can infer/insert `pure` where safe and updates caller/use sites.
 
-### 23) `xpower.py`
+### `xpower.py`
 
 Advisory checker/fixer for repeated multiplication of the same operand (for example `x*x`) that can be rewritten as power form (`x**2`).
 
@@ -777,7 +777,7 @@ python xpower.py foo.f90 --fix
 python xpower.py foo.f90 --fix --annotate --diff
 ```
 
-### 24) `xno_variable.py`
+### `xno_variable.py`
 
 Advisory checker/fixer for single-use local scalar temporaries that can be inlined.
 
@@ -800,7 +800,7 @@ Notes:
 - Includes a safety check that blocks invalid inlining when RHS dependencies are reassigned between temp definition and use (for example swap patterns).
 - Fix mode creates backups before edits.
 
-### 25) `xdealloc_tail.py`
+### `xdealloc_tail.py`
 
 Advisory checker for redundant `deallocate(...)` statements on local allocatables near program-unit end.
 
@@ -821,7 +821,7 @@ Notes:
 - Focuses on local allocatables and tail-position deallocations with no meaningful trailing work.
 - `--annotate` creates backups before edits.
 
-### 26) `xnames.py`
+### `xnames.py`
 
 Advisory checker for identifiers that collide with Fortran keywords or intrinsic names.
 
@@ -840,7 +840,7 @@ Notes:
 
 - Advisory only (no `--fix`).
 
-### 27) `xkind.py`
+### `xkind.py`
 
 Advisory checker/fixer for hard-coded kind numbers.
 
@@ -863,7 +863,7 @@ Notes:
 - Handles suffix kinds (`0_8`, `1.0_8`), selector kinds (`kind=8`, `real(8)`), and kind-parameter constants (for example `dp = 8` when used in kind selectors).
 - In module scope, fix mode can introduce module-level `xkind_*` named kind constants and rewrite literals/selectors to use them.
 
-### 28) `xalloc_assign.py`
+### `xalloc_assign.py`
 
 Advisory checker/fixer for redundant `allocate(...)` before assignment-driven allocation opportunities.
 
@@ -1119,7 +1119,7 @@ Notes:
 - Conservative by default: skips unsupported/non-literal `error stop` forms and suspicious invalid IF patterns.
 - Supports compile/run and source preview flows via `--run`, `--run-both`, `--tee`, and `--tee-both`.
 
-### 29) `xbounds.py`
+### `xbounds.py`
 
 Advisory checker for likely out-of-bounds array index/slice patterns.
 
@@ -1139,7 +1139,7 @@ Notes:
 - Advisory only (no `--fix`).
 - Uses conservative guard inference (for example `size(...)` checks, alias guards, loop bounds).
 
-### 30) `xone_line_if.py`
+### `xone_line_if.py`
 
 Advisory checker/fixer for three-line IF blocks that can be collapsed to one-line IF, with optional reverse expansion.
 
@@ -1159,7 +1159,7 @@ python xone_line_if.py foo.f90 --fix --diff
 python xone_line_if.py foo.f90 --reverse --fix --diff
 ```
 
-### 31) `xlong_lines.py`
+### `xlong_lines.py`
 
 Advisory checker/fixer for lines longer than a configurable maximum (default 100).
 
@@ -1178,7 +1178,7 @@ python xlong_lines.py foo.f90 --max-len 100 --verbose
 python xlong_lines.py foo.f90 --fix --diff
 ```
 
-### 32) `xoptval.py`
+### `xoptval.py`
 
 Advisory checker/fixer for optional-defaulting idioms that can be rewritten with `optval(...)` from `stdlib_optval`.
 
@@ -1205,7 +1205,7 @@ Notes:
   - `if (present(arg)) then; x = arg; else; x = default; end if`
 - In fix mode, required `use stdlib_optval, only: optval` import is kept in the module/specification part (before `implicit none`).
 
-### 33) `xmerge.py`
+### `xmerge.py`
 
 Advisory checker/fixer for simple `if/else` assignment blocks that can be replaced by `merge(...)`.
 
@@ -1233,7 +1233,7 @@ Notes:
   - string-literal branch values with unequal character lengths,
   - complex branch expressions outside the supported simple-source subset.
 
-### 34) `xdecl.py`
+### `xdecl.py`
 
 Advisory checker/fixer for declaration statements that omit `::`.
 
@@ -1245,7 +1245,7 @@ python xdecl.py foo.f90 --verbose
 python xdecl.py foo.f90 --fix --diff
 ```
 
-### 35) `xend_name.py`
+### `xend_name.py`
 
 Advisory checker/fixer that replaces plain `end` with named forms such as `end subroutine foo`, `end function bar`, `end module m`.
 
@@ -1257,7 +1257,7 @@ python xend_name.py foo.f90 --verbose
 python xend_name.py foo.f90 --fix --diff
 ```
 
-### 36) `xspace.py`
+### `xspace.py`
 
 Advisory checker/fixer for spacing/layout normalization rules (parenthesis spacing, blank-line normalization, procedure separation, and related formatting cleanup).
 
@@ -1270,7 +1270,7 @@ python xspace.py foo.f90 --fix --diff
 python xspace.py foo.f90 --fix --disable 2,4
 ```
 
-### 37) `xburkardt.py`
+### `xburkardt.py`
 
 Reads Burkardt-style argument comment blocks and applies matching `intent(in)`, `intent(out)`, or `intent(in out)` to declarations.
 
@@ -1281,7 +1281,7 @@ python xburkardt.py
 python xburkardt.py starpac.f90 --verbose
 ```
 
-### 38) `xmodule.py`
+### `xmodule.py`
 
 Informational checker: detects procedures outside modules, wraps them into a temporary generated module in `temp.f90`, and compile-checks the wrapped file.
 
@@ -1293,7 +1293,7 @@ python xmodule.py --codes codes.txt --compile-cmd "gfortran -c {file}"
 python xmodule.py c:\fortran\**\*.f90 --verbose
 ```
 
-### 39) `xfree.py`
+### `xfree.py`
 
 Converts fixed-form `.f` sources to free-form `.f90` in the same directory, with optional compile regression checks.
 
@@ -1305,7 +1305,7 @@ python xfree.py c:\fortran\lapack --recursive --overwrite
 python xfree.py c:\fortran\lapack --recursive --overwrite --check --fail-fast
 ```
 
-### 40) `xtest.py`
+### `xtest.py`
 
 Transform harness: copy source to `temp.f90`, baseline compile, run transform command, post-transform compile, and stop/report on transform or post-compile failure.
 
@@ -1317,7 +1317,7 @@ python xtest.py --transform-cmd "python xpure.py --fix" --compile-cmd "gfortran 
 python xtest.py --transform-cmd "python xintent.py --fix" --resume --loop --max-loop 20
 ```
 
-### 41) `xcompile.py`
+### `xcompile.py`
 
 Compile-only harness for file lists/globs, with resume/loop controls and optional fast-fail mode.
 
@@ -1330,7 +1330,7 @@ python xcompile.py --codes codes.txt --resume --limit 500
 python xcompile.py --codes codes.txt --fast-fail
 ```
 
-### 42) `xerror.py`
+### `xerror.py`
 
 Parses `xcompile.py` output logs and summarizes warning/error kinds by file count, source-line count, and total hits.
 
@@ -1341,7 +1341,7 @@ python xerror.py
 python xerror.py burkardt_errors.txt
 ```
 
-### 43) `xsort_size.py`
+### `xsort_size.py`
 
 Sorts a newline-delimited source list (for example `codes.txt`) by file size ascending.
 
@@ -1352,7 +1352,7 @@ python xsort_size.py codes.txt
 python xsort_size.py codes.txt --output codes_size_sorted.txt
 ```
 
-### 44) `xoptions.py`
+### `xoptions.py`
 
 Reports long-option inventories for `x*.py` scripts (option count plus names).
 
@@ -1363,7 +1363,7 @@ python xoptions.py
 python xoptions.py xintent.py xpure.py xarray.py
 ```
 
-### 45) `xrepeat.py`
+### `xrepeat.py`
 
 Advisory finder for repeated IF conditions and repeated expressions in straight-line blocks.
 
@@ -1374,7 +1374,7 @@ python xrepeat.py
 python xrepeat.py foo.f90 --verbose
 ```
 
-### 46) `xbuild.py`
+### `xbuild.py`
 
 Build-only harness for source-file sets, where each line in `--codes` is one build set (one or more source files).
 It attempts to build an executable for each set and reports failures with resume/silent controls.
