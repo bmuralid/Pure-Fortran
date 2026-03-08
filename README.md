@@ -339,6 +339,8 @@ Typical commands:
 ```bash
 python xautofix.py foo.f90
 python xautofix.py foo.f90 --in-place --diff
+python xautofix.py foo.f90 --drop-deallocate --hoist-loop-allocate
+python xautofix.py foo.f90 --tee-orig --tee
 python xautofix.py foo.f90 --runtime
 python xautofix.py foo.f90 --runtime --run --tee-both
 ```
@@ -347,10 +349,16 @@ Notes:
 
 - Supports compile-time and runtime fix loops (bounded by `--max-iter`).
 - Applies static allocatable safety fixes before build loops:
-  - guards unsafe `deallocate(x)` as `if (allocated(x)) deallocate(x)`.
+  - by default, guards unsafe `deallocate(x)` as `if (allocated(x)) deallocate(x)`.
+  - with `--drop-deallocate`, removes definitely unsafe/redundant `deallocate(...)` lines instead.
   - inserts guarded `deallocate` before `allocate(x(...))` in loop contexts.
+  - with `--hoist-loop-allocate`, can conservatively hoist simple loop-local `allocate(...)` patterns out of `do` loops.
 - Includes formatted-I/O mismatch fixes from static analysis and runtime diagnostics.
 - `--runtime` defaults to in-place editing unless `--out` is explicitly provided.
+- Source printing options:
+  - `--tee-orig`: print original source.
+  - `--tee`: print transformed source.
+  - `--tee-both`: print both source views and build/run stdout+stderr.
 
 ### `xunused.py`
 
