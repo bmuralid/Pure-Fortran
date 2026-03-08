@@ -11828,22 +11828,57 @@ class translator(ast.NodeVisitor):
                 return f"[{a0}, {a1}]"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "np"
+                and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"loadtxt", "genfromtxt"}
                 and len(node.args) >= 1
             ):
-                skiprows_txt = "0"
-                if len(node.args) >= 2:
-                    skiprows_txt = self.expr(node.args[1])
+                skiprows_txt = None
+                delimiter_txt = None
+                comments_txt = None
+                usecols_txt = None
+                if len(node.args) >= 2 and node.func.attr == "loadtxt":
+                    if isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, int):
+                        skiprows_txt = self.expr(node.args[1])
                 for kw in node.keywords:
                     if kw.arg == "skiprows":
                         skiprows_txt = self.expr(kw.value)
-                        break
-                    if kw.arg == "skip_header":
+                    elif kw.arg == "skip_header":
                         skiprows_txt = self.expr(kw.value)
-                        break
-                return f"loadtxt_real_2d({self.expr(node.args[0])}, int({skiprows_txt}))"
+                    elif kw.arg == "delimiter":
+                        if not is_none(kw.value):
+                            delimiter_txt = self.expr(kw.value)
+                    elif kw.arg == "comments":
+                        if not is_none(kw.value):
+                            comments_txt = self.expr(kw.value)
+                    elif kw.arg == "usecols":
+                        uc = kw.value
+                        if isinstance(uc, ast.Constant) and isinstance(uc.value, int):
+                            usecols_txt = f"[{int(uc.value)}]"
+                        elif isinstance(uc, (ast.Tuple, ast.List)):
+                            vals = []
+                            ok = True
+                            for e in uc.elts:
+                                if isinstance(e, ast.Constant) and isinstance(e.value, int):
+                                    vals.append(str(int(e.value)))
+                                else:
+                                    ok = False
+                                    break
+                            if ok:
+                                usecols_txt = "[" + ", ".join(vals) + "]"
+                            else:
+                                raise NotImplementedError("np.loadtxt/genfromtxt usecols currently requires constant integer tuple/list")
+                        else:
+                            raise NotImplementedError("np.loadtxt/genfromtxt usecols currently requires constant integer tuple/list")
+                parts = [self.expr(node.args[0])]
+                if skiprows_txt is not None:
+                    parts.append(f"skiprows=int({skiprows_txt})")
+                if delimiter_txt is not None:
+                    parts.append(f"delimiter={delimiter_txt}")
+                if comments_txt is not None:
+                    parts.append(f"comments={comments_txt}")
+                if usecols_txt is not None:
+                    parts.append(f"usecols={usecols_txt}")
+                return "loadtxt_real_2d(" + ", ".join(parts) + ")"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -18235,14 +18270,25 @@ class translator(ast.NodeVisitor):
 
         if (
             isinstance(c.func, ast.Attribute)
-            and isinstance(c.func.value, ast.Name)
-            and c.func.value.id == "np"
+            and is_numpy_name_node(c.func.value)
             and c.func.attr == "savetxt"
             and len(c.args) >= 2
         ):
             path_txt = self.expr(c.args[0])
             arr_txt = self.expr(c.args[1])
-            self.o.w(f"call savetxt_real_2d({path_txt}, {arr_txt})")
+            fmt_txt = self.expr(c.args[2]) if len(c.args) >= 3 else None
+            delim_txt = self.expr(c.args[3]) if len(c.args) >= 4 else None
+            for kw in c.keywords:
+                if kw.arg == "fmt":
+                    fmt_txt = self.expr(kw.value)
+                elif kw.arg == "delimiter":
+                    delim_txt = self.expr(kw.value)
+            parts = [path_txt, arr_txt]
+            if delim_txt is not None:
+                parts.append(f"delimiter={delim_txt}")
+            if fmt_txt is not None:
+                parts.append(f"fmt={fmt_txt}")
+            self.o.w("call savetxt_real_2d(" + ", ".join(parts) + ")")
             return
 
         if (

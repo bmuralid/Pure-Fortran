@@ -201,8 +201,8 @@ public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:re
 public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
 public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D convolution with mode full/same/valid"
 public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional desc="1D integer convolution with mode full/same/valid"
-public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional desc="load whitespace-delimited real matrix text file"
-public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in) desc="write whitespace-delimited real matrix text file"
+public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load real matrix text file with basic numpy-like options"
+public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in),delimiter:character:intent(in):optional,fmt:character:intent(in):optional desc="write real matrix text file with basic delimiter/fmt options"
 public :: print_matrix !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),label:character:intent(in):optional desc="print 2D real matrix with aligned columns"
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
 public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
@@ -652,14 +652,34 @@ contains
          s = trim(buf)
       end function py_ctime
 
-      function loadtxt_real_2d(path, skiprows) result(x)
+      function loadtxt_real_2d(path, skiprows, delimiter, comments, usecols) result(x)
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows
+         character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: usecols(:)
          real(kind=dp), allocatable :: x(:,:)
-         integer :: u, ios, nskip, nrow, ncol, irow, i
-         character(len=4096) :: line
+         integer :: u, ios, nskip, nrow, ncol, irow, i, ntok, j
+         integer :: i1, i2, max_col0
+         character(len=4096) :: line, work, delim_txt, comm_txt
+         real(kind=dp), allocatable :: vals(:)
+         logical :: usecols_present
 
          nskip = optval(skiprows, 0)
+         delim_txt = ""
+         comm_txt = "#"
+         if (present(delimiter)) delim_txt = delimiter
+         if (present(comments)) comm_txt = comments
+         usecols_present = present(usecols)
+         max_col0 = -1
+         if (usecols_present) then
+            ncol = size(usecols)
+            if (ncol <= 0) then
+               allocate(x(0,0))
+               return
+            end if
+            max_col0 = maxval(usecols)
+         end if
+
          open(newunit=u, file=trim(path), status="old", action="read", iostat=ios)
          if (ios /= 0) then
             allocate(x(0,0))
@@ -671,13 +691,20 @@ contains
          end do
 
          nrow = 0
-         ncol = 0
+         if (.not. usecols_present) ncol = 0
          do
             read(u, "(A)", iostat=ios) line
             if (ios /= 0) exit
-            if (len_trim(line) == 0) cycle
+            work = preprocess_line(line, delim_txt, comm_txt)
+            if (len_trim(work) == 0) cycle
+            ntok = count_tokens(work)
+            if (ntok <= 0) cycle
+            if (usecols_present) then
+               if (max_col0 + 1 > ntok) cycle
+            else
+               if (ncol == 0) ncol = ntok
+            end if
             nrow = nrow + 1
-            if (ncol == 0) ncol = count_tokens(line)
          end do
 
          if (nrow <= 0 .or. ncol <= 0) then
@@ -697,13 +724,57 @@ contains
          do
             read(u, "(A)", iostat=ios) line
             if (ios /= 0) exit
-            if (len_trim(line) == 0) cycle
+            work = preprocess_line(line, delim_txt, comm_txt)
+            if (len_trim(work) == 0) cycle
+            ntok = count_tokens(work)
+            if (ntok <= 0) cycle
+            if (usecols_present) then
+               if (max_col0 + 1 > ntok) cycle
+            end if
             irow = irow + 1
-            read(line, *, iostat=ios) x(irow, :)
-            if (ios /= 0) x(irow, :) = 0.0_dp
+            allocate(vals(max(1, ntok)))
+            vals = 0.0_dp
+            read(work, *, iostat=ios) vals(1:ntok)
+            if (ios /= 0) then
+               x(irow, :) = 0.0_dp
+            else
+               if (usecols_present) then
+                  do j = 1, ncol
+                     i1 = usecols(j) + 1
+                     if (i1 >= 1 .and. i1 <= ntok) then
+                        x(irow, j) = vals(i1)
+                     else
+                        x(irow, j) = 0.0_dp
+                     end if
+                  end do
+               else
+                  i2 = min(ncol, ntok)
+                  if (i2 > 0) x(irow, 1:i2) = vals(1:i2)
+                  if (i2 < ncol) x(irow, i2+1:ncol) = 0.0_dp
+               end if
+            end if
+            deallocate(vals)
          end do
          close(u)
       contains
+         pure function preprocess_line(s, delim, cmt) result(out)
+            character(len=*), intent(in) :: s, delim, cmt
+            character(len=4096) :: out
+            integer :: ipos
+            out = s
+            if (len_trim(cmt) > 0) then
+               ipos = index(out, cmt(1:1))
+               if (ipos > 0) out = out(:ipos-1)
+            end if
+            if (len_trim(delim) > 0) then
+               do
+                  ipos = index(out, delim(1:1))
+                  if (ipos <= 0) exit
+                  out(ipos:ipos) = " "
+               end do
+            end if
+         end function preprocess_line
+
          pure integer function count_tokens(s) result(n)
             character(len=*), intent(in) :: s
             integer :: i
@@ -723,16 +794,37 @@ contains
          end function count_tokens
       end function loadtxt_real_2d
 
-      subroutine savetxt_real_2d(path, x)
+      subroutine savetxt_real_2d(path, x, delimiter, fmt)
          character(len=*), intent(in) :: path
          real(kind=dp), intent(in) :: x(:,:)
-         integer :: u, i, j
+         character(len=*), intent(in), optional :: delimiter, fmt
+         integer :: u, i, j, ipos, prec, ios
+         character(len=32) :: dsep, wfmt, fmt_txt
 
+         dsep = " "
+         if (present(delimiter)) then
+            if (len_trim(delimiter) > 0) dsep = delimiter
+         end if
+         wfmt = "(g0)"
+         if (present(fmt)) then
+            fmt_txt = adjustl(trim(fmt))
+            if (len_trim(fmt_txt) >= 2 .and. fmt_txt(1:1) == "%") then
+               if (fmt_txt(len_trim(fmt_txt):len_trim(fmt_txt)) == "f") then
+                  ipos = index(fmt_txt, ".")
+                  if (ipos > 0 .and. ipos < len_trim(fmt_txt)) then
+                     read(fmt_txt(ipos+1:len_trim(fmt_txt)-1), *, iostat=ios) prec
+                     if (ios == 0 .and. prec >= 0) then
+                        write(wfmt, "(a,i0,a)") "(f0.", prec, ")"
+                     end if
+                  end if
+               end if
+            end if
+         end if
          open(newunit=u, file=trim(path), status="replace", action="write")
          do i = 1, size(x,1)
             do j = 1, size(x,2)
-               if (j > 1) write(u, "(a)", advance="no") " "
-               write(u, "(g0)", advance="no") x(i, j)
+               if (j > 1) write(u, "(a)", advance="no") trim(dsep)
+               write(u, trim(wfmt), advance="no") x(i, j)
             end do
             write(u, *)
          end do
