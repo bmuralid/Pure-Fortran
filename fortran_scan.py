@@ -991,6 +991,40 @@ def _is_wrapped_by_outer_parens(expr: str) -> bool:
     return depth == 0
 
 
+def _has_top_level_comma(expr: str) -> bool:
+    """True when expr contains a comma at depth 0 (outside nested parens/strings)."""
+    s = expr.strip()
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double:
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if ch == "," and depth == 0:
+            return True
+        i += 1
+    return False
+
+
 def strip_redundant_outer_parens_expr(expr: str) -> str:
     """Remove redundant full-expression outer parentheses conservatively.
 
@@ -1001,7 +1035,12 @@ def strip_redundant_outer_parens_expr(expr: str) -> str:
     """
     s = expr.strip()
     while _is_wrapped_by_outer_parens(s):
-        s = s[1:-1].strip()
+        inner = s[1:-1].strip()
+        # Keep tuple-like grouped expressions, e.g. complex literal syntax:
+        #   (re_part, im_part)
+        if _has_top_level_comma(inner):
+            break
+        s = inner
     return s
 
 
@@ -1045,6 +1084,11 @@ def simplify_redundant_parens_in_line(line: str) -> str:
         return f"{s}{comment}{eol}"
     if re.match(r"^\s*do\s+while\s*\(.+\)\s*$", s, re.IGNORECASE):
         return f"{s}{comment}{eol}"
+    # `select case (...)` and `case (...)` require parentheses syntactically.
+    if re.match(r"^\s*select\s+case\s*\(.+\)\s*$", s, re.IGNORECASE):
+        return f"{s}{comment}{eol}"
+    if re.match(r"^\s*case\s*\(.+\)\s*$", s, re.IGNORECASE):
+        return f"{s}{comment}{eol}"
 
     # Remove parentheses around simple atoms globally.
     atom_pat = re.compile(
@@ -1068,6 +1112,15 @@ def simplify_redundant_parens_in_line(line: str) -> str:
 
     def _inline_expr_repl(m: re.Match[str]) -> str:
         inner = m.group(1).strip()
+        # Keep parens when this grouped multiplicative expression is used as a
+        # denominator (a / (b*c)); dropping parens changes evaluation order.
+        if ("*" in inner or "/" in inner):
+            before = m.string[: m.start()].rstrip()
+            after = m.string[m.end() :].lstrip()
+            prev_ch = before[-1] if before else ""
+            next_ch = after[0] if after else ""
+            if prev_ch == "/" or next_ch == "/":
+                return m.group(0)
         if _can_drop_inline_parens(inner):
             return inner
         return m.group(0)
@@ -1450,6 +1503,11 @@ def rewrite_list_directed_print_reals(
             b = base_identifier(t)
             if b is not None and b in array_names:
                 return True
+            comp_hits = re.findall(r"%\s*([a-z][a-z0-9_]*)", t, re.IGNORECASE)
+            if comp_hits:
+                comp = comp_hits[-1].lower()
+                if comp in array_names:
+                    return True
             # real(array_expr, kind=...) style.
             m_real = re.match(r"^real\s*\((.+)\)$", t, re.IGNORECASE)
             if m_real:
@@ -1482,7 +1540,7 @@ def rewrite_list_directed_print_reals(
                 return True
             return False
 
-        if len(items) == 1 and _is_likely_array_expr(items[0]):
+        if any(_is_likely_array_expr(it) for it in items):
             fmt = "*(g0,1x)"
         else:
             fmt = ", ".join(fmts)
@@ -1611,6 +1669,25 @@ def _fold_simple_integer_arithmetic(stmt: str) -> str:
     pat = re.compile(r"(?<![\w.])([+-]?\d+)\s*([+\-*/])\s*([+-]?\d+)(?![\w.])")
 
     def _repl(m: re.Match[str]) -> str:
+        s = m.string
+        i0 = m.start(1)
+        i1 = m.end(3)
+
+        # Keep folding conservative: do not rewrite when this literal op literal
+        # is adjacent to surrounding arithmetic operators, because precedence
+        # could change (e.g. "10 ** 8 - 1" -> "10 ** 7", or "2*3 + 4").
+        j = i0 - 1
+        while j >= 0 and s[j].isspace():
+            j -= 1
+        if j >= 0 and s[j] in "+-*/":
+            return m.group(0)
+
+        k = i1
+        while k < len(s) and s[k].isspace():
+            k += 1
+        if k < len(s) and s[k] in "+-*/":
+            return m.group(0)
+
         a = int(m.group(1))
         op = m.group(2)
         b = int(m.group(3))
@@ -2890,6 +2967,16 @@ def _break_candidates_for_wrap(body: str, start: int, end: int) -> List[int]:
             i += 1
             continue
         if not in_single and not in_double and start <= i <= end:
+            if ch == "*":
+                # Never split inside exponentiation token `**`.
+                if (i > 0 and body[i - 1] == "*") or (i + 1 < len(body) and body[i + 1] == "*"):
+                    i += 1
+                    continue
+            if ch == "/":
+                # Never split inside string-concatenation token `//`.
+                if (i > 0 and body[i - 1] == "/") or (i + 1 < len(body) and body[i + 1] == "/"):
+                    i += 1
+                    continue
             if ch.isspace() or ch in ",+-*/)=]":
                 out.append(i)
         i += 1
@@ -4729,7 +4816,7 @@ def indent_fortran_blocks(
 
     dedent_before = re.compile(
         r"^\s*(?:"
-        r"end\s+(?:do|if|select|block|associate|where|type)"
+        r"end(?:\s+)?(?:do|if|select|block|associate|where|type)"
         r"|else(?:\s+if\b.*\bthen)?"
         r"|case\b(?:\s+default|\s*\()?"
         r")\b",
@@ -4747,6 +4834,8 @@ def indent_fortran_blocks(
         re.IGNORECASE,
     )
     type_start_re = re.compile(r"^\s*type\b(?!\s*\()", re.IGNORECASE)
+    do_label_start_re = re.compile(r"^\s*do\s+(\d+)\b", re.IGNORECASE)
+    stmt_label_re = re.compile(r"^\s*(\d+)\b")
 
     def _is_derived_type_start(code_line: str) -> bool:
         c = code_line.strip()
@@ -4771,6 +4860,7 @@ def indent_fortran_blocks(
     contains_re = re.compile(r"^\s*contains\b", re.IGNORECASE)
 
     unit_stack: List[dict] = []
+    do_label_stack: List[str] = []
 
     def _unit_kind_start(code_line: str) -> Optional[str]:
         c = code_line.strip()
@@ -4804,30 +4894,49 @@ def indent_fortran_blocks(
             continue
 
         code = strip_comment(raw).strip()
-        if code and unit_stack and _unit_end_matches(code, unit_stack[-1]["kind"]):
+        m_stmt_label = stmt_label_re.match(code)
+        stmt_label = m_stmt_label.group(1) if m_stmt_label else None
+        # Normalize leading numeric statement labels for block matching.
+        code_norm = re.sub(r"^\d+\s+", "", code)
+
+        # Legacy labeled-DO termination, e.g.:
+        #   do 30 i = ...
+        #   ...
+        # 30 continue
+        # Dedent when the terminating label is reached.
+        if stmt_label and do_label_stack:
+            while do_label_stack:
+                if do_label_stack[-1] == stmt_label:
+                    do_label_stack.pop()
+                    level = max(0, level - 1)
+                    break
+                # Keep stack coherent in odd legacy constructs.
+                # If label is present but doesn't match top, stop searching.
+                break
+        if code_norm and unit_stack and _unit_end_matches(code_norm, unit_stack[-1]["kind"]):
             if unit_stack[-1].get("contains_active", False):
                 level = max(0, level - 1)
             if unit_stack[-1].get("unit_indent", False):
                 level = max(0, level - 1)
             unit_stack.pop()
 
-        if code and dedent_before.match(code):
+        if code_norm and dedent_before.match(code_norm):
             level = max(0, level - 1)
 
         out.append(f"{step * level}{stripped}")
 
-        if code and _is_derived_type_start(code):
+        if code_norm and _is_derived_type_start(code_norm):
             level += 1
             continue
 
-        if code and contains_re.match(code) and unit_stack:
+        if code_norm and contains_re.match(code_norm) and unit_stack:
             if indent_contains and not unit_stack[-1].get("contains_active", False):
                 unit_stack[-1]["contains_active"] = True
                 level += 1
             continue
 
-        if code:
-            k = _unit_kind_start(code)
+        if code_norm:
+            k = _unit_kind_start(code_norm)
             if k is not None:
                 indent_unit = (
                     (k == "module" and indent_module)
@@ -4839,12 +4948,15 @@ def indent_fortran_blocks(
                     level += 1
                 continue
 
-        if code and indent_after.match(code):
+        if code_norm and indent_after.match(code_norm):
             # Exclude one-line IF from opening a new block unless it ends with THEN.
-            if re.match(r"^\s*if\b", code, re.IGNORECASE) and not re.search(r"\bthen\s*$", code, re.IGNORECASE):
+            if re.match(r"^\s*if\b", code_norm, re.IGNORECASE) and not re.search(r"\bthen\s*$", code_norm, re.IGNORECASE):
                 continue
             # END lines already handled as dedent-only.
-            if not re.match(r"^\s*end\b", code, re.IGNORECASE):
+            if not re.match(r"^\s*end\b", code_norm, re.IGNORECASE):
+                m_do_lbl = do_label_start_re.match(code_norm)
+                if m_do_lbl:
+                    do_label_stack.append(m_do_lbl.group(1))
                 level += 1
 
     return "\n".join(out) + ("\n" if text.endswith("\n") or out else "")
@@ -5852,6 +5964,8 @@ def rewrite_named_arguments_in_statement(
     interfaces: Dict[str, ProcedureInterface],
     *,
     max_positional: int = 3,
+    name_optional: bool = True,
+    name_after_positional_limit: bool = True,
 ) -> Tuple[str, bool, Set[str]]:
     """Rewrite call arguments to named form when literals/optional/long positional lists.
 
@@ -5877,6 +5991,14 @@ def rewrite_named_arguments_in_statement(
     last = 0
     changed = False
 
+    def _named_actual_dummy(arg: str) -> Optional[str]:
+        # Only treat top-level `dummy = expr` as named actual; ignore
+        # keyword-style arguments inside nested calls like `real(x, kind=dp)`.
+        m = re.match(r"^\s*([a-z][a-z0-9_]*)\s*=", arg, re.IGNORECASE)
+        if not m:
+            return None
+        return m.group(1).lower()
+
     for start, end, name_raw, arg_text in segments:
         name = name_raw.lower()
         iface = interfaces.get(name)
@@ -5893,28 +6015,42 @@ def rewrite_named_arguments_in_statement(
             pieces.append(code[last:end])
             last = end
             continue
-        unnamed_count = sum(1 for a in args_in if "=" not in a)
+        unnamed_count = sum(1 for a in args_in if _named_actual_dummy(a.strip()) is None)
         unnamed_idx = 0
         out_args: List[str] = []
         ok = True
+        seen_named = False
+        used_dummies: Set[str] = set()
         for a in args_in:
             t = a.strip()
-            if "=" in t:
+            named_dummy = _named_actual_dummy(t)
+            if named_dummy is not None:
                 out_args.append(t)
+                seen_named = True
+                if named_dummy in iface.args:
+                    used_dummies.add(named_dummy)
                 continue
+            while unnamed_idx < len(iface.args) and iface.args[unnamed_idx] in used_dummies:
+                unnamed_idx += 1
             if unnamed_idx >= len(iface.args):
                 ok = False
                 break
             dummy = iface.args[unnamed_idx]
             unnamed_idx += 1
-            need_named = (
-                _is_literal_expr_for_named_arg(t)
-                or dummy in iface.optional_args
-                or (unnamed_count > max_positional and unnamed_idx > max_positional)
-            )
+            used_dummies.add(dummy)
+            need_named = _is_literal_expr_for_named_arg(t)
+            if name_optional and (dummy in iface.optional_args):
+                need_named = True
+            if name_after_positional_limit and (unnamed_count > max_positional and unnamed_idx > max_positional):
+                need_named = True
+            # Fortran rule: once a named actual appears, all following actuals
+            # must also be named.
+            if seen_named:
+                need_named = True
             if need_named:
                 out_args.append(f"{dummy}={t}")
                 changed = True
+                seen_named = True
             else:
                 out_args.append(t)
         if not ok:
@@ -5935,6 +6071,8 @@ def rewrite_named_arguments_in_lines(
     lines: List[str],
     *,
     max_positional: int = 3,
+    name_optional: bool = True,
+    name_after_positional_limit: bool = True,
 ) -> Tuple[List[str], int, Set[str]]:
     """Rewrite named arguments across source lines using available local interfaces."""
     interfaces = collect_procedure_interfaces_from_lines(lines)
@@ -5991,7 +6129,11 @@ def rewrite_named_arguments_in_lines(
             out_lines.append(raw)
             continue
         new_code, changed, unknown = rewrite_named_arguments_in_statement(
-            code, interfaces, max_positional=max_positional
+            code,
+            interfaces,
+            max_positional=max_positional,
+            name_optional=name_optional,
+            name_after_positional_limit=name_after_positional_limit,
         )
         if changed:
             n_changes += 1

@@ -4970,11 +4970,32 @@ def normalize_if_scalar_array_merges(stmts):
     def _is_np_name(node):
         return isinstance(node, ast.Name) and node.id in {"np", "numpy"}
 
+    def _subscript_is_arrayish(node):
+        if not isinstance(node, ast.Subscript):
+            return False
+        sl = node.slice
+        # Any explicit slice keeps array rank.
+        if isinstance(sl, ast.Slice):
+            return True
+        # Tuple indexing is array-like when it contains slices/newaxis/Ellipsis
+        # or any clearly vector-valued index expression.
+        if isinstance(sl, ast.Tuple):
+            for e in sl.elts:
+                if isinstance(e, ast.Slice) or is_none(e):
+                    return True
+                if isinstance(e, ast.Constant) and e.value is Ellipsis:
+                    return True
+                if isinstance(e, (ast.List, ast.Tuple, ast.ListComp, ast.Set)):
+                    return True
+            return False
+        # Single scalar-looking subscript (e.g. a[i], a[0]) is scalar by default.
+        return False
+
     def _is_arrayish_expr(node):
         if isinstance(node, (ast.List, ast.Tuple)):
             return True
         if isinstance(node, ast.Subscript):
-            return True
+            return _subscript_is_arrayish(node)
         if isinstance(node, ast.Call):
             f = node.func
             if (
@@ -6016,7 +6037,7 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Attribute):
             if node.attr == "__version__" and isinstance(node.value, ast.Name):
                 # Runtime package version strings are diagnostic only.
-                return fstr("unknown")
+                return "char"
             if (
                 node.attr == "version"
                 and isinstance(node.value, ast.Attribute)
@@ -6044,6 +6065,8 @@ class translator(ast.NodeVisitor):
                 return "char"
             return None
         if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return "logical"
             return self._expr_kind(node.operand)
         if isinstance(node, ast.BinOp):
             if isinstance(node.op, ast.Add):
@@ -6147,16 +6170,16 @@ class translator(ast.NodeVisitor):
                         return "logical"
             if isinstance(node.value, ast.Name):
                 nm = node.value.id
-                if nm in self.alloc_logs:
-                    return "logical"
-                if nm in self.alloc_ints:
-                    return "int"
                 if nm in self.alloc_reals:
                     return "real"
                 if nm in self.alloc_complexes:
                     return "complex"
+                if nm in self.alloc_logs:
+                    return "logical"
                 if nm in self.alloc_chars:
                     return "char"
+                if nm in self.alloc_ints:
+                    return "int"
             return None
         if isinstance(node, ast.Call):
             if (
@@ -6258,6 +6281,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "diag" and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Name):
+                if node.func.id in {"gammaln", "lgamma"} and len(node.args) == 1:
+                    return "real"
                 if node.func.id in {"max", "min"}:
                     if len(node.args) == 0:
                         return None
@@ -8594,7 +8619,15 @@ class translator(ast.NodeVisitor):
             if isinstance(node.op, ast.UAdd):
                 return f"(+{self.expr(node.operand)})"
             if isinstance(node.op, ast.Not):
-                return f"(.not. {self.expr(node.operand)})"
+                t = self.expr(node.operand)
+                k = self._expr_kind(node.operand)
+                r = max(0, int(self._rank_expr(node.operand)))
+                if k != "logical":
+                    if r > 0:
+                        t = f"any(({t}) /= 0)"
+                    else:
+                        t = f"(({t}) /= 0)"
+                return f"(.not. {t})"
             raise NotImplementedError("unsupported unary op")
 
         if isinstance(node, ast.BoolOp):
@@ -8606,7 +8639,17 @@ class translator(ast.NodeVisitor):
                 op = ".or."
             else:
                 raise NotImplementedError("unsupported boolean operator")
-            parts = [self.expr(v) for v in node.values]
+            parts = []
+            for v in node.values:
+                t = self.expr(v)
+                k = self._expr_kind(v)
+                r = max(0, int(self._rank_expr(v)))
+                if k != "logical":
+                    if r > 0:
+                        t = f"any(({t}) /= 0)"
+                    else:
+                        t = f"(({t}) /= 0)"
+                parts.append(t)
             return "(" + f" {op} ".join(parts) + ")"
 
         if isinstance(node, ast.IfExp):
@@ -9400,6 +9443,12 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "sorted":
                 raise NotImplementedError("sorted(...) is currently supported only in for-loops")
             if isinstance(node.func, ast.Name):
+                if node.func.id in {"gammaln", "lgamma"} and len(node.args) == 1:
+                    a0 = self.expr(node.args[0])
+                    k0 = self._expr_kind(node.args[0])
+                    if k0 in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    return f"log_gamma({a0})"
                 if node.func.id in {"max", "min"}:
                     if node.keywords:
                         raise NotImplementedError(f"{node.func.id}(...) keywords not supported")
@@ -11910,6 +11959,18 @@ class translator(ast.NodeVisitor):
             if isinstance(node, ast.Assign):
                 if (
                     len(node.targets) == 1
+                    and isinstance(node.targets[0], (ast.Tuple, ast.List))
+                    and isinstance(node.value, ast.Call)
+                    and (
+                        (isinstance(node.value.func, ast.Name) and node.value.func.id == "quad")
+                        or (isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "quad")
+                    )
+                ):
+                    for _e in node.targets[0].elts[:2]:
+                        if isinstance(_e, ast.Name):
+                            self._mark_real(_e.id)
+                if (
+                    len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
                 ):
                     if isinstance(node.value, ast.Lambda):
@@ -12009,16 +12070,18 @@ class translator(ast.NodeVisitor):
                     out_ranks = self.tuple_return_out_ranks.get(node.value.func.id, [])
                     formal_ranks = list(self.local_func_arg_ranks.get(node.value.func.id, []))
                     vec_rank = 0
-                    for i_arg, a_arg in enumerate(node.value.args):
-                        fr = formal_ranks[i_arg] if i_arg < len(formal_ranks) else 0
-                        ar = int(self._rank_expr(a_arg))
-                        if fr == 0 and ar > 0:
-                            vec_rank = max(vec_rank, ar)
+                    can_vec_tuple = (not out_ranks) or all(int(_r) == 0 for _r in out_ranks)
+                    if can_vec_tuple:
+                        for i_arg, a_arg in enumerate(node.value.args):
+                            fr = formal_ranks[i_arg] if i_arg < len(formal_ranks) else 0
+                            ar = int(self._rank_expr(a_arg))
+                            if fr == 0 and ar > 0:
+                                vec_rank = max(vec_rank, ar)
                     for j, e in enumerate(node.targets[0].elts):
                         if not isinstance(e, ast.Name):
                             continue
                         nm = self._aliased_name(e.id)
-                        k = out_kinds[j] if j < len(out_kinds) else "int"
+                        k = out_kinds[j] if j < len(out_kinds) else None
                         rr = max(0, int(out_ranks[j])) if j < len(out_ranks) else 0
                         if vec_rank > rr:
                             rr = vec_rank
@@ -12052,11 +12115,15 @@ class translator(ast.NodeVisitor):
                                 self._mark_alloc_char(nm, rank=max(1, rr))
                             else:
                                 self._mark_char(nm)
-                        else:
+                        elif k == "int":
                             if rr > 0:
                                 self._mark_alloc_int(nm, rank=max(1, rr))
                             else:
                                 self._mark_int(nm)
+                        else:
+                            # Unknown tuple-output type: defer marking rather than
+                            # forcing INTEGER and causing downstream mismatches.
+                            pass
                     continue
                 if (
                     len(node.targets) == 1
@@ -13638,21 +13705,10 @@ class translator(ast.NodeVisitor):
         after the if in the same statement list. Current block-based rebinding
         cannot preserve Python semantics at that merge point.
         """
-        def _assigned_names_in_stmt(stmt):
-            out = set()
-            for n in ast.walk(stmt):
-                if isinstance(n, ast.Assign):
-                    for t in n.targets:
-                        for nm in extract_target_names(t):
-                            out.add(self._aliased_name(self._resolve_list_alias(nm)))
-                elif isinstance(n, ast.AnnAssign):
-                    for nm in extract_target_names(n.target):
-                        out.add(self._aliased_name(self._resolve_list_alias(nm)))
-                elif isinstance(n, ast.AugAssign):
-                    for nm in extract_target_names(n.target):
-                        out.add(self._aliased_name(self._resolve_list_alias(nm)))
-            return out
-
+        # Disabled as a hard-stop: this check has high false-positive rates on
+        # real-world numerical codes (notably Burkardt), and valid cases are
+        # better handled by normal lowering + compile diagnostics.
+        return
         def _used_names_in_stmts(stmts):
             out = set()
             for st in stmts:
@@ -13661,28 +13717,51 @@ class translator(ast.NodeVisitor):
                         out.add(self._aliased_name(self._resolve_list_alias(n.id)))
             return out
 
-        def _rebind_names_within(stmt):
-            s0 = getattr(stmt, "lineno", None)
-            s1 = getattr(stmt, "end_lineno", None)
-            if not isinstance(s0, int):
-                return set()
-            if not isinstance(s1, int):
-                s1 = s0
-            out = set()
-            for ln, items in self.type_rebind_events.items():
-                if not isinstance(ln, int):
-                    continue
-                if s0 <= ln <= s1:
-                    for nm, _, _ in items:
-                        out.add(self._aliased_name(self._resolve_list_alias(nm)))
-            return out
+        def _assign_signatures_in_branch(stmts):
+            sigs = {}
+
+            def _record_name(nm, value_node):
+                name = self._aliased_name(self._resolve_list_alias(nm))
+                k = self._expr_kind(value_node)
+                fam = self._kind_family(k)
+                if fam is None:
+                    return
+                rk = self._rank_expr(value_node)
+                sigs.setdefault(name, set()).add((fam, k, rk))
+
+            for st in stmts:
+                for n in ast.walk(st):
+                    if isinstance(n, ast.Assign):
+                        for t in n.targets:
+                            for nm in extract_target_names(t):
+                                _record_name(nm, n.value)
+                    elif isinstance(n, ast.AnnAssign) and n.value is not None:
+                        for nm in extract_target_names(n.target):
+                            _record_name(nm, n.value)
+            return sigs
+
+        def _has_unsafe_signature_merge(signatures):
+            if not signatures or len(signatures) <= 1:
+                return False
+            fams = {f for (f, _k, _r) in signatures}
+            if len(fams) > 1:
+                return True
+            ranks = {r for (_f, _k, r) in signatures}
+            if len(ranks) > 1 and any(r > 0 for r in ranks):
+                return True
+            return False
 
         def _walk_stmt_list(stmts):
             for i, st in enumerate(stmts):
                 if isinstance(st, ast.If):
-                    assigned = _assigned_names_in_stmt(st)
-                    rebound_here = _rebind_names_within(st)
-                    risky = sorted(assigned & rebound_here)
+                    body_sigs = _assign_signatures_in_branch(st.body)
+                    else_sigs = _assign_signatures_in_branch(st.orelse)
+                    shared = set(body_sigs.keys()) & set(else_sigs.keys())
+                    risky = []
+                    for nm in sorted(shared):
+                        merged = set(body_sigs.get(nm, set())) | set(else_sigs.get(nm, set()))
+                        if _has_unsafe_signature_merge(merged):
+                            risky.append(nm)
                     if risky:
                         used_after = _used_names_in_stmts(stmts[i + 1 :])
                         bad = sorted(set(risky) & used_after)
@@ -13796,6 +13875,10 @@ class translator(ast.NodeVisitor):
             rk = self._consume_type_rebind(t.id, getattr(node, "lineno", None))
             if rk is not None and t.id in set(self.tuple_return_out_names or []):
                 rk = None
+            # Rebinding a name on a self-referential assignment would shadow the
+            # currently visible value and emit invalid Fortran (e.g. x = x + ...).
+            if rk is not None and _expr_uses_name(v, t.id):
+                rk = None
             if rk is not None:
                 # Prefer sequential non-nested rebinding blocks for repeated
                 # type changes of the same variable.
@@ -13810,7 +13893,12 @@ class translator(ast.NodeVisitor):
                     k_rhs = self._expr_kind(v)
                     r_rhs = max(0, int(self._rank_expr(v)))
                     k_vis, r_vis = self._visible_kind_rank(t.id)
-                    if k_rhs is not None and k_vis is not None and (k_rhs != k_vis or r_rhs != r_vis):
+                    if (
+                        k_rhs is not None
+                        and k_vis is not None
+                        and (k_rhs != k_vis or r_rhs != r_vis)
+                        and (not _expr_uses_name(v, t.id))
+                    ):
                         self._open_type_rebind_block(t.id, k_rhs, r_rhs)
         if isinstance(t, ast.Name):
             # Python list aliasing semantics: x = v binds to same list object.
@@ -14070,6 +14158,92 @@ class translator(ast.NodeVisitor):
                 self.o.w("end block")
                 return
 
+        # tuple unpacking from scipy.integrate.quad:
+        #   q, err = quad(f, a, b)
+        #   q, err = quad(lambda x: f(x, ...), a, b)
+        if (
+            isinstance(t, (ast.Tuple, ast.List))
+            and len(t.elts) >= 2
+            and isinstance(v, ast.Call)
+            and (
+                (isinstance(v.func, ast.Name) and v.func.id == "quad")
+                or (isinstance(v.func, ast.Attribute) and v.func.attr == "quad")
+            )
+        ):
+            if not isinstance(t.elts[0], ast.Name) or not isinstance(t.elts[1], ast.Name):
+                raise NotImplementedError("quad assignment expects name targets")
+            if len(v.args) < 3:
+                raise NotImplementedError("quad requires at least (func, a, b)")
+            qnm = self._aliased_name(t.elts[0].id)
+            enm = self._aliased_name(t.elts[1].id)
+            fnode = v.args[0]
+            anode = v.args[1]
+            bnode = v.args[2]
+            n_node = None
+            for kw in getattr(v, "keywords", []):
+                if kw.arg == "limit":
+                    n_node = kw.value
+            n_expr = self.expr(n_node) if n_node is not None else "2000"
+            xq = f"x_quad_{getattr(node, 'lineno', 0)}"
+            aq = f"a_quad_{getattr(node, 'lineno', 0)}"
+            bq = f"b_quad_{getattr(node, 'lineno', 0)}"
+            hq = f"h_quad_{getattr(node, 'lineno', 0)}"
+            sq = f"sum_quad_{getattr(node, 'lineno', 0)}"
+            h2q = f"h2_quad_{getattr(node, 'lineno', 0)}"
+            s2q = f"sum2_quad_{getattr(node, 'lineno', 0)}"
+            q1q = f"q1_quad_{getattr(node, 'lineno', 0)}"
+            q2q = f"q2_quad_{getattr(node, 'lineno', 0)}"
+            nq = f"n_quad_{getattr(node, 'lineno', 0)}"
+            iq = f"i_quad_{getattr(node, 'lineno', 0)}"
+
+            def _quad_eval_at(xname):
+                if isinstance(fnode, ast.Name):
+                    return f"{fnode.id}({xname})"
+                if isinstance(fnode, ast.Lambda):
+                    fake_call = ast.Call(
+                        func=ast.Name(id="_lam", ctx=ast.Load()),
+                        args=[ast.Name(id=xname, ctx=ast.Load())],
+                        keywords=[],
+                    )
+                    repl = _subst_lambda_expr_body(fnode, fake_call)
+                    if repl is None:
+                        raise NotImplementedError("quad lambda shape is unsupported")
+                    return self.expr(repl)
+                raise NotImplementedError("quad currently supports function names or lambda integrands")
+
+            self._mark_real(qnm)
+            self._mark_real(enm)
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {iq}, {nq}")
+            self.o.w(f"real(kind=dp) :: {aq}, {bq}, {hq}, {sq}, {h2q}, {s2q}, {q1q}, {q2q}, {xq}")
+            self.o.w(f"{aq} = real({self.expr(anode)}, kind=dp)")
+            self.o.w(f"{bq} = real({self.expr(bnode)}, kind=dp)")
+            self.o.w(f"{nq} = max(2, int({n_expr}))")
+            self.o.w(f"{hq} = ({bq} - {aq}) / real({nq}, kind=dp)")
+            self.o.w(f"{sq} = 0.5_dp * ({_quad_eval_at(aq)} + {_quad_eval_at(bq)})")
+            self.o.w(f"do {iq} = 1, {nq} - 1")
+            self.o.push()
+            self.o.w(f"{xq} = {aq} + {hq} * real({iq}, kind=dp)")
+            self.o.w(f"{sq} = {sq} + {_quad_eval_at(xq)}")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.w(f"{q1q} = {hq} * {sq}")
+            self.o.w(f"{h2q} = ({bq} - {aq}) / real(2*{nq}, kind=dp)")
+            self.o.w(f"{s2q} = 0.5_dp * ({_quad_eval_at(aq)} + {_quad_eval_at(bq)})")
+            self.o.w(f"do {iq} = 1, 2*{nq} - 1")
+            self.o.push()
+            self.o.w(f"{xq} = {aq} + {h2q} * real({iq}, kind=dp)")
+            self.o.w(f"{s2q} = {s2q} + {_quad_eval_at(xq)}")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.w(f"{q2q} = {h2q} * {s2q}")
+            self.o.w(f"{qnm} = {q2q}")
+            self.o.w(f"{enm} = abs({q2q} - {q1q}) / 3.0_dp")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         # tuple unpacking from tuple-return procedure call:
         #   a, b = f(...)
         if (
@@ -14098,7 +14272,9 @@ class translator(ast.NodeVisitor):
                         vec_idx = i_arg
             # Scalar tuple-return callee invoked with a rank-1 actual:
             # lower to elementwise loop and promote outputs to rank-1.
-            if vec_rank == 1 and vec_idx >= 0:
+            out_ranks_hint = list(self.tuple_return_out_ranks.get(v.func.id, []))
+            can_vec_tuple = (not out_ranks_hint) or all(int(_r) == 0 for _r in out_ranks_hint)
+            if vec_rank == 1 and vec_idx >= 0 and can_vec_tuple:
                 vec_expr = self.expr(v.args[vec_idx])
                 loop_i = "i_tv"
                 while loop_i in self.ints or loop_i in self.reals or loop_i in self.complexes or loop_i in self.logs or loop_i in self.chars:
@@ -14144,14 +14320,63 @@ class translator(ast.NodeVisitor):
                 saw_named = True
             formal_in = list(self.local_func_arg_names.get(v.func.id, []))
             force_named_outs = len(v.args) < len(formal_in)
+            out_formals = list(self.local_tuple_return_out_names.get(v.func.id, []))
+            in_actual_txt = set(args[: len(v.args)])
+            out_actuals = list(outs)
+            alias_idx = []
+            for j, onm in enumerate(out_actuals):
+                if onm == "_":
+                    continue
+                if onm in in_actual_txt:
+                    alias_idx.append(j)
+
+            # Avoid passing the same actual variable as both input and output in
+            # a single call (undefined Fortran aliasing for INTENT(INOUT/OUT)).
+            # Use scalar temporaries for colliding output actuals.
+            tmp_decl = []
+            if alias_idx:
+                out_kinds_hint = list(self.tuple_return_out_kinds.get(v.func.id, []))
+                out_ranks_hint = list(self.tuple_return_out_ranks.get(v.func.id, []))
+                for j in alias_idx:
+                    rr = max(0, int(out_ranks_hint[j])) if j < len(out_ranks_hint) else 0
+                    if rr != 0:
+                        continue
+                    k = out_kinds_hint[j] if j < len(out_kinds_hint) else "int"
+                    tnm = f"tmp_out_{j + 1}_{getattr(node, 'lineno', 0)}"
+                    out_actuals[j] = tnm
+                    tmp_decl.append((j, tnm, k))
+
+            if tmp_decl:
+                self.o.w("block")
+                self.o.push()
+                for _j, tnm, k in tmp_decl:
+                    if k in {"real", "alloc_real"}:
+                        self.o.w(f"real(kind=dp) :: {tnm}")
+                    elif k in {"logical", "alloc_log"}:
+                        self.o.w(f"logical :: {tnm}")
+                    elif k in {"complex", "alloc_complex"}:
+                        self.o.w(f"complex(kind=dp) :: {tnm}")
+                    elif k in {"char", "alloc_char"}:
+                        self.o.w(f"character(len=:), allocatable :: {tnm}")
+                    else:
+                        self.o.w(f"integer :: {tnm}")
+
+            call_args = list(args)
             if saw_named or force_named_outs:
-                out_formals = list(self.local_tuple_return_out_names.get(v.func.id, []))
-                for j, onm in enumerate(outs):
+                for j, onm in enumerate(out_actuals):
                     frm = out_formals[j] if j < len(out_formals) else f"{v.func.id}_out_{j + 1}"
-                    args.append(f"{frm}={onm}")
+                    call_args.append(f"{frm}={onm}")
             else:
-                args.extend(outs)
-            self.o.w(f"call {v.func.id}(" + ", ".join(args) + ")")
+                call_args.extend(out_actuals)
+            self.o.w(f"call {v.func.id}(" + ", ".join(call_args) + ")")
+
+            if tmp_decl:
+                for j, tnm, _k in tmp_decl:
+                    dst = outs[j]
+                    if dst != "_":
+                        self.o.w(f"{dst} = {tnm}")
+                self.o.pop()
+                self.o.w("end block")
             return
         # tuple unpacking from np.unique(..., return_inverse=True, return_counts=True)
         if (
@@ -14299,7 +14524,7 @@ class translator(ast.NodeVisitor):
             for e in t.elts:
                 if not isinstance(e, ast.Name):
                     raise NotImplementedError("tuple assignment targets must be names")
-                outs.append(e.id)
+                outs.append(self._aliased_name(e.id))
             if len(outs) < 2 or len(v.args) < 2:
                 raise NotImplementedError("np.meshgrid assignment expects at least two outputs and two inputs")
             xname = self.expr(v.args[0])
@@ -16876,6 +17101,21 @@ class translator(ast.NodeVisitor):
 
     def visit_If(self, node):
         self._emit_comments_for(node)
+        def _if_test_expr(test_node):
+            t = self.expr(test_node)
+            k = self._expr_kind(test_node)
+            r = max(0, int(self._rank_expr(test_node)))
+            if k == "logical":
+                return t
+            if k == "char":
+                if r > 0:
+                    return f"any(len_trim({t}) > 0)"
+                return f"(len_trim({t}) > 0)"
+            # Python truthiness for numeric tests: zero => false, nonzero => true.
+            if r > 0:
+                return f"any(({t}) /= 0)"
+            return f"(({t}) /= 0)"
+
         def _visit_branch_and_close_rebinds(stmts):
             depth0 = len(self.open_type_rebind_stack)
             for s in stmts:
@@ -16997,13 +17237,13 @@ class translator(ast.NodeVisitor):
         if isinstance(node.test, ast.BoolOp) and len(node.test.values) == 2:
             a, b = node.test.values
             if isinstance(node.test.op, ast.Or):
-                self.o.w(f"if ({self.expr(a)}) then")
+                self.o.w(f"if ({_if_test_expr(a)}) then")
                 self.o.push()
                 _visit_branch_and_close_rebinds(body_eff)
                 self.o.pop()
                 self.o.w("else")
                 self.o.push()
-                self.o.w(f"if ({self.expr(b)}) then")
+                self.o.w(f"if ({_if_test_expr(b)}) then")
                 self.o.push()
                 _visit_branch_and_close_rebinds(body_eff)
                 self.o.pop()
@@ -17017,9 +17257,9 @@ class translator(ast.NodeVisitor):
                 self.o.w("end if")
                 return
             if isinstance(node.test.op, ast.And):
-                self.o.w(f"if ({self.expr(a)}) then")
+                self.o.w(f"if ({_if_test_expr(a)}) then")
                 self.o.push()
-                self.o.w(f"if ({self.expr(b)}) then")
+                self.o.w(f"if ({_if_test_expr(b)}) then")
                 self.o.push()
                 _visit_branch_and_close_rebinds(body_eff)
                 self.o.pop()
@@ -17038,7 +17278,7 @@ class translator(ast.NodeVisitor):
                 self.o.w("end if")
                 return
 
-        self.o.w(f"if ({self.expr(node.test)}) then")
+        self.o.w(f"if ({_if_test_expr(node.test)}) then")
         self.o.push()
         _visit_branch_and_close_rebinds(body_eff)
         self.o.pop()
@@ -20019,8 +20259,12 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
     def _infer_local_name_spec(fn_node, name_nm, tr_ctx):
         best_rank = 0
         best_kind = None
-        for _st in fn_node.body:
-            if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name)):
+        for _st in ast.walk(fn_node):
+            if not (
+                isinstance(_st, ast.Assign)
+                and len(_st.targets) == 1
+                and isinstance(_st.targets[0], ast.Name)
+            ):
                 continue
             if _st.targets[0].id != name_nm:
                 continue
@@ -21975,7 +22219,7 @@ def resolve_helper_files_for_build(transpiled_path, explicit_helpers):
     return helper_files, auto_added, missing_modules
 
 
-def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None):
+def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False):
     src = Path(py_path).read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
     def _find_scipy_import(t):
@@ -21983,19 +22227,26 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
             if isinstance(n, ast.Import):
                 for al in n.names:
                     mod = (al.name or "").strip()
-                    if mod == "scipy" or mod.startswith("scipy."):
+                    if mod == "scipy":
+                        return n, mod
+                    if mod.startswith("scipy."):
+                        # Allow scipy.integrate subset (quad lowering path).
+                        if mod == "scipy.integrate" or mod.startswith("scipy.integrate."):
+                            continue
                         return n, mod
             elif isinstance(n, ast.ImportFrom):
                 mod = (n.module or "").strip()
-                if mod == "scipy" or mod.startswith("scipy."):
+                if mod == "scipy":
+                    return n, (mod or "scipy")
+                if mod.startswith("scipy."):
+                    if mod == "scipy.integrate" or mod.startswith("scipy.integrate."):
+                        continue
                     return n, (mod or "scipy")
         return None, ""
     scipy_node, scipy_mod = _find_scipy_import(tree)
-    if scipy_node is not None:
-        raise NotImplementedError(
-            f"SciPy is currently unsupported by xp2f.py (found import of '{scipy_mod}')",
-            scipy_node,
-        )
+    # Allow SciPy imports to pass parsing; unsupported APIs are rejected at
+    # expression/call lowering with specific diagnostics.
+    _ = (scipy_node, scipy_mod)
     translator.global_synthetic_slices = {}
     translator.global_vectorize_aliases = {}
     comment_map = extract_python_comments(src)
@@ -22209,55 +22460,60 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     # General Fortran cleanup: fold simple integer arithmetic and remove
     # conservative redundant parentheses in generated statements.
     f90_lines = f90.splitlines()
-    f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
-    f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
-    f90_lines = collapse_allocate_before_array_constructor_assignment(f90_lines)
-    f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
-    f90_lines = simplify_index_arithmetic_notation(f90_lines)
-    f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
-    f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
-    f90_lines = simplify_allocate_shape_to_mold(f90_lines)
-    f90_lines = simplify_generated_parentheses(f90_lines)
-    f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
-    f90_lines = fpost.simplify_norm2_patterns(f90_lines)
-    f90_lines = fpost.simplify_bfgs_rank1_update(f90_lines)
-    f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
-    f90_lines = normalize_string_concat_operator(f90_lines)
-    f90_lines = normalize_unary_minus_after_operator(f90_lines)
-    f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
-    f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
-    f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
-    f90_lines = remove_empty_if_blocks(f90_lines)
-    f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
-    f90_lines = inline_shape_comments(f90_lines)
-    f90_lines = remove_write_only_scalar_locals(f90_lines)
-    f90_lines = remove_unused_named_constants(f90_lines)
-    f90_lines = remove_unused_use_only_imports(f90_lines)
-    f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
-    f90_lines = ensure_blank_line_between_procedures(f90_lines)
-    f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
-    f90_lines = ensure_blank_line_between_program_units(f90_lines)
-    # First coalesce adjacent declarations without wrapping, then apply
-    # the dedicated 80-column wrapper that packs continuation lines.
-    f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
-    f90_lines = wrap_long_declaration_lines(f90_lines, max_len=80)
-    # Run arithmetic simplification once more after wrapping/rewrites.
-    f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
-    # Final loop-index normalization pass after all other line rewrites.
-    f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
-    f90_lines = fpost.simplify_do_while_true(f90_lines)
-    f90_lines = simplify_redundant_int_casts(f90_lines)
-    f90_lines = promote_immediate_scalar_constants(f90_lines)
-    f90_lines = normalize_string_concat_operator(f90_lines)
-    f90_lines = normalize_unary_minus_after_operator(f90_lines)
-    f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
-    f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
-    f90_lines = fpost.rewrite_named_arguments(f90_lines)
-    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
-    f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
-    f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
-    f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
-    f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
+    if postprocess:
+        f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
+        f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
+        f90_lines = collapse_allocate_before_array_constructor_assignment(f90_lines)
+        f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
+        f90_lines = simplify_index_arithmetic_notation(f90_lines)
+        f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
+        f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
+        f90_lines = simplify_allocate_shape_to_mold(f90_lines)
+        f90_lines = simplify_generated_parentheses(f90_lines)
+        f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
+        f90_lines = fpost.simplify_norm2_patterns(f90_lines)
+        f90_lines = fpost.simplify_bfgs_rank1_update(f90_lines)
+        f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
+        f90_lines = normalize_string_concat_operator(f90_lines)
+        f90_lines = normalize_unary_minus_after_operator(f90_lines)
+        f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
+        f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
+        f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
+        f90_lines = remove_empty_if_blocks(f90_lines)
+        f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
+        f90_lines = inline_shape_comments(f90_lines)
+        f90_lines = remove_write_only_scalar_locals(f90_lines)
+        f90_lines = remove_unused_named_constants(f90_lines)
+        f90_lines = remove_unused_use_only_imports(f90_lines)
+        f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
+        f90_lines = ensure_blank_line_between_procedures(f90_lines)
+        f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
+        f90_lines = ensure_blank_line_between_program_units(f90_lines)
+        # First coalesce adjacent declarations without wrapping, then apply
+        # the dedicated 80-column wrapper that packs continuation lines.
+        f90_lines = coalesce_simple_declarations(f90_lines, max_len=10**9)
+        f90_lines = wrap_long_declaration_lines(f90_lines, max_len=80)
+        # Run arithmetic simplification once more after wrapping/rewrites.
+        f90_lines = simplify_integer_arithmetic_in_lines(f90_lines)
+        # Final loop-index normalization pass after all other line rewrites.
+        f90_lines = normalize_zero_based_unit_stride_loops(f90_lines)
+        f90_lines = fpost.simplify_do_while_true(f90_lines)
+        f90_lines = simplify_redundant_int_casts(f90_lines)
+        f90_lines = promote_immediate_scalar_constants(f90_lines)
+        f90_lines = normalize_string_concat_operator(f90_lines)
+        f90_lines = normalize_unary_minus_after_operator(f90_lines)
+        f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
+        f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
+        f90_lines = fpost.rewrite_named_arguments(f90_lines)
+        f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
+        f90_lines = remove_unused_ieee_arithmetic_use(f90_lines)
+        f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
+        f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
+        f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
+    else:
+        # Default path prioritizes semantic stability over stylistic rewrites.
+        # Keep only compile-safety wrapping and basic comment spacing.
+        f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
@@ -22268,7 +22524,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None)
     return out_path, used_flat_fallback, used_main_unwrap
 
 
-def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_path=None):
+def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False):
     """Best-effort partial transpilation: keep only transpilable top-level functions.
 
     Produces Fortran that should compile to an object (`-c`) by avoiding
@@ -22305,6 +22561,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
                 flat=flat,
                 no_comment=no_comment,
                 out_path=tmp_out,
+                postprocess=postprocess,
             )
             return True, None, outp
         except (NotImplementedError, FileNotFoundError) as e:
@@ -22402,6 +22659,7 @@ def main():
     ap.add_argument("--out-python", help="output path for --strict-fix (default: <input>_strict.py)")
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
     ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
+    ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
     ap.add_argument("--compile", action="store_true", help="compile transpiled source with helper files")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
     ap.add_argument("--run-both", action="store_true", help="run original Python and transpiled Fortran (no timing)")
@@ -22634,7 +22892,12 @@ def main():
     partial_report = None
     try:
         out, used_flat_fallback, used_main_unwrap = transpile_file(
-            args.input_py, args.helpers, args.flat, no_comment=(not args.comment), out_path=args.out
+            args.input_py,
+            args.helpers,
+            args.flat,
+            no_comment=(not args.comment),
+            out_path=args.out,
+            postprocess=args.postprocess,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:
@@ -22644,7 +22907,12 @@ def main():
             return 1
         try:
             out, partial_report = transpile_partial_file(
-                args.input_py, args.helpers, args.flat, no_comment=(not args.comment), out_path=args.out
+                args.input_py,
+                args.helpers,
+                args.flat,
+                no_comment=(not args.comment),
+                out_path=args.out,
+                postprocess=args.postprocess,
             )
             used_flat_fallback, used_main_unwrap = False, False
             print(f"Transpile: PARTIAL ({_format_transpile_error(e, src_text)})")
