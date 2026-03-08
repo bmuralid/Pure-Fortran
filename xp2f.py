@@ -1316,7 +1316,7 @@ def rename_conflicting_identifiers(src_text):
         "exp", "floor", "huge", "int", "kind", "len", "log", "log10", "max", "maxval",
         "mean", "merge", "min", "minval", "mod", "modulo", "nint", "pack", "present",
         "product", "real", "reshape", "sign", "sin", "size", "spread", "sqrt", "sum",
-        "tiny", "transpose", "trim", "ubound", "lbound",
+        "tiny", "transpose", "trim", "ubound", "lbound", "epsilon",
         # RNG names
         "random_number", "random_seed",
         # helper procedures from python_mod
@@ -1328,7 +1328,7 @@ def rename_conflicting_identifiers(src_text):
         "exp", "floor", "huge", "int", "kind", "len", "log", "log10", "max", "maxval",
         "mean", "merge", "min", "minval", "mod", "modulo", "nint", "pack", "present",
         "product", "real", "reshape", "sign", "sin", "size", "spread", "sqrt", "sum",
-        "tiny", "transpose", "trim", "ubound", "lbound", "random_number", "random_seed",
+        "tiny", "transpose", "trim", "ubound", "lbound", "epsilon", "random_number", "random_seed",
         # helper procedures from python_mod commonly imported with ONLY
         "eye",
     }
@@ -1817,6 +1817,92 @@ def enforce_space_before_inline_comments(lines):
         if not code.endswith(" "):
             code = code + " "
         out.append(code + bang + comment)
+    return out
+
+
+def rewrite_to_list_directed_io(lines):
+    """Rewrite formatted WRITE/PRINT to list-directed output."""
+    out = []
+
+    def _find_matching_rparen(s, lparen_idx):
+        depth = 0
+        in_single = False
+        in_double = False
+        i = lparen_idx
+        while i < len(s):
+            ch = s[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                i += 1
+                continue
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                i += 1
+                continue
+            if in_single or in_double:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return -1
+
+    for ln in lines:
+        code, bang, comment = ln.partition("!")
+        raw = code.rstrip("\r\n")
+        m_write = re.match(r"^(\s*)(?i:write)\b", raw)
+        if m_write:
+            indent = m_write.group(1)
+            p = raw.find("(", m_write.end())
+            if p >= 0:
+                q = _find_matching_rparen(raw, p)
+                if q > p:
+                    tail = raw[q + 1 :].strip()
+                    if tail:
+                        code = f"{indent}write(*,*) {tail}"
+                    else:
+                        code = f"{indent}write(*,*)"
+                    out.append((code + (bang + comment if bang else "")))
+                    continue
+
+        m_print = re.match(r"^(\s*)(?i:print)\b(.*)$", raw)
+        if m_print:
+            indent = m_print.group(1)
+            rest = m_print.group(2).lstrip()
+            if not rest.startswith("*"):
+                if rest.startswith(","):
+                    items = rest[1:].strip()
+                    code = f"{indent}print *, {items}" if items else f"{indent}print *"
+                    out.append((code + (bang + comment if bang else "")))
+                    continue
+                if rest.startswith("(") or rest.startswith("'") or rest.startswith('"'):
+                    idx = 0
+                    if rest.startswith("("):
+                        q = _find_matching_rparen(rest, 0)
+                        idx = (q + 1) if q >= 0 else 0
+                    else:
+                        qch = rest[0]
+                        i = 1
+                        while i < len(rest):
+                            if rest[i] == qch:
+                                i += 1
+                                break
+                            i += 1
+                        idx = i
+                    rem = rest[idx:].lstrip()
+                    if rem.startswith(","):
+                        items = rem[1:].strip()
+                        code = f"{indent}print *, {items}" if items else f"{indent}print *"
+                    else:
+                        code = f"{indent}print *"
+                    out.append((code + (bang + comment if bang else "")))
+                    continue
+
+        out.append(ln)
     return out
 
 
@@ -2940,6 +3026,7 @@ def is_numpy_name_node(node):
 def detect_needed_helpers(tree):
     needed = set()
     linalg_aliases = collect_linalg_aliases(tree)
+    scipy_aliases, _ = collect_scipy_special_aliases(tree)
     np_helper_map = {
         "arange": {"arange_int"},
         "linspace": {"arange_int"},
@@ -3019,6 +3106,7 @@ def detect_needed_helpers(tree):
         def __init__(self):
             super().__init__()
             self.rng_names = set()
+            self.scipy_special_aliases, self.scipy_special_func_aliases = collect_scipy_special_aliases(tree)
 
         def visit_Assign(self, node):
             if (
@@ -3044,6 +3132,43 @@ def detect_needed_helpers(tree):
             self.generic_visit(node)
 
         def visit_Call(self, node):
+            def _attr_chain_parts(n):
+                parts = []
+                cur = n
+                while isinstance(cur, ast.Attribute):
+                    parts.append(cur.attr)
+                    cur = cur.value
+                if not isinstance(cur, ast.Name):
+                    return None
+                return [cur.id] + list(reversed(parts))
+
+            def _is_scipy_special_attr_call(fn):
+                if not isinstance(fn, ast.Attribute):
+                    return False
+                parts = _attr_chain_parts(fn.value)
+                if not parts:
+                    return False
+                if len(parts) >= 2 and parts[0] == "scipy" and parts[1] == "special":
+                    return True
+                if len(parts) == 1 and parts[0] in self.scipy_special_aliases:
+                    return True
+                return False
+
+            def _is_linalg_module_attr(n):
+                if isinstance(n, ast.Name):
+                    return n.id in linalg_aliases
+                if isinstance(n, ast.Attribute):
+                    parts = _attr_chain_parts(n)
+                    if not parts:
+                        return False
+                    if len(parts) >= 2 and parts[-1] == "linalg":
+                        root = parts[0]
+                        if root in {"np", "numpy", "scipy"}:
+                            return True
+                        if root in scipy_aliases:
+                            return True
+                return False
+
             is_print_like = (
                 (isinstance(node.func, ast.Name) and node.func.id == "print")
                 or (
@@ -3055,6 +3180,25 @@ def detect_needed_helpers(tree):
             )
             if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr"}:
                 needed.add("py_str")
+            if isinstance(node.func, ast.Name) and node.func.id in self.scipy_special_func_aliases:
+                fnm = self.scipy_special_func_aliases[node.func.id]
+                if fnm == "factorial":
+                    needed.add("special_factorial")
+                elif fnm == "factorial2":
+                    needed.add("special_factorial2")
+                elif fnm == "comb":
+                    needed.add("special_comb")
+                elif fnm == "binom":
+                    needed.add("special_binom")
+            if isinstance(node.func, ast.Attribute) and _is_scipy_special_attr_call(node.func):
+                if node.func.attr == "factorial":
+                    needed.add("special_factorial")
+                elif node.func.attr == "factorial2":
+                    needed.add("special_factorial2")
+                elif node.func.attr == "comb":
+                    needed.add("special_comb")
+                elif node.func.attr == "binom":
+                    needed.add("special_binom")
             if isinstance(node.func, ast.Name) and node.func.id == "float":
                 needed.add("py_float")
             if (
@@ -3398,9 +3542,7 @@ def detect_needed_helpers(tree):
                 needed.update(np_reduceat_helper_map[node.func.value.attr])
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
+                and _is_linalg_module_attr(node.func.value)
             ):
                 if node.func.attr == "solve":
                     needed.add("linalg_solve")
@@ -3445,10 +3587,8 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_svd")
                 elif node.func.attr == "qr":
                     needed.add("linalg_qr_reduced")
-                elif node.func.attr == "eigh":
-                    needed.add("linalg_eigh")
-                elif node.func.attr == "qr":
-                    needed.add("linalg_qr_reduced")
+                elif node.func.attr == "lstsq":
+                    needed.add("linalg_solve")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3609,9 +3749,40 @@ def collect_linalg_aliases(tree):
             for al in node.names:
                 nm = (al.name or "").strip()
                 asn = (al.asname or "").strip()
-                if nm == "linalg" and asn:
-                    aliases.add(asn)
+                if nm == "linalg":
+                    aliases.add(asn or nm)
     return aliases
+
+
+def collect_scipy_special_aliases(tree):
+    """Collect aliases for scipy.special module and directly imported functions."""
+    module_aliases = set()
+    func_aliases = {}
+    supported = {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if mod == "scipy":
+                    module_aliases.add(asn or "scipy")
+                elif mod == "scipy.special":
+                    module_aliases.add(asn or "scipy")
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").strip()
+            if mod == "scipy":
+                for al in node.names:
+                    nm = (al.name or "").strip()
+                    asn = (al.asname or "").strip()
+                    if nm == "special":
+                        module_aliases.add(asn or "special")
+            elif mod == "scipy.special":
+                for al in node.names:
+                    nm = (al.name or "").strip()
+                    asn = (al.asname or "").strip()
+                    if nm in supported:
+                        func_aliases[asn or nm] = nm
+    return module_aliases, func_aliases
 
 
 def collect_structured_dtype_info(tree):
@@ -5215,6 +5386,8 @@ class translator(ast.NodeVisitor):
     global_synthetic_slices = {}
     global_vectorize_aliases = {}
     global_linalg_aliases = set()
+    global_scipy_special_aliases = set()
+    global_scipy_special_func_aliases = {}
 
     def __init__(
         self,
@@ -5303,6 +5476,8 @@ class translator(ast.NodeVisitor):
         self.synthetic_slices = dict(translator.global_synthetic_slices)
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
         self.linalg_aliases = set(translator.global_linalg_aliases)
+        self.scipy_special_aliases = set(translator.global_scipy_special_aliases)
+        self.scipy_special_func_aliases = dict(translator.global_scipy_special_func_aliases)
         self.promoted_colvec_results = set()
         self.uses_sys_argv = False
         self.var_type_first_seen = {}
@@ -5311,7 +5486,7 @@ class translator(ast.NodeVisitor):
         self.type_rebind_targets = set()
         self.open_type_rebind_stack = []
         self.open_type_rebind_meta = []
-        self.reserved_names = {"dp", "eye"}
+        self.reserved_names = {"dp", "eye", "epsilon"}
         self.name_aliases = {}
         self.fortran_name_owner = {}
         self.synthetic_alias_names = set()
@@ -5331,6 +5506,50 @@ class translator(ast.NodeVisitor):
             seen.add(cur)
             cur = self.list_aliases[cur]
         return cur
+
+    def _attr_chain_parts(self, node):
+        parts = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if not isinstance(cur, ast.Name):
+            return None
+        return [cur.id] + list(reversed(parts))
+
+    def _is_scipy_special_call_attr(self, func_node):
+        if not isinstance(func_node, ast.Attribute):
+            return False
+        parts = self._attr_chain_parts(func_node.value)
+        if not parts:
+            return False
+        if len(parts) >= 2 and parts[0] == "scipy" and parts[1] == "special":
+            return True
+        if len(parts) == 1 and parts[0] in self.scipy_special_aliases:
+            return True
+        return False
+
+    def _is_linalg_module_attr(self, node):
+        if isinstance(node, ast.Name):
+            return node.id in self.linalg_aliases
+        if isinstance(node, ast.Attribute):
+            parts = self._attr_chain_parts(node)
+            if not parts:
+                return False
+            if len(parts) >= 2 and parts[-1] == "linalg":
+                root = parts[0]
+                if root in {"np", "numpy", "scipy"}:
+                    return True
+                if root in self.scipy_special_aliases:
+                    return True
+        return False
+
+    def _is_linalg_call(self, func_node, attrs=None):
+        if not isinstance(func_node, ast.Attribute):
+            return False
+        if attrs is not None and func_node.attr not in set(attrs):
+            return False
+        return self._is_linalg_module_attr(func_node.value)
 
     def _is_python_list_expr(self, node):
         if isinstance(node, (ast.List, ast.ListComp)):
@@ -6322,21 +6541,9 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return self._expr_kind(node.args[0])
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "cond"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"cond"}) and len(node.args) >= 1:
                 return "real"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in self.linalg_aliases
-                and node.func.attr in {"solve", "cholesky", "det", "inv", "cond", "eig", "eigh", "svd", "qr"}
-            ):
+            if self._is_linalg_call(node.func, {"solve", "cholesky", "det", "inv", "cond", "eig", "eigh", "svd", "qr", "lstsq"}):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -6416,6 +6623,10 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "diag" and len(node.args) >= 1:
                 return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Name):
+                if node.func.id in self.scipy_special_func_aliases and len(node.args) >= 1:
+                    fnm = self.scipy_special_func_aliases[node.func.id]
+                    if fnm in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom"}:
+                        return "real"
                 if node.func.id in {"gammaln", "lgamma"} and len(node.args) == 1:
                     return "real"
                 if node.func.id in {"max", "min"}:
@@ -6472,6 +6683,13 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.id in {"complex"}:
                     return "complex"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and self._is_scipy_special_call_attr(node.func)
+                and node.func.attr in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom"}
+                and len(node.args) >= 1
+            ):
+                return "real"
                 if node.func.id in {"int", "isqrt", "size", "len"}:
                     return "int"
                 if node.func.id in {"str", "repr"}:
@@ -7592,6 +7810,20 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.Call):
             if (
                 isinstance(node.func, ast.Attribute)
+                and self._is_scipy_special_call_attr(node.func)
+                and node.func.attr in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2"}
+                and len(node.args) >= 1
+            ):
+                return self._rank_expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and self._is_scipy_special_call_attr(node.func)
+                and node.func.attr in {"comb", "binom"}
+                and len(node.args) >= 2
+            ):
+                return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
+            if (
+                isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr in {"copy", "empty_like", "flipud"}
                 and len(node.args) >= 1
@@ -7604,23 +7836,13 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return self._rank_expr(node.args[0])
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "cond"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"cond"}) and len(node.args) >= 1:
                 return 0
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in self.linalg_aliases
-                and node.func.attr == "solve"
-                and len(node.args) >= 2
-            ):
+            if self._is_linalg_call(node.func, {"solve"}) and len(node.args) >= 2:
                 # Same rank behavior as numpy.linalg.solve: follows RHS rank.
+                return self._rank_expr(node.args[1])
+            if self._is_linalg_call(node.func, {"lstsq"}) and len(node.args) >= 2:
+                # First output x follows RHS rank in our lowered subset.
                 return self._rank_expr(node.args[1])
             if isinstance(node.func, ast.Name) and node.func.id in self.lambda_vars:
                 repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
@@ -7666,6 +7888,20 @@ class translator(ast.NodeVisitor):
                 if len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 return 0
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.scipy_special_func_aliases
+                and self.scipy_special_func_aliases[node.func.id] in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2"}
+                and len(node.args) >= 1
+            ):
+                return self._rank_expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.scipy_special_func_aliases
+                and self.scipy_special_func_aliases[node.func.id] in {"comb", "binom"}
+                and len(node.args) >= 2
+            ):
+                return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
             if isinstance(node.func, ast.Name) and node.func.id in {
                 "cumsum",
                 "cumprod",
@@ -7720,15 +7956,7 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"fft", "ifft", "rfft", "irfft", "fftfreq", "rfftfreq"}
             ):
                 return 1
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and isinstance(node.func.value.value, ast.Name)
-                and node.func.value.value.id == "np"
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "norm"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"norm"}) and len(node.args) >= 1:
                 axis_node = None
                 for kw in node.keywords:
                     if kw.arg == "axis":
@@ -8019,9 +8247,7 @@ class translator(ast.NodeVisitor):
                 return self._rank_expr(node.func.value)
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
+                and self._is_linalg_module_attr(node.func.value)
             ):
                 if node.func.attr == "solve" and len(node.args) >= 2:
                     return self._rank_expr(node.args[1])
@@ -9384,8 +9610,9 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and not (
-                    _module_attr_root_name(node.func.value) in {"np", "math", "random"}
+                    _module_attr_root_name(node.func.value) in {"np", "numpy", "math", "random", "scipy"}
                 )
+                and not self._is_linalg_module_attr(node.func.value)
             ):
                 base_expr = self.expr(node.func.value)
                 attr = node.func.attr
@@ -9619,6 +9846,50 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "sorted":
                 raise NotImplementedError("sorted(...) is currently supported only in for-loops")
             if isinstance(node.func, ast.Name):
+                if node.func.id in self.scipy_special_func_aliases and len(node.args) >= 1:
+                    fnm = self.scipy_special_func_aliases[node.func.id]
+                    if fnm in {"comb", "binom"} and len(node.args) >= 2:
+                        a0 = self.expr(node.args[0])
+                        a1 = self.expr(node.args[1])
+                        if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                            a0 = f"real({a0}, kind=dp)"
+                        if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                            a1 = f"real({a1}, kind=dp)"
+                        if fnm == "binom":
+                            return f"special_binom({a0}, {a1})"
+                        exact_txt = None
+                        rep_txt = None
+                        if len(node.args) >= 3:
+                            exact_txt = self.expr(node.args[2])
+                        if len(node.args) >= 4:
+                            rep_txt = self.expr(node.args[3])
+                        for kw in node.keywords:
+                            if kw.arg == "exact":
+                                exact_txt = self.expr(kw.value)
+                            elif kw.arg == "repetition":
+                                rep_txt = self.expr(kw.value)
+                        parts = [a0, a1]
+                        if exact_txt is not None:
+                            parts.append(f"exact={exact_txt}")
+                        if rep_txt is not None:
+                            parts.append(f"repetition={rep_txt}")
+                        return "special_comb(" + ", ".join(parts) + ")"
+                    a0 = self.expr(node.args[0])
+                    k0 = self._expr_kind(node.args[0])
+                    if k0 in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if fnm in {"gammaln", "lgamma"}:
+                        return f"log_gamma({a0})"
+                    if fnm == "gamma":
+                        return f"gamma({a0})"
+                    if fnm == "erf":
+                        return f"erf({a0})"
+                    if fnm == "erfc":
+                        return f"erfc({a0})"
+                    if fnm == "factorial":
+                        return f"special_factorial({a0})"
+                    if fnm == "factorial2":
+                        return f"special_factorial2({a0})"
                 if node.func.id in {"gammaln", "lgamma"} and len(node.args) == 1:
                     a0 = self.expr(node.args[0])
                     k0 = self._expr_kind(node.args[0])
@@ -10270,67 +10541,17 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "dot" and self._rank_expr(node.args[0]) == 1 and self._rank_expr(node.args[1]) == 1:
                     return f"dot_product({a0}, {a1})"
                 return f"matmul({a0}, {a1})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "solve"
-                and len(node.args) >= 2
-            ):
+            if self._is_linalg_call(node.func, {"solve"}) and len(node.args) >= 2:
                 return f"linalg_solve({self.expr(node.args[0])}, {self.expr(node.args[1])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in self.linalg_aliases
-                and node.func.attr == "solve"
-                and len(node.args) >= 2
-            ):
-                return f"linalg_solve({self.expr(node.args[0])}, {self.expr(node.args[1])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "cholesky"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"cholesky"}) and len(node.args) >= 1:
                 return f"linalg_cholesky({self.expr(node.args[0])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "det"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"det"}) and len(node.args) >= 1:
                 return f"linalg_det({self.expr(node.args[0])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "inv"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"inv"}) and len(node.args) >= 1:
                 return f"linalg_inv({self.expr(node.args[0])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "cond"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"cond"}) and len(node.args) >= 1:
                 return f"linalg_cond({self.expr(node.args[0])})"
-            if (
-                isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Attribute)
-                and is_numpy_name_node(node.func.value.value)
-                and node.func.value.attr == "linalg"
-                and node.func.attr == "norm"
-                and len(node.args) >= 1
-            ):
+            if self._is_linalg_call(node.func, {"norm"}) and len(node.args) >= 1:
                 a0 = self.expr(node.args[0])
                 ord_node = None
                 axis_node = None
@@ -10353,7 +10574,7 @@ class translator(ast.NodeVisitor):
                 ord_is_posinf = bool(
                     isinstance(ord_node, ast.Attribute)
                     and isinstance(ord_node.value, ast.Name)
-                    and node.func.value.value.id in {"np", "numpy"}
+                    and is_numpy_name_node(ord_node.value)
                     and ord_node.attr == "inf"
                 )
                 ord_is_neginf = bool(
@@ -10361,7 +10582,7 @@ class translator(ast.NodeVisitor):
                     and isinstance(ord_node.op, ast.USub)
                     and isinstance(ord_node.operand, ast.Attribute)
                     and isinstance(ord_node.operand.value, ast.Name)
-                    and node.func.value.value.id in {"np", "numpy"}
+                    and is_numpy_name_node(ord_node.operand.value)
                     and ord_node.operand.attr == "inf"
                 )
                 if axis_node is not None:
@@ -11711,6 +11932,53 @@ class translator(ast.NodeVisitor):
                 return f"atan2({y0}, {x0})"
             if (
                 isinstance(node.func, ast.Attribute)
+                and self._is_scipy_special_call_attr(node.func)
+                and node.func.attr in {"gamma", "gammaln", "lgamma", "erf", "erfc", "factorial", "factorial2", "comb", "binom"}
+                and len(node.args) >= 1
+            ):
+                if node.func.attr in {"comb", "binom"} and len(node.args) >= 2:
+                    a0 = self.expr(node.args[0])
+                    a1 = self.expr(node.args[1])
+                    if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                        a0 = f"real({a0}, kind=dp)"
+                    if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                        a1 = f"real({a1}, kind=dp)"
+                    if node.func.attr == "binom":
+                        return f"special_binom({a0}, {a1})"
+                    exact_txt = None
+                    rep_txt = None
+                    if len(node.args) >= 3:
+                        exact_txt = self.expr(node.args[2])
+                    if len(node.args) >= 4:
+                        rep_txt = self.expr(node.args[3])
+                    for kw in node.keywords:
+                        if kw.arg == "exact":
+                            exact_txt = self.expr(kw.value)
+                        elif kw.arg == "repetition":
+                            rep_txt = self.expr(kw.value)
+                    parts = [a0, a1]
+                    if exact_txt is not None:
+                        parts.append(f"exact={exact_txt}")
+                    if rep_txt is not None:
+                        parts.append(f"repetition={rep_txt}")
+                    return "special_comb(" + ", ".join(parts) + ")"
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if node.func.attr in {"gammaln", "lgamma"}:
+                    return f"log_gamma({a0})"
+                if node.func.attr == "gamma":
+                    return f"gamma({a0})"
+                if node.func.attr == "erf":
+                    return f"erf({a0})"
+                if node.func.attr == "erfc":
+                    return f"erfc({a0})"
+                if node.func.attr == "factorial":
+                    return f"special_factorial({a0})"
+                return f"special_factorial2({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "platform"
                 and node.func.attr == "python_version"
@@ -12439,10 +12707,7 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.targets[0], (ast.Tuple, ast.List))
                     and isinstance(node.value, ast.Call)
                     and isinstance(node.value.func, ast.Attribute)
-                    and isinstance(node.value.func.value, ast.Attribute)
-                    and isinstance(node.value.func.value.value, ast.Name)
-                    and node.value.func.value.value.id == "np"
-                    and node.value.func.value.attr == "linalg"
+                    and self._is_linalg_module_attr(node.value.func.value)
                 ):
                     outs = [e.id for e in node.targets[0].elts if isinstance(e, ast.Name)]
                     if node.value.func.attr == "eig" and len(outs) >= 2:
@@ -14691,10 +14956,7 @@ class translator(ast.NodeVisitor):
             isinstance(t, (ast.Tuple, ast.List))
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
-            and isinstance(v.func.value, ast.Attribute)
-            and isinstance(v.func.value.value, ast.Name)
-            and v.func.value.value.id == "np"
-            and v.func.value.attr == "linalg"
+            and self._is_linalg_module_attr(v.func.value)
         ):
             outs = []
             for e in t.elts:
@@ -18393,6 +18655,29 @@ class translator(ast.NodeVisitor):
             self.o.w("print *, " + ", ".join(parts))
             return
         a = call.args[0]
+
+        # print("...".format(...))
+        # Conservative fallback: ignore Python formatting mini-language and
+        # emit list-directed output of provided format arguments.
+        if (
+            isinstance(a, ast.Call)
+            and isinstance(a.func, ast.Attribute)
+            and a.func.attr == "format"
+            and is_const_str(a.func.value)
+        ):
+            fmt_args = list(a.args) + [kw.value for kw in getattr(a, "keywords", [])]
+            if fmt_args:
+                rhs = ", ".join(self.expr(x) for x in fmt_args)
+                if advance_no:
+                    self.o.w(f"write(*,*, advance='no') {rhs}")
+                else:
+                    self.o.w(f"print *, {rhs}")
+            else:
+                if advance_no:
+                    self.o.w("write(*,*, advance='no')")
+                else:
+                    self.o.w("print *")
+            return
 
         # print('...%d...' % (...), end='') old-style formatting.
         if (
@@ -22976,7 +23261,7 @@ def _tree_uses_shell_exec(tree):
     return False
 
 
-def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False):
+def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False, list_directed_io=False):
     src = Path(py_path).read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
     def _find_scipy_import(t):
@@ -23007,6 +23292,8 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     translator.global_synthetic_slices = {}
     translator.global_vectorize_aliases = {}
     translator.global_linalg_aliases = set()
+    translator.global_scipy_special_aliases = set()
+    translator.global_scipy_special_func_aliases = {}
     comment_map = extract_python_comments(src)
 
     exec_nodes = [
@@ -23117,6 +23404,10 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     params = find_parameters(effective_tree)
     translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
     translator.global_linalg_aliases = collect_linalg_aliases(tree)
+    (
+        translator.global_scipy_special_aliases,
+        translator.global_scipy_special_func_aliases,
+    ) = collect_scipy_special_aliases(tree)
     structured_type_components, structured_array_types, structured_dtype_strings = collect_structured_dtype_info(effective_tree)
     user_class_types, user_type_components = collect_dataclass_info(tree)
     for tnm, fields in user_type_components.items():
@@ -23275,6 +23566,8 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
         # Default path prioritizes semantic stability over stylistic rewrites.
         # Keep only compile-safety wrapping and basic comment spacing.
         f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
+    if list_directed_io:
+        f90_lines = rewrite_to_list_directed_io(f90_lines)
     # Keep inline Fortran comments consistently separated from code.
     f90_lines = enforce_space_before_inline_comments(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
@@ -23285,7 +23578,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     return out_path, used_flat_fallback, used_main_unwrap
 
 
-def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False):
+def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False, list_directed_io=False):
     """Best-effort partial transpilation: keep only transpilable top-level functions.
 
     Produces Fortran that should compile to an object (`-c`) by avoiding
@@ -23323,6 +23616,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
                 no_comment=no_comment,
                 out_path=tmp_out,
                 postprocess=postprocess,
+                list_directed_io=list_directed_io,
             )
             return True, None, outp
         except (NotImplementedError, FileNotFoundError) as e:
@@ -23421,6 +23715,7 @@ def main():
     ap.add_argument("--flat", action="store_true", help="emit flat main-program translation")
     ap.add_argument("--partial", action="store_true", help="best-effort partial translation of top-level functions")
     ap.add_argument("--postprocess", action="store_true", help="enable full Fortran post-processing rewrites")
+    ap.add_argument("--list-directed-io", action="store_true", help="rewrite formatted write/print to list-directed output")
     ap.add_argument("--compile", action="store_true", help="compile transpiled source with helper files")
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
     ap.add_argument("--run-both", action="store_true", help="run original Python and transpiled Fortran (no timing)")
@@ -23712,6 +24007,7 @@ def main():
             no_comment=(not args.comment),
             out_path=args.out,
             postprocess=args.postprocess,
+            list_directed_io=args.list_directed_io,
         )
     except (NotImplementedError, FileNotFoundError) as e:
         if not args.partial:
@@ -23728,6 +24024,7 @@ def main():
                 no_comment=(not args.comment),
                 out_path=args.out,
                 postprocess=args.postprocess,
+                list_directed_io=args.list_directed_io,
             )
             used_flat_fallback, used_main_unwrap = False, False
             print(f"Transpile: PARTIAL ({_format_transpile_error(e, src_text)})")

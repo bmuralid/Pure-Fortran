@@ -98,6 +98,10 @@ public :: ones_logical !@pyapi kind=function ret=logical(:) args=n:integer:inten
 public :: strvec_t !@pyapi kind=type desc="string vector helper type"
 public :: py_str !@pyapi kind=function ret=character args=x:any:intent(in) desc="python-like str() conversion for scalar int/real/logical/char"
 public :: py_float !@pyapi kind=function ret=real(dp) args=s:character:intent(in) desc="parse string to real(dp), NaN on read failure"
+public :: special_factorial !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial approximation via gamma(x+1)"
+public :: special_factorial2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial2 for integer-like x"
+public :: special_binom !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in) desc="binomial coefficient via gamma"
+public :: special_comb !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in),exact:logical:intent(in):optional,repetition:logical:intent(in):optional desc="scipy.special.comb(n,k,exact=False,repetition=False)"
 public :: to_lower !@pyapi kind=function ret=character args=s:character:intent(in) desc="lowercase string"
 public :: to_upper !@pyapi kind=function ret=character args=s:character:intent(in) desc="uppercase string"
 public :: str_strip !@pyapi kind=function ret=character args=s:character:intent(in),chars:character:intent(in):optional desc="strip leading/trailing characters"
@@ -372,6 +376,72 @@ contains
          end do
          isqrt_int = r
       end function isqrt_int
+
+      pure elemental real(kind=dp) function special_factorial(x) result(v)
+         real(kind=dp), intent(in) :: x
+         if (x < 0.0_dp) then
+            v = ieee_value(0.0_dp, ieee_quiet_nan)
+         else
+            v = gamma(x + 1.0_dp)
+         end if
+      end function special_factorial
+
+      pure elemental real(kind=dp) function special_factorial2(x) result(v)
+         real(kind=dp), intent(in) :: x
+         integer :: n, i
+         if (x < -1.0_dp) then
+            v = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         n = nint(x)
+         if (abs(x - real(n, kind=dp)) > 1.0e-12_dp) then
+            v = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         if (n == -1 .or. n == 0) then
+            v = 1.0_dp
+            return
+         end if
+         if (n < -1) then
+            v = ieee_value(0.0_dp, ieee_quiet_nan)
+            return
+         end if
+         v = 1.0_dp
+         do i = n, 1, -2
+            v = v * real(i, kind=dp)
+         end do
+      end function special_factorial2
+
+      pure elemental real(kind=dp) function special_binom(n, k) result(v)
+         real(kind=dp), intent(in) :: n, k
+         if (k < 0.0_dp .or. n < k) then
+            v = 0.0_dp
+            return
+         end if
+         v = gamma(n + 1.0_dp) / (gamma(k + 1.0_dp) * gamma(n - k + 1.0_dp))
+      end function special_binom
+
+      pure elemental real(kind=dp) function special_comb(n, k, exact, repetition) result(v)
+         real(kind=dp), intent(in) :: n, k
+         logical, intent(in), optional :: exact, repetition
+         logical :: repetition_opt
+         real(kind=dp) :: nn, kk
+         nn = n
+         kk = k
+         repetition_opt = .false.
+         if (present(repetition)) repetition_opt = repetition
+         if (repetition_opt) then
+            nn = n + k - 1.0_dp
+         end if
+         if (kk < 0.0_dp .or. nn < kk) then
+            v = 0.0_dp
+            return
+         end if
+         v = gamma(nn + 1.0_dp) / (gamma(kk + 1.0_dp) * gamma(nn - kk + 1.0_dp))
+         if (present(exact)) then
+            if (exact) v = real(nint(v), kind=dp)
+         end if
+      end function special_comb
 
       subroutine print_int_list(a, n)
          ! print integer list a(1:n) in python-style [..] format
