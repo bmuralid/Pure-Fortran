@@ -47,6 +47,22 @@ IF_GUARDED_DEALLOC_RE = re.compile(
 DO_START_RE = re.compile(r"^\s*do\b", re.IGNORECASE)
 END_DO_RE = re.compile(r"^\s*end\s*do\b|^\s*enddo\b", re.IGNORECASE)
 DO_ITER_RE = re.compile(r"^\s*do\b(?:\s+\d+)?\s*([a-z_][a-z0-9_]*)\s*=", re.IGNORECASE)
+SUBSCRIPTED_ARRAY_CTOR_RE = re.compile(
+    r"^\s*([a-z_][a-z0-9_]*(?:\s*\([^)]*\))?)\s*=\s*(\[[^]]+\])\s*\(([^()]*)\)\s*(?:!\s*(.*))?$",
+    re.IGNORECASE,
+)
+NUM_REAL_LIT_RE = re.compile(
+    r"^[+-]?(?:\d+\.\d*|\.\d+|\d+[eEdD][+-]?\d+|\d+\.\d*[eEdD][+-]?\d+)(?:_([a-z0-9_]+))?$",
+    re.IGNORECASE,
+)
+NUM_INT_LIT_RE = re.compile(r"^[+-]?\d+(?:_([a-z0-9_]+))?$", re.IGNORECASE)
+CHAR_LIT_RE = re.compile(r"^(['\"])(.*)\1$", re.DOTALL)
+PRINT_MISSING_COMMA_RE = re.compile(r'^(\s*print\s*"[^"]*")\s+([^,].*?)\s*(?:!\s*(.*))?$', re.IGNORECASE)
+IF_NO_THEN_RE = re.compile(r"^(\s*)if\s*\((.+)\)\s*(?:!\s*(.*))?$", re.IGNORECASE)
+PROC_START_RE = re.compile(
+    r"^\s*(?:pure\s+|elemental\s+|recursive\s+|impure\s+)*(subroutine|function)\s+[a-z_][a-z0-9_]*\b",
+    re.IGNORECASE,
+)
 
 
 def _q(path: Path) -> str:
@@ -65,14 +81,31 @@ def _run_compile(cmd: str) -> subprocess.CompletedProcess[str]:
 
 
 def _emit_cp_output(cp: subprocess.CompletedProcess[str], prefix: str = "") -> None:
+    def _safe_emit(txt: str) -> None:
+        if not txt:
+            return
+        s = txt.rstrip()
+        enc = sys.stdout.encoding or "utf-8"
+        safe = s.encode(enc, errors="replace").decode(enc, errors="replace")
+        print(safe)
+
     if cp.stdout:
         if prefix:
             print(f"{prefix}stdout:")
-        print(cp.stdout.rstrip())
+        _safe_emit(cp.stdout)
     if cp.stderr:
         if prefix:
             print(f"{prefix}stderr:")
-        print(cp.stderr.rstrip())
+        _safe_emit(cp.stderr)
+
+
+def _safe_print_text(text: str) -> None:
+    if not text:
+        return
+    s = text.rstrip()
+    enc = sys.stdout.encoding or "utf-8"
+    safe = s.encode(enc, errors="replace").decode(enc, errors="replace")
+    print(safe)
 
 
 def _build_and_run_program(srcs: list[Path], tag: str, tee_both: bool = False) -> int:
@@ -87,7 +120,7 @@ def _build_and_run_program(srcs: list[Path], tag: str, tee_both: bool = False) -
         print("Final build: FAIL")
         err = cpb.stderr or cpb.stdout or ""
         if err.strip():
-            print(err.strip())
+            _safe_print_text(err)
         return cpb.returncode or 1
     print(f"Final run: {exe}")
     cpr = subprocess.run(
@@ -264,6 +297,338 @@ def _fix_unallocated_deallocate_guards(path: Path, drop_deallocate: bool = False
             lines = [ln for ln in lines if ln != drop_marker]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return edits
+
+
+def _fix_subscripted_array_constructor(path: Path, line_no: int) -> bool:
+    """Rewrite invalid `x = [..](idx)` into an ASSOCIATE block."""
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no < 1 or line_no > len(lines):
+        return False
+    raw = lines[line_no - 1]
+    m = SUBSCRIPTED_ARRAY_CTOR_RE.match(raw)
+    if not m:
+        return False
+    lhs = m.group(1).strip()
+    ctor = m.group(2).strip()
+    idx = m.group(3).strip()
+    comment = m.group(4)
+    indent = raw[: len(raw) - len(raw.lstrip(" "))]
+    out = [
+        f"{indent}associate(xautofix_tmp => {ctor})",
+        f"{indent}   {lhs} = xautofix_tmp({idx})",
+        f"{indent}end associate",
+    ]
+    if comment:
+        out[0] = f"{out[0]} ! {comment}"
+    lines[line_no - 1 : line_no] = out
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _split_code_comment(line: str) -> tuple[str, str]:
+    i = line.find("!")
+    if i < 0:
+        return line, ""
+    return line[:i], line[i:]
+
+
+def _rewrite_mixed_numeric_items(items: list[str]) -> list[str] | None:
+    kinds: list[str] = []
+    parsed: list[tuple[str, str, str]] = []  # (kind, token, suffix)
+    for it in items:
+        tok = it.strip()
+        mr = NUM_REAL_LIT_RE.match(tok)
+        if mr:
+            suf = mr.group(1) or ""
+            parsed.append(("real", tok, suf))
+            if suf:
+                kinds.append(suf)
+            continue
+        mi = NUM_INT_LIT_RE.match(tok)
+        if mi:
+            suf = mi.group(1) or ""
+            parsed.append(("int", tok, suf))
+            if suf:
+                kinds.append(suf)
+            continue
+        return None
+    has_real = any(k == "real" for k, _, _ in parsed)
+    has_int = any(k == "int" for k, _, _ in parsed)
+    if not (has_real and has_int):
+        return None
+    chosen = kinds[0] if kinds else "dp"
+    out: list[str] = []
+    for k, tok, _ in parsed:
+        t = tok
+        if k == "int":
+            m = re.match(r"^([+-]?\d+)", t)
+            if not m:
+                return None
+            base = m.group(1)
+            t = f"{base}.0_{chosen}"
+        else:
+            if "_" not in t:
+                t = f"{t}_{chosen}"
+        out.append(t)
+    return out
+
+
+def _char_lit_len(tok: str) -> int | None:
+    m = CHAR_LIT_RE.match(tok.strip())
+    if not m:
+        return None
+    q = m.group(1)
+    s = m.group(2)
+    esc = q * 2
+    return len(s.replace(esc, q))
+
+
+def _fix_mixed_type_array_constructor(path: Path, line_no_1: int) -> tuple[bool, str]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False, ""
+    old = lines[line_no_1 - 1]
+    code, comment = _split_code_comment(old)
+    m = re.search(r"\[([^\]]*)\]", code)
+    if not m:
+        return False, ""
+    inner = m.group(1).strip()
+    if not inner:
+        return False, ""
+    items = _split_top_level_commas(inner)
+    if len(items) < 2:
+        return False, ""
+    nums = _rewrite_mixed_numeric_items(items)
+    if nums is not None:
+        rep = "[" + ", ".join(nums) + "]"
+        new_code = code[: m.start()] + rep + code[m.end() :]
+        if new_code != code:
+            lines[line_no_1 - 1] = new_code + comment
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            return True, "Fix: homogenized mixed int/real array constructor to real literals."
+        return False, ""
+    char_lens = [_char_lit_len(it) for it in items]
+    if all(v is not None for v in char_lens):
+        mx = max(char_lens) if char_lens else 0
+        mn = min(char_lens) if char_lens else 0
+        if mx != mn and "::" not in inner:
+            rep = "[character(len=" + str(mx) + ") :: " + ", ".join(it.strip() for it in items) + "]"
+            new_code = code[: m.start()] + rep + code[m.end() :]
+            if new_code != code:
+                lines[line_no_1 - 1] = new_code + comment
+                path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                return True, "Fix: added CHARACTER(len=...) type-spec to mixed-length character constructor."
+    return False, ""
+
+
+def _infer_decl_typespec_for_name(lines: list[str], line_no_1: int, name: str) -> str | None:
+    nm = name.lower()
+    for ln in lines[: max(0, line_no_1 - 1)]:
+        core = ln.split("!", 1)[0]
+        if "::" not in core:
+            continue
+        left, right = core.split("::", 1)
+        l = left.strip()
+        m = re.match(r"^(integer|real|logical|character|complex)(\s*\([^)]*\))?", l, re.IGNORECASE)
+        if not m:
+            continue
+        tname = m.group(1)
+        tmod = m.group(2) or ""
+        decl_items = _split_top_level_commas(right)
+        for d in decl_items:
+            b = d.split("=", 1)[0].strip()
+            mv = re.match(r"^([a-z_][a-z0-9_]*)", b, re.IGNORECASE)
+            if mv and mv.group(1).lower() == nm:
+                return f"{tname}{tmod}"
+    return None
+
+
+def _fix_empty_array_constructor(path: Path, line_no_1: int) -> tuple[bool, str | None]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False, None
+    old = lines[line_no_1 - 1]
+    code, comment = _split_code_comment(old)
+    m = re.match(r"^(\s*)([a-z_][a-z0-9_]*(?:\s*\([^)]*\))?)\s*=\s*\[\s*\]\s*$", code, re.IGNORECASE)
+    if not m:
+        return False, None
+    lhs = m.group(2).strip()
+    base = _base_ident(lhs)
+    ts = _infer_decl_typespec_for_name(lines, line_no_1, base)
+    if not ts:
+        return False, (
+            f"Warning: could not infer LHS type for empty constructor at {path}:{line_no_1}; "
+            "left `x = []` unchanged."
+        )
+    lines[line_no_1 - 1] = f"{m.group(1)}{lhs} = [{ts} ::]{comment}"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True, "Fix: rewrote empty constructor using inferred LHS type."
+
+
+def _fix_missing_closers(path: Path, line_no_1: int) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False
+    old = lines[line_no_1 - 1]
+    code, comment = _split_code_comment(old)
+    stack: list[str] = []
+    in_s = False
+    in_d = False
+    for ch in code:
+        if ch == "'" and not in_d:
+            in_s = not in_s
+            continue
+        if ch == '"' and not in_s:
+            in_d = not in_d
+            continue
+        if in_s or in_d:
+            continue
+        if ch in "([":
+            stack.append(ch)
+        elif ch == ")" and stack and stack[-1] == "(":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+    if not stack:
+        return False
+    closers = "".join(")" if c == "(" else "]" for c in reversed(stack))
+    lines[line_no_1 - 1] = code.rstrip() + closers + comment
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _fix_missing_contains(path: Path, line_no_1: int) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False
+    cur = lines[line_no_1 - 1].split("!", 1)[0]
+    if not PROC_START_RE.match(cur):
+        return False
+    scope_idx = -1
+    scope_kind = ""
+    for i in range(line_no_1 - 1, -1, -1):
+        s = lines[i].split("!", 1)[0].strip().lower()
+        if re.match(r"^module\s+[a-z_][a-z0-9_]*\b", s) and not s.startswith("module procedure"):
+            scope_idx = i
+            scope_kind = "module"
+            break
+        if re.match(r"^program\s+[a-z_][a-z0-9_]*\b", s):
+            scope_idx = i
+            scope_kind = "program"
+            break
+    if scope_idx < 0:
+        return False
+    for j in range(scope_idx + 1, line_no_1 - 1):
+        sj = lines[j].split("!", 1)[0].strip().lower()
+        if sj == "contains":
+            return False
+        if scope_kind == "module" and sj.startswith("end module"):
+            return False
+        if scope_kind == "program" and sj.startswith("end program"):
+            return False
+    indent = re.match(r"^\s*", lines[scope_idx]).group(0)
+    lines.insert(line_no_1 - 1, f"{indent}contains")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _fix_use_after_implicit_none(path: Path, line_no_1: int) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False
+    use_idx = -1
+    for i in range(max(0, line_no_1 - 4), min(len(lines), line_no_1 + 1)):
+        if re.match(r"^\s*use\b", lines[i], re.IGNORECASE):
+            use_idx = i
+            break
+    if use_idx < 0:
+        return False
+    imp_idx = -1
+    for i in range(use_idx - 1, -1, -1):
+        if re.match(r"^\s*implicit\s+none\b", lines[i], re.IGNORECASE):
+            imp_idx = i
+            break
+        s = lines[i].split("!", 1)[0].strip().lower()
+        if re.match(r"^(program|module|subroutine|function)\b", s):
+            break
+    if imp_idx < 0 or imp_idx > use_idx:
+        return False
+    last_use = use_idx
+    for i in range(use_idx + 1, len(lines)):
+        s = lines[i].split("!", 1)[0].strip().lower()
+        if re.match(r"^use\b", s):
+            last_use = i
+            continue
+        if not s:
+            continue
+        break
+    imp_line = lines.pop(imp_idx)
+    if imp_idx < last_use:
+        last_use -= 1
+    lines.insert(last_use + 1, imp_line)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _fix_print_missing_comma(path: Path, line_no_1: int) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False
+    old = lines[line_no_1 - 1]
+    m = PRINT_MISSING_COMMA_RE.match(old)
+    if not m:
+        return False
+    cmt = f" ! {m.group(3)}" if m.group(3) else ""
+    lines[line_no_1 - 1] = f"{m.group(1)}, {m.group(2).strip()}{cmt}"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _fix_if_missing_then(path: Path, line_no_1: int) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return False
+    old = lines[line_no_1 - 1]
+    if re.search(r"\bthen\b", old, re.IGNORECASE):
+        return False
+    m = IF_NO_THEN_RE.match(old)
+    if not m:
+        return False
+    # Require a block IF context nearby.
+    has_end_if = any(re.match(r"^\s*end\s*if\b", lines[k], re.IGNORECASE) for k in range(line_no_1, min(len(lines), line_no_1 + 25)))
+    if not has_end_if:
+        return False
+    cmt = f" ! {m.group(3)}" if m.group(3) else ""
+    lines[line_no_1 - 1] = f"{m.group(1)}if ({m.group(2).strip()}) then{cmt}"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
+
+
+def _fix_missing_end_associate(path: Path) -> bool:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    open_n = 0
+    close_n = 0
+    for ln in lines:
+        s = ln.split("!", 1)[0].strip().lower()
+        if re.match(r"^associate\s*\(", s):
+            open_n += 1
+        elif re.match(r"^end\s+associate\b", s):
+            close_n += 1
+    if open_n <= close_n:
+        return False
+    miss = open_n - close_n
+    insert_at = len(lines)
+    for i, ln in enumerate(lines):
+        s = ln.split("!", 1)[0].strip().lower()
+        if re.match(r"^end\s+(program|module|subroutine|function)\b|^end$", s):
+            insert_at = i
+            break
+    indent = re.match(r"^\s*", lines[insert_at - 1] if insert_at > 0 else "").group(0)
+    for _ in range(miss):
+        lines.insert(insert_at, f"{indent}end associate")
+        insert_at += 1
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return True
 
 
 def _line_has_guard_for_var(line: str, var: str) -> bool:
@@ -609,6 +974,10 @@ def _infer_missing_end_line(path: Path) -> str:
             if stack and stack[-1][0] == "interface":
                 stack.pop()
             continue
+        if re.match(r"^end\s+associate\b", s):
+            if stack and stack[-1][0] == "associate":
+                stack.pop()
+            continue
         if re.match(r"^end\s+function\b", s):
             if stack and stack[-1][0] == "function":
                 stack.pop()
@@ -662,6 +1031,9 @@ def _infer_missing_end_line(path: Path) -> str:
         if re.match(r"^interface\b", s):
             stack.append(("interface", None))
             continue
+        if re.match(r"^associate\s*\(", s):
+            stack.append(("associate", None))
+            continue
         if re.match(r"^type\s*::\s*[a-z_]\w*\b", s):
             stack.append(("type", None))
             continue
@@ -683,6 +1055,8 @@ def _infer_missing_end_line(path: Path) -> str:
         return "end type"
     if k == "interface":
         return "end interface"
+    if k == "associate":
+        return "end associate"
     return "end"
 
 
@@ -963,7 +1337,7 @@ def _fix_scalar_i_format_for_real_expr(path: Path) -> bool:
     return changed
 
 
-def _static_format_mismatches(path: Path) -> list[Tuple[int, str]]:
+def _static_format_mismatches(path: Path) -> list[Tuple[int, str, int | None, str | None]]:
     infos, _ = xfmm.fscan.load_source_files([path])
     if not infos:
         return []
@@ -973,15 +1347,52 @@ def _static_format_mismatches(path: Path) -> list[Tuple[int, str]]:
         findings.extend(xfmm.analyze_unit(u))
     findings = [f for f in findings if f.certainty == "definite"]
     findings.sort(key=lambda f: (f.line, f.detail))
-    out: list[Tuple[int, str]] = []
-    seen: set[Tuple[int, str]] = set()
+    out: list[Tuple[int, str, int | None, str | None]] = []
+    seen: set[Tuple[int, str, int | None, str | None]] = set()
     for f in findings:
-        k = (f.line, f.detail)
+        item_no: int | None = None
+        got_type: str | None = None
+        mm = re.search(r"item\s+(\d+)\s+type\s+([a-z]+)", f.detail, re.IGNORECASE)
+        if mm:
+            try:
+                item_no = int(mm.group(1))
+            except ValueError:
+                item_no = None
+            got_type = mm.group(2).upper()
+        k = (f.line, f.detail, item_no, got_type)
         if k in seen:
             continue
         seen.add(k)
         out.append(k)
     return out
+
+
+def _expected_kind_from_descriptor_token(tok: str) -> str | None:
+    t = tok.strip().lower()
+    if not t:
+        return None
+    if t.startswith("i"):
+        return "INTEGER"
+    if t.startswith("l"):
+        return "LOGICAL"
+    if t.startswith("a"):
+        return "CHARACTER"
+    if t.startswith("f") or t.startswith("e") or t.startswith("d") or t.startswith("g"):
+        return "REAL"
+    return None
+
+
+def _expected_kind_at_item_in_line(line: str, item_no: int) -> str | None:
+    any_data_desc = re.compile(
+        r"\b(?:i\s*\d+|[fegd]\s*\d+(?:\.\d+)?(?:e\d+)?|l\s*\d+|a)\b",
+        re.IGNORECASE,
+    )
+    matches = list(any_data_desc.finditer(line))
+    if not matches:
+        return None
+    idx = min(max(item_no - 1, 0), len(matches) - 1)
+    tok = line[matches[idx].start():matches[idx].end()]
+    return _expected_kind_from_descriptor_token(tok)
 
 
 def _fix_static_format_mismatch_with_xfmm(path: Path, line_no_1: int) -> bool:
@@ -1174,9 +1585,52 @@ def _find_first_action(stderr: str, default_src: Path) -> dict[str, object] | No
             return {"kind": "percent_mod", "file": cur_file, "line": cur_line}
         if "Error: Unclassifiable statement" in ln:
             return {"kind": "unclassifiable", "file": cur_file, "line": cur_line}
+        if "Error: Missing ')' in statement" in ln or "Expected a right parenthesis" in ln:
+            return {"kind": "missing_closer", "file": cur_file, "line": cur_line}
+        if "Error: Missing THEN in IF statement" in ln:
+            return {"kind": "if_missing_then", "file": cur_file, "line": cur_line}
+        if "Error: Expecting END ASSOCIATE statement" in ln:
+            return {"kind": "missing_end_associate", "file": cur_file, "line": cur_line}
+        if "cannot follow IMPLICIT NONE" in ln and "USE statement" in ln:
+            return {"kind": "implicit_after_use", "file": cur_file, "line": cur_line}
         if "Unexpected end of file" in ln:
             return {"kind": "unexpected_eof", "file": cur_file, "line": cur_line}
     return None
+
+
+def _first_error_loc(stderr: str, default_src: Path) -> tuple[Path, int]:
+    for ln in stderr.splitlines():
+        m = LOC_RE.match(ln.strip())
+        if m:
+            return Path(m.group(1)), int(m.group(2))
+    return default_src, 1
+
+
+def _try_general_compile_fix(path: Path, line_no: int, err_text: str) -> tuple[bool, str | None]:
+    changed, msg = _fix_mixed_type_array_constructor(path, line_no)
+    if changed:
+        return True, msg
+    changed, warn = _fix_empty_array_constructor(path, line_no)
+    if changed:
+        return True, "Fix: rewrote empty array constructor from LHS type."
+    if warn:
+        return False, warn
+    if _fix_subscripted_array_constructor(path, line_no):
+        return True, "Fix: rewrote subscripted array constructor."
+    if _fix_print_missing_comma(path, line_no):
+        return True, "Fix: inserted missing comma in PRINT statement."
+    if _fix_if_missing_then(path, line_no):
+        return True, "Fix: inserted missing THEN in IF statement."
+    if _fix_missing_contains(path, line_no):
+        return True, "Fix: inserted missing CONTAINS before internal procedures."
+    if _fix_use_after_implicit_none(path, line_no):
+        return True, "Fix: moved IMPLICIT NONE after USE statements."
+    if _fix_missing_closers(path, line_no):
+        return True, "Fix: appended missing closing parenthesis/bracket."
+    if ("expecting end associate" in err_text.lower()) or ("unexpected end of file" in err_text.lower()):
+        if _fix_missing_end_associate(path):
+            return True, "Fix: inserted missing END ASSOCIATE."
+    return False, None
 
 
 def main() -> int:
@@ -1205,6 +1659,11 @@ def main() -> int:
         "--runtime",
         action="store_true",
         help="Runtime autofix mode: compile and run, then fix supported runtime formatted-transfer mismatches.",
+    )
+    ap.add_argument(
+        "--compile-fix",
+        action="store_true",
+        help="Enable compile-error-driven autofixes (for example, invalid expression subscripting).",
     )
     ap.add_argument(
         "--run",
@@ -1241,6 +1700,11 @@ def main() -> int:
         action="store_true",
         help="When a DEALLOCATE is definitely unsafe/redundant, drop it instead of guarding with allocated(...).",
     )
+    ap.add_argument(
+        "--normalize-format-style",
+        action="store_true",
+        help="Apply format-string style normalization (spacing/parentheses). Off by default.",
+    )
     args = ap.parse_args()
     tee_orig = args.tee_orig or args.tee_both
     tee_src = args.tee or args.tee_both
@@ -1265,6 +1729,8 @@ def main() -> int:
             print(f"Missing file: {s}")
             return 1
 
+    compile_fix_enabled = args.compile_fix or (not args.runtime)
+
     if args.runtime:
         tgt_idx = -1
         for i in range(len(srcs) - 1, -1, -1):
@@ -1277,8 +1743,16 @@ def main() -> int:
         target = srcs[tgt_idx]
         target_index = tgt_idx
     else:
-        target = srcs[0]
-        target_index = 0
+        tgt_idx = -1
+        for i, s in enumerate(srcs):
+            if s.suffix.lower() in {".f90", ".f95", ".f03", ".f08", ".f", ".for"}:
+                tgt_idx = i
+                break
+        if tgt_idx < 0:
+            print("No Fortran source file found in inputs.")
+            return 1
+        target = srcs[tgt_idx]
+        target_index = tgt_idx
     if tee_orig:
         _emit_source("Original source", target)
     if args.in_place:
@@ -1347,10 +1821,42 @@ def main() -> int:
             if cpb.returncode != 0:
                 err = cpb.stderr or cpb.stdout or ""
                 action = _find_first_action(err, src)
+                if compile_fix_enabled:
+                    if action is not None:
+                        af0 = Path(action["file"])  # type: ignore[index]
+                        ln0 = int(action["line"])  # type: ignore[index]
+                    else:
+                        af0, ln0 = _first_error_loc(err, src)
+                    if not af0.exists():
+                        af0 = src
+                    before0 = _read_lines(af0) if args.diff else []
+                    changed0, msg0 = _try_general_compile_fix(af0, ln0, err)
+                    if changed0:
+                        if args.diff:
+                            _print_unified_diff(af0, before0, _read_lines(af0))
+                        edits += 1
+                        print(msg0 or f"Fix: applied compile-fix rewrite in {af0}:{ln0}.")
+                        continue
+                    if msg0 and msg0.lower().startswith("warning:"):
+                        print(msg0)
                 if action is None:
                     print("Build: FAIL; no supported autofix for current error.")
-                    print(err.strip())
+                    _safe_print_text(err)
                     return _ret(cpb.returncode or 1)
+                if compile_fix_enabled:
+                    afile = Path(action["file"])  # type: ignore[index]
+                    if not afile.exists():
+                        afile = src
+                    if action["kind"] == "unclassifiable":
+                        line_no = int(action["line"])
+                        before = _read_lines(afile) if args.diff else []
+                        changed = _fix_subscripted_array_constructor(afile, line_no)
+                        if changed:
+                            if args.diff:
+                                _print_unified_diff(afile, before, _read_lines(afile))
+                            edits += 1
+                            print(f"Fix: rewrote subscripted array constructor in {afile}:{line_no}.")
+                            continue
                 afile = Path(action["file"])  # type: ignore[index]
                 if not afile.exists():
                     afile = src
@@ -1419,7 +1925,7 @@ def main() -> int:
                         print(f"Fix: appended missing closing `end` in {afile}.")
                         continue
                 print("Build: FAIL; matched rule but no edit was applied.")
-                print(err.strip())
+                _safe_print_text(err)
                 return _ret(cpb.returncode or 1)
 
             print(f"[{it}] Run: {exe}")
@@ -1433,22 +1939,23 @@ def main() -> int:
             if args.tee_both:
                 _emit_cp_output(cpr, prefix=f"[{it}] Run ")
             if cpr.returncode == 0:
-                before_norm = _read_lines(work_target) if args.diff else []
-                norm_changed = _normalize_format_spacing(work_target)
-                if norm_changed:
-                    if args.diff:
-                        _print_unified_diff(work_target, before_norm, _read_lines(work_target))
-                    edits += 1
-                    print(f"Fix: normalized explicit format spacing in {work_target}.")
-                    continue
-                before_par = _read_lines(work_target) if args.diff else []
-                par_changed = _normalize_redundant_format_parens(work_target)
-                if par_changed:
-                    if args.diff:
-                        _print_unified_diff(work_target, before_par, _read_lines(work_target))
-                    edits += 1
-                    print(f"Fix: normalized redundant format parentheses in {work_target}.")
-                    continue
+                if args.normalize_format_style:
+                    before_norm = _read_lines(work_target) if args.diff else []
+                    norm_changed = _normalize_format_spacing(work_target)
+                    if norm_changed:
+                        if args.diff:
+                            _print_unified_diff(work_target, before_norm, _read_lines(work_target))
+                        edits += 1
+                        print(f"Fix: normalized explicit format spacing in {work_target}.")
+                        continue
+                    before_par = _read_lines(work_target) if args.diff else []
+                    par_changed = _normalize_redundant_format_parens(work_target)
+                    if par_changed:
+                        if args.diff:
+                            _print_unified_diff(work_target, before_par, _read_lines(work_target))
+                        edits += 1
+                        print(f"Fix: normalized redundant format parentheses in {work_target}.")
+                        continue
                 print(f"Run: PASS after {edits} edit(s).")
                 if args.run:
                     rr = _build_and_run_program(build_inputs, work_target.stem, tee_both=args.tee_both)
@@ -1459,7 +1966,7 @@ def main() -> int:
             action = _parse_runtime_fmt_mismatch(run_log)
             if action is None:
                 print("Run: FAIL; no supported runtime autofix for current error.")
-                print(run_log.strip())
+                _safe_print_text(run_log)
                 return _ret(cpr.returncode or 1)
             afile_from_log = Path(action["file"])  # type: ignore[index]
             if args.in_place and afile_from_log.exists():
@@ -1493,7 +2000,7 @@ def main() -> int:
                 )
                 continue
             print("Run: FAIL; matched runtime rule but no edit was applied.")
-            print(run_log.strip())
+            _safe_print_text(run_log)
             return _ret(cpr.returncode or 1)
 
         cmd = args.compile_cmd.format(src=_q(src), srcs=srcs_str)
@@ -1505,11 +2012,17 @@ def main() -> int:
             static_mismatches = _static_format_mismatches(src)
             if static_mismatches:
                 fixed_one = False
-                for line_no, detail in static_mismatches:
+                for line_no, detail, item_no, got_type in static_mismatches:
                     before_static = _read_lines(src) if args.diff else []
                     changed = _fix_static_format_mismatch_with_xfmm(src, line_no)
                     if not changed:
                         changed = _fix_runtime_rebuild_print_format(src, line_no)
+                    if (not changed) and item_no is not None and got_type is not None:
+                        src_lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+                        if 1 <= line_no <= len(src_lines):
+                            exp = _expected_kind_at_item_in_line(src_lines[line_no - 1], item_no)
+                            if exp is not None:
+                                changed = _fix_runtime_format_mismatch(src, line_no, exp, got_type, item_no)
                     if changed:
                         if args.diff:
                             _print_unified_diff(src, before_static, _read_lines(src))
@@ -1527,14 +2040,15 @@ def main() -> int:
                 edits += 1
                 print(f"Fix: corrected integer format descriptor for real-valued expression in {src}.")
                 continue
-            before_par = _read_lines(src) if args.diff else []
-            par_changed = _normalize_redundant_format_parens(src)
-            if par_changed:
-                if args.diff:
-                    _print_unified_diff(src, before_par, _read_lines(src))
-                edits += 1
-                print(f"Fix: normalized redundant format parentheses in {src}.")
-                continue
+            if args.normalize_format_style:
+                before_par = _read_lines(src) if args.diff else []
+                par_changed = _normalize_redundant_format_parens(src)
+                if par_changed:
+                    if args.diff:
+                        _print_unified_diff(src, before_par, _read_lines(src))
+                    edits += 1
+                    print(f"Fix: normalized redundant format parentheses in {src}.")
+                    continue
             print(f"Build: PASS after {edits} edit(s).")
             if args.run:
                 rr = _build_and_run_program(build_inputs, work_target.stem, tee_both=args.tee_both)
@@ -1543,10 +2057,42 @@ def main() -> int:
 
         err = cp.stderr or cp.stdout or ""
         action = _find_first_action(err, src)
+        if compile_fix_enabled:
+            if action is not None:
+                af0 = Path(action["file"])  # type: ignore[index]
+                ln0 = int(action["line"])  # type: ignore[index]
+            else:
+                af0, ln0 = _first_error_loc(err, src)
+            if not af0.exists():
+                af0 = src
+            before0 = _read_lines(af0) if args.diff else []
+            changed0, msg0 = _try_general_compile_fix(af0, ln0, err)
+            if changed0:
+                if args.diff:
+                    _print_unified_diff(af0, before0, _read_lines(af0))
+                edits += 1
+                print(msg0 or f"Fix: applied compile-fix rewrite in {af0}:{ln0}.")
+                continue
+            if msg0 and msg0.lower().startswith("warning:"):
+                print(msg0)
         if action is None:
             print("Build: FAIL; no supported autofix for current error.")
-            print(err.strip())
+            _safe_print_text(err)
             return _ret(cp.returncode or 1)
+        if compile_fix_enabled:
+            afile = Path(action["file"])  # type: ignore[index]
+            if not afile.exists():
+                afile = src
+            if action["kind"] == "unclassifiable":
+                line_no = int(action["line"])
+                before = _read_lines(afile) if args.diff else []
+                changed = _fix_subscripted_array_constructor(afile, line_no)
+                if changed:
+                    if args.diff:
+                        _print_unified_diff(afile, before, _read_lines(afile))
+                    edits += 1
+                    print(f"Fix: rewrote subscripted array constructor in {afile}:{line_no}.")
+                    continue
 
         afile = Path(action["file"])  # type: ignore[index]
         if not afile.exists():
@@ -1617,7 +2163,7 @@ def main() -> int:
                 continue
 
         print("Build: FAIL; matched rule but no edit was applied.")
-        print(err.strip())
+        _safe_print_text(err)
         return _ret(cp.returncode or 1)
 
     print(f"Stopped after max iterations ({args.max_iter}); edits={edits}.")
