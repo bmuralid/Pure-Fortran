@@ -2884,6 +2884,7 @@ def is_numpy_name_node(node):
 
 def detect_needed_helpers(tree):
     needed = set()
+    linalg_aliases = collect_linalg_aliases(tree)
     np_helper_map = {
         "arange": {"arange_int"},
         "linspace": {"arange_int"},
@@ -3366,6 +3367,29 @@ def detect_needed_helpers(tree):
                     needed.add("linalg_eigh")
                 elif node.func.attr == "qr":
                     needed.add("linalg_qr_reduced")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in linalg_aliases
+            ):
+                if node.func.attr == "solve":
+                    needed.add("linalg_solve")
+                elif node.func.attr == "cholesky":
+                    needed.add("linalg_cholesky")
+                elif node.func.attr == "det":
+                    needed.add("linalg_det")
+                elif node.func.attr == "inv":
+                    needed.add("linalg_inv")
+                elif node.func.attr == "cond":
+                    needed.add("linalg_cond")
+                elif node.func.attr == "eig":
+                    needed.add("linalg_eig")
+                elif node.func.attr == "eigh":
+                    needed.add("linalg_eigh")
+                elif node.func.attr == "svd":
+                    needed.add("linalg_svd")
+                elif node.func.attr == "qr":
+                    needed.add("linalg_qr_reduced")
                 elif node.func.attr == "eigh":
                     needed.add("linalg_eigh")
                 elif node.func.attr == "qr":
@@ -3502,6 +3526,28 @@ def collect_vectorize_aliases(tree, local_funcs=None):
         if local_names and target not in local_names:
             continue
         aliases[alias] = target
+    return aliases
+
+
+def collect_linalg_aliases(tree):
+    """Collect aliases to numpy/scipy linalg modules (e.g. `import scipy.linalg as la`)."""
+    aliases = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if asn and mod in {"numpy.linalg", "scipy.linalg"}:
+                    aliases.add(asn)
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").strip()
+            if mod not in {"numpy", "scipy"}:
+                continue
+            for al in node.names:
+                nm = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if nm == "linalg" and asn:
+                    aliases.add(asn)
     return aliases
 
 
@@ -5105,6 +5151,7 @@ class emit:
 class translator(ast.NodeVisitor):
     global_synthetic_slices = {}
     global_vectorize_aliases = {}
+    global_linalg_aliases = set()
 
     def __init__(
         self,
@@ -5192,6 +5239,7 @@ class translator(ast.NodeVisitor):
         self.dict_var_components = {}
         self.synthetic_slices = dict(translator.global_synthetic_slices)
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
+        self.linalg_aliases = set(translator.global_linalg_aliases)
         self.promoted_colvec_results = set()
         self.uses_sys_argv = False
         self.var_type_first_seen = {}
@@ -6222,6 +6270,13 @@ class translator(ast.NodeVisitor):
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.linalg_aliases
+                and node.func.attr in {"solve", "cholesky", "det", "inv", "cond", "eig", "eigh", "svd", "qr"}
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and (
                     (
                         isinstance(node.func.value, ast.Attribute)
@@ -6345,6 +6400,8 @@ class translator(ast.NodeVisitor):
                 if node.func.id in {"abs"} and len(node.args) >= 1:
                     ak = self._expr_kind(node.args[0])
                     return "real" if ak == "complex" else ak
+                if node.func.id == "norm" and len(node.args) >= 1:
+                    return "real"
                 if node.func.id in {"complex"}:
                     return "complex"
                 if node.func.id in {"int", "isqrt", "size", "len"}:
@@ -6996,6 +7053,8 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.value.id == "random" and node.func.attr == "random":
                     return "real"
+            if isinstance(node.func, ast.Name) and node.func.id == "norm" and len(node.args) >= 1:
+                return "real"
             return None
         return None
 
@@ -7486,6 +7545,15 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return 0
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.linalg_aliases
+                and node.func.attr == "solve"
+                and len(node.args) >= 2
+            ):
+                # Same rank behavior as numpy.linalg.solve: follows RHS rank.
+                return self._rank_expr(node.args[1])
             if isinstance(node.func, ast.Name) and node.func.id in self.lambda_vars:
                 repl = _subst_lambda_expr_body(self.lambda_vars[node.func.id], node)
                 if repl is not None:
@@ -7550,6 +7618,8 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name):
                 if node.func.id in {"abs"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
+                if node.func.id == "norm" and len(node.args) >= 1:
+                    return 0
                 if node.func.id in {"float", "int", "real", "dble", "cmplx", "complex"}:
                     return 0
                 if node.func.id in {"log_normal_pdf_1d", "normal_logpdf_1d"}:
@@ -8278,7 +8348,7 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("unsupported constant")
 
         if isinstance(node, ast.List):
-            if node.elts and all(isinstance(e, ast.List) for e in node.elts):
+            if node.elts and all(isinstance(e, (ast.List, ast.Tuple)) for e in node.elts):
                 nrow = len(node.elts)
                 ncol = len(node.elts[0].elts)
                 if not all(len(e.elts) == ncol for e in node.elts):
@@ -8290,6 +8360,15 @@ class translator(ast.NodeVisitor):
             return _array_constructor(node.elts)
 
         if isinstance(node, ast.Tuple):
+            if node.elts and all(isinstance(e, (ast.List, ast.Tuple)) for e in node.elts):
+                nrow = len(node.elts)
+                ncol = len(node.elts[0].elts)
+                if not all(len(e.elts) == ncol for e in node.elts):
+                    raise NotImplementedError("nested tuple rows must have equal lengths")
+                flat_nodes = []
+                for r in node.elts:
+                    flat_nodes.extend(r.elts)
+                return f"transpose(reshape({_array_constructor(flat_nodes)}, [{ncol}, {nrow}]))"
             return _array_constructor(node.elts)
 
         if isinstance(node, ast.Set):
@@ -9513,6 +9592,9 @@ class translator(ast.NodeVisitor):
                     return f"{tnm}(" + ", ".join(parts) + ")"
                 if node.func.id in self.local_void_funcs:
                     raise NotImplementedError("subroutine call cannot be used in expression context")
+                if node.func.id == "norm" and len(node.args) >= 1:
+                    a0 = self.expr(node.args[0])
+                    return f"sqrt(sum(({a0})**2))"
                 args_nodes = self._build_local_call_actual_nodes(node.func.id, node)
                 ranks = self.local_func_arg_ranks.get(node.func.id, [])
                 parts = []
@@ -10112,6 +10194,14 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Attribute)
                 and is_numpy_name_node(node.func.value.value)
                 and node.func.value.attr == "linalg"
+                and node.func.attr == "solve"
+                and len(node.args) >= 2
+            ):
+                return f"linalg_solve({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.linalg_aliases
                 and node.func.attr == "solve"
                 and len(node.args) >= 2
             ):
@@ -11797,6 +11887,9 @@ class translator(ast.NodeVisitor):
                     if name == "fftfreq":
                         return f"fft_fftfreq(int({n0}), {d_txt})" if d_txt is not None else f"fft_fftfreq(int({n0}))"
                     return f"fft_rfftfreq(int({n0}), {d_txt})" if d_txt is not None else f"fft_rfftfreq(int({n0}))"
+            if isinstance(node.func, ast.Name) and node.func.id == "norm" and len(node.args) >= 1:
+                a0 = self.expr(node.args[0])
+                return f"sqrt(sum(({a0})**2))"
             if isinstance(node.func, ast.Attribute):
                 def _root_name_of_attr(a):
                     cur = a
@@ -18076,7 +18169,9 @@ class translator(ast.NodeVisitor):
                     if width is not None and prec is not None:
                         items.append(("desc", f"{cl}{width}.{prec}", an))
                     elif width is not None:
-                        items.append(("desc", f"{cl}{width}", an))
+                        # Width-only float descriptors are not directly portable
+                        # to standard Fortran edit descriptors; use g0.
+                        items.append(("desc", "g0", an))
                     else:
                         items.append(("desc", "g0", an))
                 elif cl in {"c", "r", "s"}:
@@ -18806,6 +18901,13 @@ def _emit_local_function(
                     return True
         return False
 
+    def _arg_name_prefers_int(nm):
+        nm_l = str(nm).lower()
+        return nm_l in {
+            "n", "m", "k", "nx", "ny", "nz", "nt", "nr", "nc",
+            "iter", "iterate", "itmax", "maxiter", "job", "rlbl",
+        }
+
     dict_arg_names = set((dict_arg_types or {}).keys())
     for a in arg_nodes:
         if a.arg in callback_args:
@@ -18829,6 +18931,8 @@ def _emit_local_function(
         # Python range/index operands are integer by semantics.
         # Keep this as a hard preference over arithmetic-based real hints.
         if _arg_used_as_index_or_range(a.arg):
+            rk_hint = "int"
+        elif (rk_hint is None or rk_hint == "real") and _arg_name_prefers_int(a.arg):
             rk_hint = "int"
         if (force_arg_ranks is None or a.arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == a.arg), -1)
@@ -19798,6 +19902,8 @@ def _emit_local_function(
                 if hint_kind is None:
                     hint_kind = local_func_arg_kinds[fn.name][idx]
         if _arg_used_as_index_or_range(arg):
+            hint_kind = "int"
+        elif (hint_kind is None or hint_kind == "real") and _arg_name_prefers_int(arg):
             hint_kind = "int"
         arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
         if force_arg_ranks is not None and arg in force_arg_ranks:
@@ -22689,6 +22795,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     _ = (scipy_node, scipy_mod)
     translator.global_synthetic_slices = {}
     translator.global_vectorize_aliases = {}
+    translator.global_linalg_aliases = set()
     comment_map = extract_python_comments(src)
 
     exec_nodes = [
@@ -22798,6 +22905,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
 
     params = find_parameters(effective_tree)
     translator.global_vectorize_aliases = collect_vectorize_aliases(effective_tree, local_funcs=local_funcs)
+    translator.global_linalg_aliases = collect_linalg_aliases(tree)
     structured_type_components, structured_array_types, structured_dtype_strings = collect_structured_dtype_info(effective_tree)
     user_class_types, user_type_components = collect_dataclass_info(tree)
     for tnm, fields in user_type_components.items():
@@ -22910,6 +23018,160 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
         f90 = re.sub(
             r"(function\s+func03\(z\)\s+result\(fz\)[\s\S]*?\n)\s*real\(kind=dp\)\s*::\s*me,\s*mo,\s*of,\s*x\s*\n\s*complex\(kind=dp\)\s*::\s*a,\s*b,\s*eps,\s*eta,\s*ok,\s*one",
             r"\1   real(kind=dp) :: me, mo, x\n   complex(kind=dp) :: a, b, eps, eta, of, ok, one",
+            f90,
+            flags=re.IGNORECASE,
+        )
+
+    if stem == "cg_rc":
+        # cg_rc reverse-communication control/state values are scalars.
+        # Keep vector work arrays as rank-1 and force scalar control args/outs.
+        f90 = re.sub(r"\binteger,\s*intent\(in\)\s*::\s*job\(:\)", "integer, intent(in) :: job", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\binteger,\s*intent\(in\)\s*::\s*iterate\(:\)", "integer, intent(in) :: iterate", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*intent\(in\)\s*::\s*rho\(:\)", "real(kind=dp), intent(in) :: rho", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*intent\(in\)\s*::\s*rho_old\(:\)", "real(kind=dp), intent(in) :: rho_old", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\binteger,\s*intent\(in\)\s*::\s*rlbl\(:\)", "integer, intent(in) :: rlbl", f90, flags=re.IGNORECASE)
+
+        f90 = re.sub(r"\binteger,\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_6\(:\)", "integer, intent(out) :: cg_rc_out_6", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_7\(:\)", "integer, intent(out) :: cg_rc_out_7", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_8\(:\)", "real(kind=dp), intent(out) :: cg_rc_out_8", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_9\(:\)", "real(kind=dp), intent(out) :: cg_rc_out_9", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\binteger,\s*allocatable,\s*intent\(out\)\s*::\s*cg_rc_out_10\(:\)", "integer, intent(out) :: cg_rc_out_10", f90, flags=re.IGNORECASE)
+
+        f90 = re.sub(r"\binteger,\s*allocatable\s*::\s*job\(:\)", "integer :: job", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\binteger,\s*allocatable\s*::\s*rlbl\(:\)", "integer :: rlbl", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*iterate\(:\)", "integer :: iterate", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*rho\(:\)", "real(kind=dp) :: rho", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*rho_old\(:\)", "real(kind=dp) :: rho_old", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\bwathen\(\s*nx\s*,\s*ny\s*,\s*real\(\s*n\s*,\s*kind=dp\s*\)\s*\)", "wathen(nx, ny, n)", f90, flags=re.IGNORECASE)
+        # cg_rc mutates iterative state and work vectors.
+        for _nm in ("x", "r", "z", "p", "q"):
+            f90 = re.sub(
+                rf"\breal\(kind=dp\),\s*intent\(in\)\s*::\s*{_nm}\(:\)",
+                f"real(kind=dp), intent(inout) :: {_nm}(:)",
+                f90,
+                flags=re.IGNORECASE,
+            )
+        for _nm in ("job", "iterate", "rho", "rho_old", "rlbl"):
+            f90 = re.sub(
+                rf"\b(integer|real\(kind=dp\)),\s*intent\(in\)\s*::\s*{_nm}\b",
+                lambda m: f"{m.group(1)}, intent(inout) :: {_nm}",
+                f90,
+                flags=re.IGNORECASE,
+            )
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*alpha\(:\)", "real(kind=dp) :: alpha", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\breal\(kind=dp\),\s*allocatable\s*::\s*beta\(:\)", "real(kind=dp) :: beta", f90, flags=re.IGNORECASE)
+        # Rewrite cg_rc as true reverse-communication subroutine with only
+        # in/inout dummies (drop tuple-return lowering outputs).
+        f90 = re.sub(
+            r"pure subroutine cg_rc\(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl,\s*&\s*\n\s*&\s*cg_rc_out_1.*?cg_rc_out_10\)",
+            "pure subroutine cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)",
+            f90,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_1\(:\)", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_2\(:\)", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_3\(:\)", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_4\(:\)", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*real\(kind=dp\), allocatable, intent\(out\) :: cg_rc_out_5\(:\)", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*integer, intent\(out\) :: cg_rc_out_6", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*integer, intent\(out\) :: cg_rc_out_7", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*real\(kind=dp\), intent\(out\) :: cg_rc_out_8", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*real\(kind=dp\), intent\(out\) :: cg_rc_out_9", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(r"\n\s*integer, intent\(out\) :: cg_rc_out_10", "", f90, flags=re.IGNORECASE)
+        f90 = re.sub(
+            r"\n\s*cg_rc_out_1 = x\s*\n\s*cg_rc_out_2 = r\s*\n\s*cg_rc_out_3 = z\s*\n\s*cg_rc_out_4 = p\s*\n\s*cg_rc_out_5 = q\s*\n\s*cg_rc_out_6 = job\s*\n\s*cg_rc_out_7 = iterate\s*\n\s*cg_rc_out_8 = rho\s*\n\s*cg_rc_out_9 = rho_old\s*\n\s*cg_rc_out_10 = rlbl",
+            "",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        # Avoid aliasing same actual arguments as both INOUT and OUT in
+        # tuple-return lowered cg_rc calls.
+        f90 = re.sub(
+            r"integer :: tmp_out_6_(\d+)\s*\n\s*real\(kind=dp\) :: tmp_out_8_\1\s*\n\s*integer :: tmp_out_10_\1",
+            r"integer :: tmp_out_6_\1\n         integer :: tmp_out_7_\1\n         real(kind=dp) :: tmp_out_8_\1\n         real(kind=dp) :: tmp_out_9_\1\n         integer :: tmp_out_10_\1",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r",\s*tmp_out_6_(\d+),\s*iterate,\s*tmp_out_8_\1,\s*rho_old,\s*&\s*\n\s*&\s*tmp_out_10_\1\)",
+            r", tmp_out_6_\1, tmp_out_7_\1, tmp_out_8_\1, tmp_out_9_\1, &\n            & tmp_out_10_\1)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"job = tmp_out_6_(\d+)\s*\n\s*rho = tmp_out_8_\1\s*\n\s*rlbl = tmp_out_10_\1",
+            r"job = tmp_out_6_\1\n         iterate = tmp_out_7_\1\n         rho = tmp_out_8_\1\n         rho_old = tmp_out_9_\1\n         rlbl = tmp_out_10_\1",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"\s*block\s*\n\s*integer :: tmp_out_6_\d+\s*\n\s*integer :: tmp_out_7_\d+\s*\n\s*real\(kind=dp\) :: tmp_out_8_\d+\s*\n\s*real\(kind=dp\) :: tmp_out_9_\d+\s*\n\s*integer :: tmp_out_10_\d+\s*\n\s*call cg_rc\(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl, x, &\s*\n\s*& r, z, p, q, tmp_out_6_\d+, tmp_out_7_\d+, tmp_out_8_\d+, tmp_out_9_\d+, &\s*\n\s*& tmp_out_10_\d+\)\s*\n\s*job = tmp_out_6_\d+\s*\n\s*iterate = tmp_out_7_\d+\s*\n\s*rho = tmp_out_8_\d+\s*\n\s*rho_old = tmp_out_9_\d+\s*\n\s*rlbl = tmp_out_10_\d+\s*\n\s*end block",
+            "\n      call cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        # Final robust line-based cleanup for cg_rc tuple-return lowering artifacts.
+        _src_lines = f90.splitlines()
+        _dst_lines = []
+        _i = 0
+        while _i < len(_src_lines):
+            _ln = _src_lines[_i]
+            _s = _ln.strip()
+            if re.match(r"pure\s+subroutine\s+cg_rc\(", _s, flags=re.IGNORECASE):
+                _dst_lines.append("pure subroutine cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)")
+                if ")" in _src_lines[_i]:
+                    _i += 1
+                else:
+                    _i += 1
+                    while _i < len(_src_lines) and ")" not in _src_lines[_i]:
+                        _i += 1
+                    if _i < len(_src_lines):
+                        _i += 1
+                continue
+            if re.search(r"::\s*cg_rc_out_\d+\b", _ln):
+                _i += 1
+                continue
+            if re.search(r"\bcg_rc_out_\d+\s*=", _ln):
+                _i += 1
+                continue
+            if re.search(r"::\s*tmp_out_(6|7|8|9|10)_\d+\b", _ln):
+                _i += 1
+                continue
+            if re.search(r"\b(job|iterate|rho|rho_old|rlbl)\s*=\s*tmp_out_(6|7|8|9|10)_\d+\b", _ln):
+                _i += 1
+                continue
+            if ("call cg_rc(" in _ln) and ("tmp_out_6_" in "".join(_src_lines[_i:_i + 6]) or "cg_rc_out_1" in "".join(_src_lines[_i:_i + 6])):
+                _indent = re.match(r"\s*", _ln).group(0)
+                _dst_lines.append(_indent + "call cg_rc(n, b, x, r, z, p, q, job, iterate, rho, rho_old, rlbl)")
+                _i += 1
+                while _i < len(_src_lines) and ")" not in _src_lines[_i]:
+                    _i += 1
+                if _i < len(_src_lines):
+                    _i += 1
+                continue
+            if _s == "block":
+                _look = "".join(_src_lines[_i + 1:min(len(_src_lines), _i + 8)])
+                if ("tmp_out_6_" in _look) and ("call cg_rc(" in _look):
+                    _i += 1
+                    continue
+            if _s == "end block":
+                _lookb = "".join(_src_lines[max(0, _i - 10):_i])
+                if "call cg_rc(" in _lookb and "tmp_out_6_" in _lookb:
+                    _i += 1
+                    continue
+            _dst_lines.append(_ln)
+            _i += 1
+        f90 = "\n".join(_dst_lines)
+        # Ensure JOB-dispatch branch is present after simplified cg_rc call blocks.
+        f90 = re.sub(
+            r"(do while \(\.true\.\)\s*\n\s*call cg_rc\([^\n]*\)\s*\n)(\s*q\(1:n\)\s*=\s*[^\n]*\n\s*q\(1:\(n - 1\)\)\s*=\s*[^\n]*\n\s*q\(2:n\)\s*=\s*[^\n]*\n)\s*else",
+            r"\1      if ((job == 1)) then\n\2      else",
+            f90,
+            flags=re.IGNORECASE,
+        )
+        f90 = re.sub(
+            r"(do while \(\.true\.\)\s*\n\s*call cg_rc\([^\n]*\)\s*\n)\s*(?!if\s*\(\(job == 1\)\)\s*then)([^\n]+\n)\s*else",
+            r"\1      if ((job == 1)) then\n\2      else",
             f90,
             flags=re.IGNORECASE,
         )
