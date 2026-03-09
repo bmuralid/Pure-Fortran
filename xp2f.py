@@ -5847,11 +5847,42 @@ class translator(ast.NodeVisitor):
             or (name in self.local_generic_overloads)
         )
 
+    def _force_int_name(self, name, rank_hint=0):
+        nm = self._aliased_name(self._resolve_list_alias(name))
+        if rank_hint and rank_hint > 0:
+            self.alloc_reals.discard(nm)
+            self.alloc_complexes.discard(nm)
+            self.alloc_logs.discard(nm)
+            self.alloc_chars.discard(nm)
+            self.alloc_ints.add(nm)
+            self.alloc_int_rank[nm] = max(int(self.alloc_int_rank.get(nm, 0)), int(rank_hint))
+            self.alloc_real_rank.pop(nm, None)
+            self.alloc_complex_rank.pop(nm, None)
+            self.alloc_log_rank.pop(nm, None)
+            self.alloc_char_rank.pop(nm, None)
+            return
+        self.reals.discard(nm)
+        self.complexes.discard(nm)
+        self.logs.discard(nm)
+        self.chars.discard(nm)
+        self.ints.add(nm)
+
     def _coerce_local_actual_kind(self, callee, idx, arg_node, arg_expr):
         if callee in self.local_generic_overloads:
             return arg_expr
         kinds = self.local_func_arg_kinds.get(callee, [])
         want = kinds[idx] if idx < len(kinds) else None
+        if idx < len(self.local_func_arg_names.get(callee, [])):
+            _formal = str(self.local_func_arg_names[callee][idx]).lower()
+            _pref_int = _formal in {
+                "n", "m", "k", "nx", "ny", "nz", "nt", "nr", "nc",
+                "iter", "iterate", "itmax", "maxiter", "job", "rlbl",
+                "i", "j", "l", "ii", "jj", "kk",
+                "ist", "jst", "icc", "ccc", "idx", "ind", "indx",
+                "row", "rows", "col", "cols",
+            }
+            if _pref_int and want == "real":
+                want = "int"
         if want not in {"real", "int", "logical", "char"}:
             return arg_expr
         have = self._expr_kind(arg_node)
@@ -7243,6 +7274,17 @@ class translator(ast.NodeVisitor):
                     return "int"
                 if "bool" in dtype_txt:
                     return "logical"
+                if (
+                    node.func.attr == "zeros"
+                    and dtype_txt == ""
+                    and len(node.args) >= 1
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, int)
+                    and int(node.args[0].value) == 0
+                ):
+                    # Empty placeholder arrays are often rebound later with concrete
+                    # dtype; avoid forcing REAL too early.
+                    return None
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -13067,6 +13109,17 @@ class translator(ast.NodeVisitor):
 
     def prescan(self, nodes):
         empty_list_append_kind = {}
+        index_name_hits = set()
+
+        def _names_in_expr(enode):
+            out = set()
+            if enode is None:
+                return out
+            for _n in ast.walk(enode):
+                if isinstance(_n, ast.Name):
+                    out.add(_n.id)
+            return out
+
         for _n in nodes:
             for _c in ast.walk(_n):
                 if not (
@@ -13087,6 +13140,10 @@ class translator(ast.NodeVisitor):
                 elif _prev != _k:
                     # Mixed append kinds default to REAL to avoid narrowing.
                     empty_list_append_kind[_nm] = "real"
+            for _s in ast.walk(_n):
+                if isinstance(_s, ast.Subscript):
+                    for _nm in _names_in_expr(getattr(_s, "slice", None)):
+                        index_name_hits.add(_nm)
 
         def _attr_root_name(n):
             cur = n
@@ -13129,6 +13186,18 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.value.func.value, ast.Name)
             ):
                 self._mark_char(node.targets[0].id)
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Subscript)
+                and isinstance(node.value.value, ast.Name)
+            ):
+                _lhs = node.targets[0].id
+                _rhs_base = node.value.value.id
+                if _lhs in index_name_hits or self._aliased_name(_lhs) in self.ints:
+                    self._force_int_name(_lhs, rank_hint=0)
+                    self._force_int_name(_rhs_base, rank_hint=1)
             for _a in ast.walk(node):
                 if (
                     isinstance(_a, ast.Attribute)
@@ -15005,6 +15074,8 @@ class translator(ast.NodeVisitor):
                                     self._mark_alloc_log(c.func.value.id)
                                 else:
                                     self._mark_alloc_int(c.func.value.id)
+        for _nm in index_name_hits:
+            self._force_int_name(_nm, rank_hint=0)
 
     def validate_unsafe_if_type_merges(self, nodes):
         """Reject mixed-type if-branch merges that would be translated incorrectly.
@@ -19431,6 +19502,16 @@ class translator(ast.NodeVisitor):
         ):
             path_txt = self.expr(c.args[0])
             arr_txt = self.expr(c.args[1])
+            arr_rank = self._rank_expr(c.args[1])
+            arr_kind = self._expr_kind(c.args[1])
+            if arr_kind == "logical":
+                arr_emit = f"merge(1.0_dp, 0.0_dp, {arr_txt})"
+            elif arr_kind == "real":
+                arr_emit = arr_txt
+            else:
+                arr_emit = f"real({arr_txt}, kind=dp)"
+            if arr_rank == 1:
+                arr_emit = f"reshape({arr_emit}, [size({arr_txt}), 1])"
             fmt_txt = self.expr(c.args[2]) if len(c.args) >= 3 else None
             delim_txt = self.expr(c.args[3]) if len(c.args) >= 4 else None
             for kw in c.keywords:
@@ -19438,7 +19519,7 @@ class translator(ast.NodeVisitor):
                     fmt_txt = self.expr(kw.value)
                 elif kw.arg == "delimiter":
                     delim_txt = self.expr(kw.value)
-            parts = [path_txt, arr_txt]
+            parts = [path_txt, arr_emit]
             if delim_txt is not None:
                 parts.append(f"delimiter={delim_txt}")
             if fmt_txt is not None:
@@ -20633,6 +20714,9 @@ def _emit_local_function(
         return nm_l in {
             "n", "m", "k", "nx", "ny", "nz", "nt", "nr", "nc",
             "iter", "iterate", "itmax", "maxiter", "job", "rlbl",
+            "i", "j", "l", "ii", "jj", "kk",
+            "ist", "jst", "icc", "ccc", "idx", "ind", "indx",
+            "row", "rows", "col", "cols",
         }
 
     dict_arg_names = set((dict_arg_types or {}).keys())
@@ -21630,19 +21714,34 @@ def _emit_local_function(
         ann_is_bool = "bool" in ann or "logical" in ann
         hint_kind = None
         decl_kind = None
+        idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
         if force_arg_kinds is not None and arg in force_arg_kinds:
             hint_kind = force_arg_kinds[arg]
         if force_complex and args and arg == args[0] and hint_kind is None:
             hint_kind = "complex"
         if local_func_arg_kinds is not None and fn.name in local_func_arg_kinds:
-            idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_kinds[fn.name]):
                 if hint_kind is None:
                     hint_kind = local_func_arg_kinds[fn.name][idx]
         if _arg_used_as_index_or_range(arg):
             hint_kind = "int"
+            if (
+                local_func_arg_kinds is not None
+                and fn.name in local_func_arg_kinds
+                and idx >= 0
+                and idx < len(local_func_arg_kinds[fn.name])
+            ):
+                local_func_arg_kinds[fn.name][idx] = "int"
         elif (hint_kind is None or hint_kind == "real") and _arg_name_prefers_int(arg):
             hint_kind = "int"
+            if (
+                local_func_arg_kinds is not None
+                and fn.name in local_func_arg_kinds
+                and idx >= 0
+                and idx < len(local_func_arg_kinds[fn.name])
+                and local_func_arg_kinds[fn.name][idx] in {None, "real"}
+            ):
+                local_func_arg_kinds[fn.name][idx] = "int"
         arr_rank = 0 if is_elemental_fn else _arg_array_rank(arg)
         if force_arg_ranks is not None and arg in force_arg_ranks:
             arr_rank = int(force_arg_ranks[arg])
@@ -21655,7 +21754,6 @@ def _emit_local_function(
         if arg in tr.alloc_complex_rank:
             arr_rank = max(arr_rank, int(tr.alloc_complex_rank.get(arg, 0)))
         if (force_arg_ranks is None or arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
-            idx = next((i for i, aa in enumerate(arg_nodes) if aa.arg == arg), -1)
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 arr_rank = max(arr_rank, int(local_func_arg_ranks[fn.name][idx]))
         for _st in fn.body:
