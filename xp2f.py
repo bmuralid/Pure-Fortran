@@ -9204,6 +9204,17 @@ class translator(ast.NodeVisitor):
                     la = a0 if lk == "char" else f"py_str({a0})"
                     rb = b0 if rk == "char" else f"py_str({b0})"
                     return f"({la} // {rb})"
+                # List-concatenation chain with at least one explicit list term.
+                # This covers expressions like [a] + x + [b], where x is a
+                # rank-1 sequence returned by a helper function.
+                def _flatten_add_terms(n):
+                    if isinstance(n, ast.BinOp) and isinstance(n.op, ast.Add):
+                        return _flatten_add_terms(n.left) + _flatten_add_terms(n.right)
+                    return [n]
+                add_terms = _flatten_add_terms(node)
+                has_explicit_list = any(isinstance(tn, (ast.List, ast.ListComp)) for tn in add_terms)
+                if has_explicit_list and all(self._rank_expr(tn) <= 1 for tn in add_terms):
+                    return "[" + ", ".join(self.expr(tn) for tn in add_terms) + "]"
             # Python list repetition semantics: n * list or list * n.
             if op is ast.Mult:
                 left_list = self._is_python_list_expr(node.left)
@@ -18594,6 +18605,19 @@ class translator(ast.NodeVisitor):
 
         # subscript assignment
         if isinstance(t, ast.Subscript):
+            # Statement-level lowering for ternary RHS preserves Python
+            # short-circuit semantics when assigning into indexed targets.
+            if isinstance(v, ast.IfExp):
+                self.o.w(f"if ({self.expr(v.test)}) then")
+                self.o.push()
+                self.o.w(f"{self.expr(t)} = {self.expr(v.body)}")
+                self.o.pop()
+                self.o.w("else")
+                self.o.push()
+                self.o.w(f"{self.expr(t)} = {self.expr(v.orelse)}")
+                self.o.pop()
+                self.o.w("end if")
+                return
             # NumPy boolean-mask assignment: a[m] = v
             if self._expr_kind(t.slice) == "logical":
                 rhs_rank = self._rank_expr(v)
@@ -24010,6 +24034,12 @@ def generate_flat(
             ):
                 return True
         return False
+    def _tree_loaded_names(_tree):
+        out = set()
+        for _n in ast.walk(_tree):
+            if isinstance(_n, ast.Name) and isinstance(getattr(_n, "ctx", None), ast.Load):
+                out.add(_n.id)
+        return out
     if use_proc_module:
         proc_tree = ast.Module(body=list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
@@ -24262,12 +24292,15 @@ def generate_flat(
         prog_name = f"{stem}_prog"
 
     helper_uses_main = helper_uses
+    proc_main_syms = []
     if use_proc_module:
         _main_nodes = [
             _n for _n in tree.body
             if not isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
         ]
         _main_tree = ast.Module(body=list(_main_nodes), type_ignores=[])
+        _main_loaded = _tree_loaded_names(_main_tree)
+        proc_main_syms = sorted([_s for _s in proc_public_syms if _s in _main_loaded])
         main_needed = detect_needed_helpers(_main_tree)
         helper_uses_main = {}
         for mod, syms in helper_uses.items():
@@ -24284,7 +24317,10 @@ def generate_flat(
     o.w(f"program {prog_name}")
     o.push()
     if use_proc_module:
-        o.w(f"use {proc_mod_name}, only: " + ", ".join(proc_public_syms))
+        if proc_main_syms:
+            o.w(f"use {proc_mod_name}, only: " + ", ".join(proc_main_syms))
+        else:
+            o.w(f"use {proc_mod_name}")
     for mod, syms in helper_uses_main.items():
         if syms:
             o.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
