@@ -8090,6 +8090,10 @@ class translator(ast.NodeVisitor):
                     if uconst >= 0:
                         return str(uconst)
                     return f"({extent_expr} - {abs(uconst)})"
+                if isinstance(slc.upper, ast.UnaryOp) and isinstance(slc.upper.op, ast.USub):
+                    # Python slice upper like ":-k" maps to n-k in Fortran.
+                    # Keep it symbolic to avoid evaluating non-constants here.
+                    return f"({extent_expr} - ({self.expr(slc.upper.operand)}))"
                 return self.expr(slc.upper)
             # For negative-step slices, Python upper bound is exclusive and maps to +1 in Fortran.
             if step_val < 0:
@@ -14444,8 +14448,11 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_log(t.id, rank=rank_hint)
                     elif "float" in dtype_txt:
                         self._mark_alloc_real(t.id, rank=rank_hint)
-                    else:
+                    elif "int" in dtype_txt:
                         self._mark_alloc_int(t.id, rank=rank_hint)
+                    else:
+                        # NumPy defaults np.empty dtype to float64.
+                        self._mark_alloc_real(t.id, rank=rank_hint)
 
                 # np.full(shape, value, dtype=...)
                 if (
