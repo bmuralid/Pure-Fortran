@@ -458,6 +458,11 @@ class CppTranspiler:
                 if expr.func.attr == "size":
                     return "int"
                 if expr.func.attr == "reshape":
+                    base_type = self.infer_expr_type(expr.func.value, local_types)
+                    if len(expr.args) == 1:
+                        if base_type == "pycpp::Array2D<double>":
+                            return "pycpp::Array1D<double>"
+                        return base_type
                     return "pycpp::Array2D<double>"
                 if expr.func.attr == "gauss":
                     return "double"
@@ -719,6 +724,11 @@ class CppTranspiler:
             if base_type == "pycpp::Array2D<double>" and index_type == "pycpp::Array1D<int>":
                 self.emit(f"pycpp::set_rows({self.expr(target.value, local_types)}, {self.expr(target.slice, local_types)}, {value});")
                 return
+            if base_type == "pycpp::Array2D<double>" and isinstance(target.slice, (ast.Constant, ast.Name, ast.UnaryOp, ast.BinOp, ast.Call, ast.Attribute, ast.Subscript)):
+                slice_type = self.infer_expr_type(target.slice, local_types)
+                if slice_type == "int":
+                    self.emit(f"pycpp::set_row({self.expr(target.value, local_types)}, {self.expr(target.slice, local_types)}, {value});")
+                    return
             if (
                 base_type == "pycpp::Array2D<double>"
                 and isinstance(target.slice, ast.Tuple)
@@ -1200,6 +1210,8 @@ class CppTranspiler:
             if node.func.attr == "ravel" and not node.args:
                 return f"{self.expr(node.func.value, local_types)}.ravel()"
             if node.func.attr == "reshape":
+                if len(node.args) == 1:
+                    return f"pycpp::reshape({self.expr(node.func.value, local_types)}, {self.expr(node.args[0], local_types)})"
                 return f"pycpp::reshape({self.expr(node.func.value, local_types)}, {self.expr(node.args[0], local_types)}, {self.expr(node.args[1], local_types)})"
             if node.func.attr == "choice":
                 size_arg = None

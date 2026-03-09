@@ -539,6 +539,16 @@ Array1D<T> row(const Array2D<T>& values, int index) {
 }
 
 template <typename T>
+void set_row(Array2D<T>& target, int index, const Array1D<T>& values) {
+    if (index < 0 || static_cast<std::size_t>(index) >= target.rows() || values.size() != target.cols()) {
+        throw std::runtime_error("set_row shape mismatch");
+    }
+    for (std::size_t j = 0; j < target.cols(); ++j) {
+        target(static_cast<std::size_t>(index), j) = values[j];
+    }
+}
+
+template <typename T>
 Array1D<T> col(const Array2D<T>& values, int index) {
     if (index < 0 || static_cast<std::size_t>(index) >= values.cols()) {
         throw std::runtime_error("column index out of range");
@@ -626,6 +636,14 @@ Array2D<T> reshape(const Array1D<T>& values, int rows, int cols) {
         }
     }
     return out;
+}
+
+template <typename T>
+Array1D<T> reshape(const Array2D<T>& values, int size) {
+    if (size < 0 || static_cast<std::size_t>(size) != values.size()) {
+        throw std::runtime_error("reshape size mismatch");
+    }
+    return values.ravel();
 }
 
 template <typename T>
