@@ -3142,6 +3142,14 @@ def detect_needed_helpers(tree):
                     return None
                 return [cur.id] + list(reversed(parts))
 
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "csv"
+                and node.func.attr == "reader"
+            ):
+                needed.add("csv_split_line")
+
             def _is_scipy_special_attr_call(fn):
                 if not isinstance(fn, ast.Attribute):
                     return False
@@ -5480,6 +5488,7 @@ class translator(ast.NodeVisitor):
         self.scipy_special_func_aliases = dict(translator.global_scipy_special_func_aliases)
         self.promoted_colvec_results = set()
         self.uses_sys_argv = False
+        self.uses_csv_split_line = False
         self.var_type_first_seen = {}
         self.var_type_initial_spec = {}
         self.type_rebind_events = {}
@@ -5498,6 +5507,9 @@ class translator(ast.NodeVisitor):
         self.lambda_vars = {}
         self.tuple_loop_literals = {}
         self.callable_aliases = {}
+        self.csv_reader_vars = set()
+        self.csv_reader_specs = {}
+        self.with_open_paths = {}
 
     def _resolve_list_alias(self, name):
         cur = name
@@ -6783,6 +6795,13 @@ class translator(ast.NodeVisitor):
             ):
                 return self._np_dtype_kind(node)
             if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"atleast_1d", "atleast_2d"}
+                and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
+            if (
                 isinstance(node.func, ast.Name)
                 and node.func.id == "array"
                 and len(node.args) >= 1
@@ -8057,6 +8076,10 @@ class translator(ast.NodeVisitor):
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"full_like", "clip", "transpose", "swapaxes", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "gradient", "ascontiguousarray", "asfortranarray"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
+                if node.func.attr == "atleast_1d" and len(node.args) >= 1:
+                    return max(1, self._rank_expr(node.args[0]))
+                if node.func.attr == "atleast_2d" and len(node.args) >= 1:
+                    return max(2, self._rank_expr(node.args[0]))
                 if node.func.attr in {"log1p", "nan_to_num"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"pad", "roll", "flip", "flipud", "copy", "empty_like"} and len(node.args) >= 1:
@@ -9844,7 +9867,10 @@ class translator(ast.NodeVisitor):
                     return f"nint({self.expr(node.args[0])})"
                 raise NotImplementedError("round() currently supports one argument (or ndigits=0)")
             if isinstance(node.func, ast.Name) and node.func.id == "int" and len(node.args) == 1:
-                return f"int({self.expr(node.args[0])})"
+                a0 = node.args[0]
+                if self._expr_kind(a0) == "char":
+                    return f"nint(py_float({self.expr(a0)}))"
+                return f"int({self.expr(a0)})"
             if isinstance(node.func, ast.Name) and node.func.id == "float" and len(node.args) == 1:
                 if is_const_str(node.args[0]) and str(node.args[0].value).lower() == "nan":
                     return "ieee_value(0.0_dp, ieee_quiet_nan)"
@@ -11979,6 +12005,31 @@ class translator(ast.NodeVisitor):
                 return helper_name + "(" + ", ".join(parts) + ")"
             if (
                 isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "atleast_1d"
+                and len(node.args) >= 1
+            ):
+                a0 = node.args[0]
+                e0 = self.expr(a0)
+                if self._rank_expr(a0) > 0:
+                    return e0
+                return f"[{e0}]"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "atleast_2d"
+                and len(node.args) >= 1
+            ):
+                a0 = node.args[0]
+                e0 = self.expr(a0)
+                r0 = self._rank_expr(a0)
+                if r0 >= 2:
+                    return e0
+                if r0 == 1:
+                    return f"reshape({e0}, [1, size({e0})])"
+                return f"reshape([{e0}], [1, 1])"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "where"
@@ -12669,6 +12720,32 @@ class translator(ast.NodeVisitor):
                 continue
 
             if isinstance(node, ast.Assign):
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and isinstance(node.value.func.value, ast.Name)
+                    and node.value.func.value.id == "csv"
+                    and node.value.func.attr == "reader"
+                ):
+                    self.csv_reader_vars.add(node.targets[0].id)
+                    self.uses_csv_split_line = True
+                    self._mark_int(node.targets[0].id)
+                    continue
+                if (
+                    len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and node.value.func.id == "next"
+                    and len(node.value.args) >= 1
+                    and isinstance(node.value.args[0], ast.Name)
+                    and node.value.args[0].id in self.csv_reader_vars
+                ):
+                    self.uses_csv_split_line = True
+                    self._mark_alloc_char(node.targets[0].id, rank=1)
+                    continue
                 if (
                     len(node.targets) == 1
                     and isinstance(node.targets[0], (ast.Tuple, ast.List))
@@ -14302,6 +14379,12 @@ class translator(ast.NodeVisitor):
             if isinstance(node, ast.For):
                 if isinstance(node.target, ast.Name):
                     tnm = "i_" if node.target.id == "_" else node.target.id
+                    if isinstance(node.iter, ast.Name) and node.iter.id in self.csv_reader_vars:
+                        self.uses_csv_split_line = True
+                        if node.target.id != "_":
+                            self._mark_alloc_char(tnm, rank=1)
+                        self.prescan(node.body)
+                        continue
                     if (
                         isinstance(node.iter, ast.Call)
                         and isinstance(node.iter.func, ast.Name)
@@ -14395,17 +14478,23 @@ class translator(ast.NodeVisitor):
             if isinstance(node, ast.While):
                 self.prescan(node.body)
                 self.prescan(node.orelse)
+            if isinstance(node, ast.With):
+                self.prescan(node.body)
 
-            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-                c = node.value
-                if isinstance(c.func, ast.Attribute) and c.func.attr == "append":
-                    if isinstance(c.func.value, ast.Name):
-                        if self.context == "flat":
-                            k = self._expr_kind(c.args[0]) if c.args else None
-                            if k == "real":
-                                self._mark_alloc_real(c.func.value.id)
-                            else:
-                                self._mark_alloc_int(c.func.value.id)
+                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                    c = node.value
+                    if isinstance(c.func, ast.Attribute) and c.func.attr == "append":
+                        if isinstance(c.func.value, ast.Name):
+                            if self.context == "flat":
+                                k = self._expr_kind(c.args[0]) if c.args else None
+                                if k == "real":
+                                    self._mark_alloc_real(c.func.value.id)
+                                elif k == "char":
+                                    self._mark_alloc_char(c.func.value.id)
+                                elif k == "logical":
+                                    self._mark_alloc_log(c.func.value.id)
+                                else:
+                                    self._mark_alloc_int(c.func.value.id)
 
     def validate_unsafe_if_type_merges(self, nodes):
         """Reject mixed-type if-branch merges that would be translated incorrectly.
@@ -14495,6 +14584,26 @@ class translator(ast.NodeVisitor):
         fake = ast.Assign(targets=[node.target], value=node.value)
         self.visit_Assign(fake)
 
+    def visit_With(self, node):
+        self._emit_comments_for(node)
+        pushed = []
+        for it in getattr(node, "items", []):
+            ctx = getattr(it, "context_expr", None)
+            opt = getattr(it, "optional_vars", None)
+            if (
+                isinstance(ctx, ast.Call)
+                and isinstance(ctx.func, ast.Name)
+                and ctx.func.id == "open"
+                and isinstance(opt, ast.Name)
+                and len(ctx.args) >= 1
+            ):
+                self.with_open_paths[opt.id] = self.expr(ctx.args[0])
+                pushed.append(opt.id)
+        for s in node.body:
+            self.visit(s)
+        for nm in pushed:
+            self.with_open_paths.pop(nm, None)
+
     def visit_Delete(self, node):
         self._emit_comments_for(node)
         for t in node.targets:
@@ -14556,6 +14665,75 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("multiple assignment not supported")
         t = node.targets[0]
         v = node.value
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "csv"
+            and v.func.attr == "reader"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Name)
+        ):
+            fvar = v.args[0].id
+            if fvar not in self.with_open_paths:
+                raise NotImplementedError("csv.reader currently requires with open(... ) as f context")
+            delim_txt = '","'
+            quote_txt = '\'"\''
+            for kw in v.keywords:
+                if kw.arg == "delimiter":
+                    delim_txt = self.expr(kw.value)
+                elif kw.arg == "quotechar":
+                    quote_txt = self.expr(kw.value)
+            self.csv_reader_specs[t.id] = {
+                "path": self.with_open_paths[fvar],
+                "delimiter": delim_txt,
+                "quotechar": quote_txt,
+                "skiprows": 0,
+            }
+            self.csv_reader_vars.add(t.id)
+            return
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id == "next"
+            and len(v.args) >= 1
+            and isinstance(v.args[0], ast.Name)
+            and v.args[0].id in self.csv_reader_specs
+        ):
+            spec = self.csv_reader_specs[v.args[0].id]
+            self.uses_csv_split_line = True
+            spec["skiprows"] = int(spec.get("skiprows", 0)) + 1
+            self.csv_reader_specs[v.args[0].id] = spec
+            self._mark_alloc_char(t.id, rank=1)
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: u_csv, ios_csv")
+            self.o.w("character(len=4096) :: line_csv")
+            self.o.w(f"open(newunit=u_csv, file=trim({spec['path']}), status='old', action='read', iostat=ios_csv)")
+            self.o.w("if (ios_csv == 0) then")
+            self.o.push()
+            self.o.w("read(u_csv, '(A)', iostat=ios_csv) line_csv")
+            self.o.w("if (ios_csv == 0) then")
+            self.o.push()
+            self.o.w(f"{t.id} = csv_split_line(line_csv, delimiter={spec['delimiter']}, quotechar={spec['quotechar']})")
+            self.o.pop()
+            self.o.w("else")
+            self.o.push()
+            self.o.w(f"allocate(character(len=1) :: {t.id}(0))")
+            self.o.pop()
+            self.o.w("end if")
+            self.o.w("close(u_csv)")
+            self.o.pop()
+            self.o.w("else")
+            self.o.push()
+            self.o.w(f"allocate(character(len=1) :: {t.id}(0))")
+            self.o.pop()
+            self.o.w("end if")
+            self.o.pop()
+            self.o.w("end block")
+            return
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
@@ -18160,6 +18338,47 @@ class translator(ast.NodeVisitor):
             self.o.pop()
             self.o.w("end block")
 
+        if (
+            isinstance(node.iter, ast.Name)
+            and node.iter.id in self.csv_reader_specs
+            and isinstance(node.target, ast.Name)
+        ):
+            spec = self.csv_reader_specs[node.iter.id]
+            self.uses_csv_split_line = True
+            target_name = node.target.id
+            if target_name != "_":
+                self._mark_alloc_char(target_name, rank=1)
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: u_csv, ios_csv, i_csv")
+            self.o.w("character(len=4096) :: line_csv")
+            self.o.w(f"open(newunit=u_csv, file=trim({spec['path']}), status='old', action='read', iostat=ios_csv)")
+            self.o.w("if (ios_csv == 0) then")
+            self.o.push()
+            if int(spec.get("skiprows", 0)) > 0:
+                self.o.w(f"do i_csv = 1, {int(spec.get('skiprows', 0))}")
+                self.o.push()
+                self.o.w("read(u_csv, '(A)', iostat=ios_csv) line_csv")
+                self.o.w("if (ios_csv /= 0) exit")
+                self.o.pop()
+                self.o.w("end do")
+            self.o.w("do")
+            self.o.push()
+            self.o.w("read(u_csv, '(A)', iostat=ios_csv) line_csv")
+            self.o.w("if (ios_csv /= 0) exit")
+            if target_name != "_":
+                self.o.w(f"{target_name} = csv_split_line(line_csv, delimiter={spec['delimiter']}, quotechar={spec['quotechar']})")
+            for s in node.body:
+                self.visit(s)
+            self.o.pop()
+            self.o.w("end do")
+            self.o.w("close(u_csv)")
+            self.o.pop()
+            self.o.w("end if")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         # for i, j in enumerate(range(...), start=...)
         if (
             isinstance(node.iter, ast.Call)
@@ -21248,6 +21467,8 @@ def _emit_local_function(
             needed_helpers.add("sys_argv_init")
             needed_helpers.add("sys_argv_delete")
         o.w("sys_argv = sys_argv_init()")
+    if tr.uses_csv_split_line and needed_helpers is not None:
+        needed_helpers.add("csv_split_line")
     for arg, alias, _decl_kind in local_rebind_aliases:
         o.w(f"{alias} = {arg}")
     for arg, alias, dflt_expr, arr_rank in optional_default_inits:
@@ -23126,6 +23347,8 @@ def generate_flat(
             needed_helpers.add("sys_argv_init")
             needed_helpers.add("sys_argv_delete")
         o.w("sys_argv = sys_argv_init()")
+    if tr.uses_csv_split_line and needed_helpers is not None:
+        needed_helpers.add("csv_split_line")
 
     o.w("")
     for stmt in tree.body:
