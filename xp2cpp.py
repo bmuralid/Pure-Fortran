@@ -18,6 +18,7 @@ class CppTranspiler:
         self.function_cpp_names: dict[str, str] = {}
         self.struct_fields: dict[str, dict[str, str]] = {}
         self.function_struct_types: dict[str, str] = {}
+        self.argparse_specs: dict[str, dict[str, object]] = {}
 
     def emit(self, line: str = "") -> None:
         self.lines.append("    " * self.indent_level + line)
@@ -29,6 +30,7 @@ class CppTranspiler:
         self.emit("#include <cmath>")
         self.emit("#include <iomanip>")
         self.emit("#include <iostream>")
+        self.emit("#include <limits>")
         self.emit("#include <map>")
         self.emit("#include <random>")
         self.emit("#include <sstream>")
@@ -115,16 +117,114 @@ class CppTranspiler:
             self.emit("};")
             self.emit()
 
+        self.emit("std::vector<std::string> sys_argv;")
+        self.emit()
+        self.emit("std::ostream& operator<<(std::ostream& os, const std::tuple<int>& value) {")
+        self.indent_level += 1
+        self.emit('os << "(" << std::get<0>(value) << ",)";')
+        self.emit("return os;")
+        self.indent_level -= 1
+        self.emit("}")
+        self.emit()
+        self.emit("std::ostream& operator<<(std::ostream& os, const std::tuple<int, int>& value) {")
+        self.indent_level += 1
+        self.emit('os << "(" << std::get<0>(value) << ", " << std::get<1>(value) << ")";')
+        self.emit("return os;")
+        self.indent_level -= 1
+        self.emit("}")
+        self.emit()
+
+        for spec in self.argparse_specs.values():
+            struct_name = spec["struct_name"]
+            fields = spec["fields"]
+            self.emit(f"{struct_name} parse_{struct_name}(const std::vector<std::string>& argv) {{")
+            self.indent_level += 1
+            self.emit(f"{struct_name} args;")
+            positional_name = None
+            positional_default = None
+            positional_type = None
+            for field in fields:
+                if field["kind"] == "positional":
+                    positional_name = field["name"]
+                    positional_default = field["default_expr"]
+                    positional_type = field["type"]
+                else:
+                    self.emit(f'args.{field["name"]} = {field["default_expr"]};')
+            if positional_name is not None:
+                self.emit(f"args.{positional_name} = {positional_default};")
+            self.emit("for (int i = 1; i < static_cast<int>(argv.size()); ++i) {")
+            self.indent_level += 1
+            self.emit("const std::string& arg = argv[i];")
+            first = True
+            for field in fields:
+                if field["kind"] != "option":
+                    continue
+                prefix = "if" if first else "else if"
+                self.emit(f'{prefix} (arg == "{field["flag"]}") {{')
+                self.indent_level += 1
+                self.emit("if (i + 1 >= static_cast<int>(argv.size())) {")
+                self.indent_level += 1
+                self.emit(f'throw std::runtime_error("missing value for {field["flag"]}");')
+                self.indent_level -= 1
+                self.emit("}")
+                parse_expr = "argv[++i]"
+                if field["type"] == "int":
+                    parse_expr = "std::stoi(argv[++i])"
+                elif field["type"] == "double":
+                    parse_expr = "std::stod(argv[++i])"
+                self.emit(f'args.{field["name"]} = {parse_expr};')
+                self.indent_level -= 1
+                self.emit("}")
+                first = False
+            if positional_name is not None:
+                prefix = "if" if first else "else if"
+                self.emit(f"{prefix} (!arg.empty() && arg[0] != '-') {{")
+                self.indent_level += 1
+                assign_expr = "arg"
+                if positional_type == "int":
+                    assign_expr = "std::stoi(arg)"
+                elif positional_type == "double":
+                    assign_expr = "std::stod(arg)"
+                self.emit(f"args.{positional_name} = {assign_expr};")
+                self.indent_level -= 1
+                self.emit("}")
+                first = False
+            self.emit("else {")
+            self.indent_level += 1
+            self.emit('throw std::runtime_error("unsupported command-line argument: " + arg);')
+            self.indent_level -= 1
+            self.emit("}")
+            self.indent_level -= 1
+            self.emit("}")
+            self.emit("return args;")
+            self.indent_level -= 1
+            self.emit("}")
+            self.emit()
+
         for node in tree.body:
             if isinstance(node, ast.FunctionDef):
                 self.emit_function(node)
                 self.emit()
 
-        main_call = self.find_main_call(tree)
-        self.emit("int main() {")
+        main_block = self.find_main_block(tree)
+        self.emit("int main(int argc, char* argv[]) {")
         self.indent_level += 1
-        if main_call is not None:
-            self.emit(f"{self.function_cpp_names.get(main_call, main_call)}();")
+        self.emit("sys_argv.clear();")
+        self.emit("for (int i = 0; i < argc; ++i) {")
+        self.indent_level += 1
+        self.emit("sys_argv.emplace_back(argv[i]);")
+        self.indent_level -= 1
+        self.emit("}")
+        if main_block is not None:
+            local_types: dict[str, str] = {}
+            for stmt in main_block:
+                self.collect_stmt_types(stmt, local_types)
+            declared: set[str] = set()
+            for name, cpp_type in local_types.items():
+                self.emit(f"{cpp_type} {name}{self.default_initializer(cpp_type)};")
+                declared.add(name)
+            for stmt in main_block:
+                self.emit_stmt(stmt, local_types, declared)
         self.emit("return 0;")
         self.indent_level -= 1
         self.emit("}")
@@ -135,6 +235,7 @@ class CppTranspiler:
             if not isinstance(node, ast.FunctionDef):
                 continue
             self.function_cpp_names[node.name] = "py_main" if node.name == "main" else node.name
+            self.extract_argparse_spec(node)
             arg_names = [arg.arg for arg in node.args.args]
             self.function_arg_names[node.name] = arg_names
             defaults: dict[str, ast.AST] = {}
@@ -153,6 +254,10 @@ class CppTranspiler:
                     inferred = self.infer_arg_type_from_usage(node, arg.arg, local_types)
                     if inferred != "double":
                         local_types[arg.arg] = inferred
+            rescanned_types = {arg.arg: local_types[arg.arg] for arg in node.args.args}
+            for stmt in node.body:
+                self.collect_stmt_types(stmt, rescanned_types)
+            local_types = rescanned_types
             self.function_local_types[node.name] = local_types
             self.function_return_types[node.name] = self.infer_function_return_type(node, local_types)
 
@@ -189,19 +294,28 @@ class CppTranspiler:
     def collect_stmt_types(self, stmt: ast.stmt, local_types: dict[str, str]) -> None:
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
             name = stmt.targets[0].id
+            if (
+                isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "parse_args"
+                and isinstance(stmt.value.func.value, ast.Name)
+            ):
+                for spec in self.argparse_specs.values():
+                    if stmt.value.func.value.id == spec["parser_var"]:
+                        local_types[name] = spec["struct_name"]
+                        return
             inferred = self.infer_expr_type(stmt.value, local_types)
             current = local_types.get(name)
             if current is None or (current == "double" and inferred != "double"):
                 local_types[name] = inferred
         elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], (ast.Tuple, ast.List)):
             target = stmt.targets[0]
-            if isinstance(stmt.value, ast.Call):
-                inferred = self.infer_expr_type(stmt.value, local_types)
-                tuple_items = self.tuple_inner_types(inferred)
-                if tuple_items and len(tuple_items) == len(target.elts):
-                    for elt, item_type in zip(target.elts, tuple_items):
-                        if isinstance(elt, ast.Name):
-                            local_types[elt.id] = item_type
+            inferred = self.infer_expr_type(stmt.value, local_types)
+            tuple_items = self.tuple_inner_types(inferred)
+            if tuple_items and len(tuple_items) == len(target.elts):
+                for elt, item_type in zip(target.elts, tuple_items):
+                    if isinstance(elt, ast.Name):
+                        local_types[elt.id] = item_type
         elif isinstance(stmt, ast.If):
             for inner in stmt.body:
                 self.collect_stmt_types(inner, local_types)
@@ -227,6 +341,12 @@ class CppTranspiler:
                 return "std::string"
         if isinstance(expr, ast.Name):
             return local_types.get(expr.id, "double")
+        if isinstance(expr, ast.Attribute) and expr.attr == "shape":
+            base_type = self.infer_expr_type(expr.value, local_types)
+            if base_type == "pycpp::Array2D<double>":
+                return "std::tuple<int, int>"
+            if base_type in {"pycpp::Array1D<double>", "pycpp::Array1D<int>"}:
+                return "std::tuple<int>"
         if isinstance(expr, ast.Tuple):
             inner = ", ".join(self.infer_expr_type(elt, local_types) for elt in expr.elts)
             return f"std::tuple<{inner}>"
@@ -250,6 +370,8 @@ class CppTranspiler:
             if isinstance(expr.func, ast.Attribute):
                 if self.is_string_method_call(expr):
                     return "std::string"
+                if self.attr_chain(expr.func)[:2] == ["argparse", "ArgumentParser"]:
+                    return "pycpp::ArgParser"
                 if self.attr_chain(expr.func)[:2] == ["math", "erf"]:
                     return "double"
                 if self.attr_chain(expr.func)[:2] == ["random", "Random"]:
@@ -261,9 +383,15 @@ class CppTranspiler:
                 if expr.func.attr == "normal":
                     return "pycpp::Array1D<double>"
                 if self.attr_chain(expr.func)[:2] == ["np", "array"]:
+                    arg_type = self.infer_expr_type(expr.args[0], local_types) if expr.args else "double"
+                    if arg_type == "std::vector<pycpp::Array2D<double>>":
+                        return arg_type
+                    if expr.args and isinstance(expr.args[0], ast.List) and expr.args[0].elts and isinstance(expr.args[0].elts[0], ast.List):
+                        return "pycpp::Array2D<double>"
                     return "pycpp::Array1D<double>"
                 if self.attr_chain(expr.func)[:2] == ["np", "asarray"]:
-                    return "pycpp::Array1D<double>"
+                    arg_type = self.infer_expr_type(expr.args[0], local_types) if expr.args else "double"
+                    return arg_type if arg_type.startswith("pycpp::Array") else "pycpp::Array1D<double>"
                 if self.attr_chain(expr.func)[:2] == ["np", "full"]:
                     if expr.args and isinstance(expr.args[0], ast.Tuple):
                         return "pycpp::Array2D<double>"
@@ -293,6 +421,26 @@ class CppTranspiler:
                     return "double"
                 if self.attr_chain(expr.func)[:2] == ["np", "argsort"]:
                     return "pycpp::Array1D<int>"
+                if self.attr_chain(expr.func)[:2] == ["np", "eye"]:
+                    return "pycpp::Array2D<double>"
+                if self.attr_chain(expr.func)[:2] == ["np", "ndim"]:
+                    return "int"
+                if self.attr_chain(expr.func)[:2] == ["np", "cov"]:
+                    return "pycpp::Array2D<double>"
+                if self.attr_chain(expr.func)[:2] == ["np", "atleast_2d"]:
+                    return "pycpp::Array2D<double>"
+                if self.attr_chain(expr.func)[:2] == ["np", "loadtxt"]:
+                    return "pycpp::Array2D<double>"
+                if self.attr_chain(expr.func)[:3] == ["np", "linalg", "slogdet"]:
+                    return "std::tuple<double, double>"
+                if self.attr_chain(expr.func)[:3] == ["np", "linalg", "inv"]:
+                    return "pycpp::Array2D<double>"
+                if self.attr_chain(expr.func)[:2] == ["np", "einsum"]:
+                    return "pycpp::Array1D<double>"
+                if self.attr_chain(expr.func)[:2] == ["np", "where"]:
+                    return "std::tuple<pycpp::Array1D<int>>"
+                if self.attr_chain(expr.func)[:2] == ["np", "column_stack"]:
+                    return "pycpp::Array2D<double>"
                 if self.attr_chain(expr.func)[:2] == ["np", "max"]:
                     if any(keyword.arg == "axis" for keyword in expr.keywords):
                         keepdims = next((kw.value for kw in expr.keywords if kw.arg == "keepdims"), None)
@@ -309,8 +457,16 @@ class CppTranspiler:
                     return base_type
                 if expr.func.attr == "size":
                     return "int"
+                if expr.func.attr == "reshape":
+                    return "pycpp::Array2D<double>"
                 if expr.func.attr == "gauss":
                     return "double"
+                if expr.func.attr == "multivariate_normal":
+                    return "pycpp::Array2D<double>"
+                if expr.func.attr == "parse_args" and isinstance(expr.func.value, ast.Name):
+                    spec = self.argparse_specs.get(self.current_function_name(local_types))
+                    if spec is not None and expr.func.value.id == spec["parser_var"]:
+                        return spec["struct_name"]
         if isinstance(expr, ast.BinOp):
             if (
                 isinstance(expr.op, ast.Mult)
@@ -324,6 +480,11 @@ class CppTranspiler:
                 return left_type
             if right_type.startswith("pycpp::Array") and left_type in {"double", "int"}:
                 return right_type
+            if isinstance(expr.op, ast.MatMult):
+                if left_type == "pycpp::Array2D<double>" and right_type == "pycpp::Array2D<double>":
+                    return "pycpp::Array2D<double>"
+                if left_type == "pycpp::Array2D<double>" and right_type == "pycpp::Array1D<double>":
+                    return "pycpp::Array1D<double>"
             if (
                 isinstance(expr.op, ast.Add)
                 and left_type == "std::vector<double>"
@@ -341,16 +502,50 @@ class CppTranspiler:
             return "bool"
         if isinstance(expr, ast.BoolOp):
             return "bool"
+        if isinstance(expr, ast.IfExp):
+            body_type = self.infer_expr_type(expr.body, local_types)
+            else_type = self.infer_expr_type(expr.orelse, local_types)
+            if body_type == else_type:
+                return body_type
+            if "std::string" in {body_type, else_type}:
+                return "std::string"
+            if body_type.startswith("pycpp::Array"):
+                return body_type
+            if else_type.startswith("pycpp::Array"):
+                return else_type
+            if body_type == else_type == "int":
+                return "int"
+            return "double"
         if isinstance(expr, ast.Dict):
             return "std::map<std::string, double>"
         if isinstance(expr, ast.Subscript):
+            if (
+                isinstance(expr.value, ast.Call)
+                and isinstance(expr.value.func, ast.Attribute)
+                and self.attr_chain(expr.value.func)[:2] == ["np", "where"]
+                and isinstance(expr.slice, ast.Constant)
+                and expr.slice.value == 0
+            ):
+                return "pycpp::Array1D<int>"
             value_type = self.infer_expr_type(expr.value, local_types)
             if value_type in self.struct_fields and isinstance(expr.slice, ast.Constant) and isinstance(expr.slice.value, str):
                 return self.struct_fields[value_type][expr.slice.value]
+            if (
+                isinstance(expr.value, ast.Attribute)
+                and expr.value.attr == "shape"
+                and isinstance(expr.slice, ast.Constant)
+                and isinstance(expr.slice.value, int)
+            ):
+                return "int"
             if isinstance(expr.slice, ast.Tuple) and value_type == "pycpp::Array1D<double>":
                 return "pycpp::Array2D<double>"
             if value_type == "std::vector<double>":
                 return "double"
+            if value_type == "std::vector<pycpp::Array2D<double>>":
+                index_type = self.infer_expr_type(expr.slice, local_types)
+                if index_type == "pycpp::Array1D<int>":
+                    return "std::vector<pycpp::Array2D<double>>"
+                return "pycpp::Array2D<double>"
             if value_type == "pycpp::Array1D<double>":
                 index_type = self.infer_expr_type(expr.slice, local_types)
                 if index_type == "pycpp::Array1D<int>":
@@ -362,11 +557,21 @@ class CppTranspiler:
                     return "pycpp::Array1D<int>"
                 return "int"
             if value_type == "pycpp::Array2D<double>":
-                return "pycpp::Array2D<double>"
+                index_type = self.infer_expr_type(expr.slice, local_types)
+                if index_type == "pycpp::Array1D<int>":
+                    return "pycpp::Array2D<double>"
+                return "pycpp::Array1D<double>"
             return "double"
         if isinstance(expr, ast.List):
+            if expr.elts:
+                element_type = self.infer_expr_type(expr.elts[0], local_types)
+                if element_type == "pycpp::Array2D<double>":
+                    return "std::vector<pycpp::Array2D<double>>"
             return "std::vector<double>"
         if isinstance(expr, ast.ListComp):
+            element_type = self.infer_expr_type(expr.elt, local_types)
+            if element_type == "pycpp::Array2D<double>":
+                return "std::vector<pycpp::Array2D<double>>"
             return "std::vector<double>"
         return "double"
 
@@ -407,6 +612,8 @@ class CppTranspiler:
                     inner = ", ".join(self.cpp_type_from_annotation(elt) for elt in sub.elts)
                     return f"std::tuple<{inner}>"
             if isinstance(base, ast.Name) and base.id == "list":
+                if isinstance(annotation.slice, ast.Name) and annotation.slice.id == "str":
+                    return "std::vector<std::string>"
                 return "std::vector<double>"
         return "double"
 
@@ -477,6 +684,14 @@ class CppTranspiler:
             if isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "print":
                 self.emit_print(stmt.value, local_types)
                 return
+            if (
+                isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "add_argument"
+                and isinstance(stmt.value.func.value, ast.Name)
+            ):
+                spec = self.argparse_specs.get(self.current_function_name(local_types))
+                if spec is not None and stmt.value.func.value.id == spec["parser_var"]:
+                    return
             if isinstance(stmt.value.func, ast.Attribute) and stmt.value.func.attr == "append":
                 self.emit_append(stmt.value, local_types)
                 return
@@ -488,18 +703,39 @@ class CppTranspiler:
         if isinstance(stmt, ast.Break):
             self.emit("break;")
             return
+        if isinstance(stmt, ast.Continue):
+            self.emit("continue;")
+            return
+        if isinstance(stmt, ast.Pass):
+            return
         raise NotImplementedError(f"unsupported statement: {ast.dump(stmt)}")
 
     def emit_assign(self, stmt: ast.Assign, local_types: dict[str, str], declared: set[str]) -> None:
         target = stmt.targets[0]
         if isinstance(target, ast.Subscript):
-            target_expr = self.subscript_expr(target, local_types)
             value = self.expr(stmt.value, local_types)
+            base_type = self.infer_expr_type(target.value, local_types)
+            index_type = self.infer_expr_type(target.slice, local_types)
+            if base_type == "pycpp::Array2D<double>" and index_type == "pycpp::Array1D<int>":
+                self.emit(f"pycpp::set_rows({self.expr(target.value, local_types)}, {self.expr(target.slice, local_types)}, {value});")
+                return
+            if (
+                base_type == "pycpp::Array2D<double>"
+                and isinstance(target.slice, ast.Tuple)
+                and len(target.slice.elts) == 2
+                and isinstance(target.slice.elts[0], ast.Slice)
+                and target.slice.elts[0].lower is None
+                and target.slice.elts[0].upper is None
+            ):
+                self.emit(
+                    f"pycpp::set_col({self.expr(target.value, local_types)}, "
+                    f"{self.expr(target.slice.elts[1], local_types)}, {value});"
+                )
+                return
+            target_expr = self.subscript_expr(target, local_types)
             self.emit(f"{target_expr} = {value};")
             return
         if isinstance(target, (ast.Tuple, ast.List)):
-            if not isinstance(stmt.value, ast.Call):
-                raise NotImplementedError("tuple assignment requires call on right-hand side")
             names = []
             for elt in target.elts:
                 if not isinstance(elt, ast.Name):
@@ -531,6 +767,15 @@ class CppTranspiler:
             declared.add(name)
 
     def emit_augassign(self, stmt: ast.AugAssign, local_types: dict[str, str], declared: set[str]) -> None:
+        if (
+            isinstance(stmt.target, ast.Subscript)
+            and isinstance(stmt.target.value, ast.Attribute)
+            and stmt.target.value.attr == "flat"
+            and isinstance(stmt.target.value.value, ast.Subscript)
+            and isinstance(stmt.op, ast.Add)
+        ):
+            self.emit(f"pycpp::add_diag({self.expr(stmt.target.value.value, local_types)}, {self.expr(stmt.value, local_types)});")
+            return
         if not isinstance(stmt.target, ast.Name):
             raise NotImplementedError("only simple augmented assignments are supported")
         op = self.binop(stmt.op)
@@ -673,6 +918,8 @@ class CppTranspiler:
                 if left_type.startswith("pycpp::Array"):
                     return f"pycpp::pow({self.expr(node.left, local_types)}, {self.expr(node.right, local_types)})"
                 return f"std::pow({self.expr(node.left, local_types)}, {self.expr(node.right, local_types)})"
+            if isinstance(node.op, ast.MatMult):
+                return f"pycpp::matmul({self.expr(node.left, local_types)}, {self.expr(node.right, local_types)})"
             op = self.binop(node.op)
             return f"({self.expr(node.left, local_types)} {op} {self.expr(node.right, local_types)})"
         if isinstance(node, ast.UnaryOp):
@@ -703,6 +950,10 @@ class CppTranspiler:
         if isinstance(node, ast.Tuple):
             return "std::make_tuple(" + ", ".join(self.expr(elt, local_types) for elt in node.elts) + ")"
         if isinstance(node, ast.List):
+            if node.elts and isinstance(node.elts[0], ast.Constant) and isinstance(node.elts[0].value, str):
+                return "std::vector<std::string>{" + ", ".join(self.expr(elt, local_types) for elt in node.elts) + "}"
+            if node.elts and self.infer_expr_type(node.elts[0], local_types) == "pycpp::Array2D<double>":
+                return "std::vector<pycpp::Array2D<double>>{" + ", ".join(self.expr(elt, local_types) for elt in node.elts) + "}"
             return "std::vector<double>{" + ", ".join(self.expr(elt, local_types) for elt in node.elts) + "}"
         if isinstance(node, ast.ListComp):
             return self.list_comp_expr(node, local_types)
@@ -721,10 +972,34 @@ class CppTranspiler:
                 return "3.14159265358979323846"
             if chain == ["np", "pi"]:
                 return "3.14159265358979323846"
+            if chain == ["np", "inf"]:
+                return "std::numeric_limits<double>::infinity()"
+            if chain == ["sys", "argv"]:
+                return "sys_argv"
+            base_type = self.infer_expr_type(node.value, local_types)
+            if base_type in self.struct_fields:
+                return f"{self.expr(node.value, local_types)}.{node.attr}"
+            if node.attr == "T":
+                if base_type == "pycpp::Array2D<double>":
+                    return f"pycpp::transpose({self.expr(node.value, local_types)})"
+            if node.attr == "shape":
+                base_type = self.infer_expr_type(node.value, local_types)
+                if base_type == "pycpp::Array2D<double>":
+                    base = self.expr(node.value, local_types)
+                    return f"std::make_tuple(static_cast<int>({base}.rows()), static_cast<int>({base}.cols()))"
+                if base_type in {"pycpp::Array1D<double>", "pycpp::Array1D<int>"}:
+                    base = self.expr(node.value, local_types)
+                    return f"std::make_tuple(static_cast<int>({base}.size()))"
             if node.attr == "size":
                 base_type = self.infer_expr_type(node.value, local_types)
                 if base_type in {"pycpp::Array1D<double>", "pycpp::Array1D<int>", "pycpp::Array2D<double>"}:
                     return f"static_cast<int>({self.expr(node.value, local_types)}.size())"
+            if node.attr == "ndim":
+                base_type = self.infer_expr_type(node.value, local_types)
+                if base_type == "pycpp::Array1D<double>" or base_type == "pycpp::Array1D<int>":
+                    return "1"
+                if base_type == "pycpp::Array2D<double>":
+                    return "2"
         raise NotImplementedError(f"unsupported expression: {ast.dump(node)}")
 
     def call_expr(self, node: ast.Call, local_types: dict[str, str]) -> str:
@@ -739,6 +1014,9 @@ class CppTranspiler:
                 return f"static_cast<int>({self.expr(node.args[0], local_types)}.size())"
             if name in {"float", "int"}:
                 target = "double" if name == "float" else "int"
+                arg_type = self.infer_expr_type(node.args[0], local_types)
+                if arg_type == "pycpp::Array2D<double>":
+                    return f"static_cast<{target}>(pycpp::to_scalar({self.expr(node.args[0], local_types)}))"
                 return f"static_cast<{target}>({self.expr(node.args[0], local_types)})"
             if name == "max":
                 return f"std::max({self.expr(node.args[0], local_types)}, {self.expr(node.args[1], local_types)})"
@@ -773,6 +1051,23 @@ class CppTranspiler:
             if chain[:2] == ["np", "array"]:
                 if len(node.args) != 1:
                     raise NotImplementedError("np.array currently requires one positional argument")
+                arg_type = self.infer_expr_type(node.args[0], local_types)
+                if arg_type == "std::vector<pycpp::Array2D<double>>":
+                    return self.expr(node.args[0], local_types)
+                if (
+                    isinstance(node.args[0], ast.List)
+                    and len(node.args[0].elts) == 1
+                    and isinstance(node.args[0].elts[0], ast.List)
+                    and len(node.args[0].elts[0].elts) == 1
+                ):
+                    return f"pycpp::scalar_matrix({self.expr(node.args[0].elts[0].elts[0], local_types)})"
+                if isinstance(node.args[0], ast.List) and node.args[0].elts and isinstance(node.args[0].elts[0], ast.List):
+                    rows = []
+                    for row in node.args[0].elts:
+                        if not isinstance(row, ast.List):
+                            raise NotImplementedError("mixed nested np.array literals are not supported")
+                        rows.append("{" + ", ".join(self.expr(elt, local_types) for elt in row.elts) + "}")
+                    return "pycpp::Array2D<double>{" + ", ".join(rows) + "}"
                 if isinstance(node.args[0], ast.List):
                     inner = ", ".join(self.expr(elt, local_types) for elt in node.args[0].elts)
                     return f"pycpp::array<double>({{{inner}}})"
@@ -821,6 +1116,67 @@ class CppTranspiler:
                 return f"pycpp::var({self.expr(node.args[0], local_types)})"
             if chain[:2] == ["np", "argsort"]:
                 return f"pycpp::argsort({self.expr(node.args[0], local_types)})"
+            if chain[:2] == ["np", "eye"]:
+                return f"pycpp::eye<double>({self.expr(node.args[0], local_types)})"
+            if chain[:2] == ["np", "ndim"]:
+                arg_type = self.infer_expr_type(node.args[0], local_types)
+                if arg_type in {"pycpp::Array1D<double>", "pycpp::Array1D<int>"}:
+                    return "1"
+                if arg_type == "pycpp::Array2D<double>":
+                    return "2"
+                return "0"
+            if chain[:2] == ["np", "cov"]:
+                rowvar_kw = next((kw for kw in node.keywords if kw.arg == "rowvar"), None)
+                rowvar = self.expr(rowvar_kw.value, local_types) if rowvar_kw is not None else "true"
+                return f"pycpp::cov({self.expr(node.args[0], local_types)}, {rowvar})"
+            if chain[:2] == ["np", "atleast_2d"]:
+                arg_type = self.infer_expr_type(node.args[0], local_types)
+                if arg_type == "pycpp::Array2D<double>":
+                    return self.expr(node.args[0], local_types)
+                return f"pycpp::row_vector({self.expr(node.args[0], local_types)})"
+            if chain[:2] == ["np", "loadtxt"]:
+                return f"pycpp::loadtxt({self.expr(node.args[0], local_types)})"
+            if chain[:3] == ["np", "linalg", "slogdet"]:
+                return f"pycpp::slogdet({self.expr(node.args[0], local_types)})"
+            if chain[:3] == ["np", "linalg", "inv"]:
+                return f"pycpp::inv({self.expr(node.args[0], local_types)})"
+            if chain[:2] == ["np", "einsum"]:
+                if len(node.args) == 4 and isinstance(node.args[0], ast.Constant) and node.args[0].value == "ni,ij,nj->n":
+                    return (
+                        "pycpp::quad_form_rows("
+                        + self.expr(node.args[1], local_types)
+                        + ", "
+                        + self.expr(node.args[2], local_types)
+                        + ", "
+                        + self.expr(node.args[3], local_types)
+                        + ")"
+                    )
+                raise NotImplementedError("np.einsum currently supports only 'ni,ij,nj->n'")
+            if chain[:2] == ["argparse", "ArgumentParser"]:
+                return "pycpp::ArgParser{}"
+            if node.func.attr == "parse_args" and isinstance(node.func.value, ast.Name):
+                spec = self.argparse_specs.get(self.current_function_name(local_types))
+                if spec is not None and node.func.value.id == spec["parser_var"]:
+                    return f'parse_{spec["struct_name"]}(sys_argv)'
+            if chain[:2] == ["np", "where"]:
+                if (
+                    len(node.args) == 1
+                    and isinstance(node.args[0], ast.Compare)
+                    and len(node.args[0].ops) == 1
+                    and isinstance(node.args[0].ops[0], ast.Eq)
+                ):
+                    left = node.args[0].left
+                    right = node.args[0].comparators[0]
+                    return f"std::make_tuple(pycpp::where_equal({self.expr(left, local_types)}, {self.expr(right, local_types)}))"
+                raise NotImplementedError("np.where currently supports simple equality tests")
+            if chain[:2] == ["np", "column_stack"]:
+                if len(node.args) == 1 and isinstance(node.args[0], ast.List) and len(node.args[0].elts) == 2:
+                    return f"pycpp::column_stack({self.expr(node.args[0].elts[0], local_types)}, {self.expr(node.args[0].elts[1], local_types)})"
+                raise NotImplementedError("np.column_stack currently supports two inputs")
+            if chain[:2] == ["np", "savetxt"]:
+                fmt_kw = next((kw for kw in node.keywords if kw.arg == "fmt"), None)
+                fmt_expr = self.expr(fmt_kw.value, local_types) if fmt_kw is not None else "std::vector<std::string>{}"
+                return f"pycpp::savetxt({self.expr(node.args[0], local_types)}, {self.expr(node.args[1], local_types)}, {fmt_expr})"
             if chain[:2] == ["np", "max"]:
                 axis_kw = next((kw for kw in node.keywords if kw.arg == "axis"), None)
                 keepdims_kw = next((kw for kw in node.keywords if kw.arg == "keepdims"), None)
@@ -843,6 +1199,8 @@ class CppTranspiler:
                 return f"{self.expr(node.func.value, local_types)}.copy()"
             if node.func.attr == "ravel" and not node.args:
                 return f"{self.expr(node.func.value, local_types)}.ravel()"
+            if node.func.attr == "reshape":
+                return f"pycpp::reshape({self.expr(node.func.value, local_types)}, {self.expr(node.args[0], local_types)}, {self.expr(node.args[1], local_types)})"
             if node.func.attr == "choice":
                 size_arg = None
                 p_arg = None
@@ -868,6 +1226,18 @@ class CppTranspiler:
                         + size_arg
                         + ", "
                         + p_arg
+                        + ")"
+                    )
+                if first_type == "int":
+                    return (
+                        "pycpp::choice("
+                        + self.expr(node.func.value, local_types)
+                        + ", "
+                        + self.expr(node.args[0], local_types)
+                        + ", "
+                        + size_arg
+                        + ", "
+                        + replace_text
                         + ")"
                     )
                 if first_type == "pycpp::Array1D<double>":
@@ -910,15 +1280,47 @@ class CppTranspiler:
             if node.func.attr == "gauss":
                 args = ", ".join(self.expr(arg, local_types) for arg in node.args)
                 return f"normal_sample({self.expr(node.func.value, local_types)}, {args})"
+            if chain[:3] == ["np", "random", "multivariate_normal"]:
+                size_kw = next((kw for kw in node.keywords if kw.arg == "size"), None)
+                if size_kw is None:
+                    raise NotImplementedError("np.random.multivariate_normal currently requires size=...")
+                return f"pycpp::multivariate_normal({self.expr(node.args[0], local_types)}, {self.expr(node.args[1], local_types)}, {self.expr(size_kw.value, local_types)})"
 
         raise NotImplementedError(f"unsupported call: {ast.dump(node)}")
 
     def subscript_expr(self, node: ast.Subscript, local_types: dict[str, str]) -> str:
+        if (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+            and self.attr_chain(node.value.func)[:2] == ["np", "where"]
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == 0
+        ):
+            where_arg = node.value.args[0]
+            if isinstance(where_arg, ast.Compare) and len(where_arg.ops) == 1 and isinstance(where_arg.ops[0], ast.Eq):
+                return f"pycpp::where_equal({self.expr(where_arg.left, local_types)}, {self.expr(where_arg.comparators[0], local_types)})"
+            raise NotImplementedError("np.where()[0] currently supports simple equality tests")
         value_type = self.infer_expr_type(node.value, local_types)
         if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
             if value_type in self.struct_fields:
                 return f"{self.expr(node.value, local_types)}.{node.slice.value}"
             return f"{self.expr(node.value, local_types)}.at({self.expr(node.slice, local_types)})"
+        if (
+            isinstance(node.value, ast.Attribute)
+            and node.value.attr == "shape"
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, int)
+        ):
+            base = node.value.value
+            base_type = self.infer_expr_type(base, local_types)
+            if base_type in {"pycpp::Array1D<double>", "pycpp::Array1D<int>"} and node.slice.value == 0:
+                return f"static_cast<int>({self.expr(base, local_types)}.size())"
+            if base_type == "pycpp::Array2D<double>":
+                if node.slice.value == 0:
+                    return f"static_cast<int>({self.expr(base, local_types)}.rows())"
+                if node.slice.value == 1:
+                    return f"static_cast<int>({self.expr(base, local_types)}.cols())"
+            raise NotImplementedError("unsupported shape index")
         slice_type = self.infer_expr_type(node.slice, local_types)
         if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
             first, second = node.slice.elts
@@ -941,13 +1343,33 @@ class CppTranspiler:
                 and all(isinstance(elt, ast.Slice) and elt.lower is None and elt.upper is None for elt in node.slice.elts)
             ):
                 return self.expr(node.value, local_types)
+            if (
+                value_type == "pycpp::Array2D<double>"
+                and isinstance(first, ast.Slice)
+                and first.lower is None and first.upper is None
+            ):
+                return f"pycpp::col({self.expr(node.value, local_types)}, {self.expr(second, local_types)})"
+            if (
+                value_type == "pycpp::Array2D<double>"
+                and isinstance(second, ast.Slice)
+                and second.lower is None and second.upper is None
+            ):
+                return f"pycpp::row({self.expr(node.value, local_types)}, {self.expr(first, local_types)})"
             raise NotImplementedError("unsupported tuple subscript pattern")
         if value_type in {"pycpp::Array1D<double>", "pycpp::Array1D<int>"} and slice_type == "pycpp::Array1D<int>":
             return f"pycpp::take({self.expr(node.value, local_types)}, {self.expr(node.slice, local_types)})"
+        if value_type == "std::vector<pycpp::Array2D<double>>" and slice_type == "pycpp::Array1D<int>":
+            return f"pycpp::take_vector({self.expr(node.value, local_types)}, {self.expr(node.slice, local_types)})"
         if value_type in {"pycpp::Array1D<double>", "pycpp::Array1D<int>"} and isinstance(node.slice, ast.Slice):
             lower = self.expr(node.slice.lower, local_types) if node.slice.lower is not None else "0"
             upper = self.expr(node.slice.upper, local_types) if node.slice.upper is not None else f"static_cast<int>({self.expr(node.value, local_types)}.size())"
             return f"pycpp::slice({self.expr(node.value, local_types)}, {lower}, {upper})"
+        if value_type == "std::vector<pycpp::Array2D<double>>":
+            return f"{self.expr(node.value, local_types)}[{self.expr(node.slice, local_types)}]"
+        if value_type == "pycpp::Array2D<double>" and slice_type == "pycpp::Array1D<int>":
+            return f"pycpp::take_rows({self.expr(node.value, local_types)}, {self.expr(node.slice, local_types)})"
+        if value_type == "pycpp::Array2D<double>":
+            return f"pycpp::row({self.expr(node.value, local_types)}, {self.expr(node.slice, local_types)})"
         index_expr = self.expr(node.slice, local_types)
         if isinstance(node.slice, ast.UnaryOp) and isinstance(node.slice.op, ast.USub):
             base_expr = self.expr(node.value, local_types)
@@ -996,7 +1418,8 @@ class CppTranspiler:
             raise NotImplementedError("only simple list comprehension targets are supported")
         loop_var = gen.target.id
         loop_var_type = local_types.get(loop_var, "double")
-        result_type = "std::vector<double>"
+        elt_type = self.infer_expr_type(node.elt, local_types | {gen.target.id if isinstance(gen.target, ast.Name) else "_": "int"})
+        result_type = "std::vector<pycpp::Array2D<double>>" if elt_type == "pycpp::Array2D<double>" else "std::vector<double>"
         if (
             isinstance(gen.iter, ast.Call)
             and isinstance(gen.iter.func, ast.Name)
@@ -1109,7 +1532,7 @@ class CppTranspiler:
             parts.append(value.id)
         return list(reversed(parts))
 
-    def find_main_call(self, tree: ast.Module) -> str | None:
+    def find_main_block(self, tree: ast.Module) -> list[ast.stmt] | None:
         for node in tree.body:
             if not isinstance(node, ast.If):
                 continue
@@ -1123,10 +1546,7 @@ class CppTranspiler:
                 and isinstance(node.test.comparators[0], ast.Constant)
                 and node.test.comparators[0].value == "__main__"
             ):
-                if len(node.body) == 1 and isinstance(node.body[0], ast.Expr):
-                    call = node.body[0].value
-                    if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
-                        return call.func.id
+                return node.body
         return None
 
     def joined_str_literal(self, node: ast.JoinedStr | ast.AST) -> str:
@@ -1172,6 +1592,8 @@ class CppTranspiler:
             return " = false"
         if cpp_type == "std::string":
             return ' = ""'
+        if cpp_type == "pycpp::ArgParser":
+            return "{}"
         return ""
 
     def tuple_inner_types(self, cpp_type: str) -> list[str] | None:
@@ -1211,23 +1633,140 @@ class CppTranspiler:
 
     def infer_arg_type_from_usage(self, node: ast.FunctionDef, arg_name: str, local_types: dict[str, str]) -> str:
         inferred = "double"
+        aliases = {arg_name}
+        for inner in ast.walk(node):
+            if (
+                isinstance(inner, ast.Assign)
+                and len(inner.targets) == 1
+                and isinstance(inner.targets[0], ast.Name)
+                and isinstance(inner.value, ast.Call)
+                and isinstance(inner.value.func, ast.Attribute)
+                and self.attr_chain(inner.value.func)[:2] == ["np", "asarray"]
+                and inner.value.args
+                and isinstance(inner.value.args[0], ast.Name)
+                and inner.value.args[0].id in aliases
+            ):
+                aliases.add(inner.targets[0].id)
         for inner in ast.walk(node):
             if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
                 chain = self.attr_chain(inner.func)
+                if chain[:2] == ["np", "savetxt"] and inner.args:
+                    if isinstance(inner.args[0], ast.Name) and inner.args[0].id in aliases:
+                        return "std::string"
                 if chain[:2] in (["np", "max"], ["np", "sum"]) and inner.args:
-                    if isinstance(inner.args[0], ast.Name) and inner.args[0].id == arg_name:
+                    if isinstance(inner.args[0], ast.Name) and inner.args[0].id in aliases:
                         if any(keyword.arg == "axis" for keyword in inner.keywords):
                             return "pycpp::Array2D<double>"
-                if inner.func.attr in {"ravel", "copy"} and isinstance(inner.func.value, ast.Name) and inner.func.value.id == arg_name:
+                if inner.func.attr in {"ravel", "copy"} and isinstance(inner.func.value, ast.Name) and inner.func.value.id in aliases:
                     inferred = "pycpp::Array1D<double>"
             if isinstance(inner, ast.Attribute) and inner.attr == "size":
-                if isinstance(inner.value, ast.Name) and inner.value.id == arg_name:
+                if isinstance(inner.value, ast.Name) and inner.value.id in aliases:
                     inferred = "pycpp::Array1D<double>"
-            if isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Name) and inner.value.id == arg_name:
+            if isinstance(inner, ast.Attribute) and inner.attr == "shape":
+                if isinstance(inner.value, ast.Name) and inner.value.id in aliases:
+                    return "pycpp::Array2D<double>"
+            if isinstance(inner, ast.Attribute) and inner.attr == "ndim":
+                if isinstance(inner.value, ast.Name) and inner.value.id in aliases:
+                    parent = getattr(inner, "_codex_parent", None)
+                    if (
+                        isinstance(parent, ast.Compare)
+                        and parent.comparators
+                        and isinstance(parent.comparators[0], ast.Constant)
+                        and isinstance(parent.comparators[0].value, int)
+                    ):
+                        if parent.comparators[0].value == 1:
+                            inferred = "pycpp::Array1D<double>"
+                        elif parent.comparators[0].value == 2:
+                            return "pycpp::Array2D<double>"
+            if isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Attribute) and inner.value.attr == "shape":
+                if isinstance(inner.value.value, ast.Name) and inner.value.value.id in aliases:
+                    return "pycpp::Array2D<double>"
+            if isinstance(inner, ast.Subscript) and isinstance(inner.value, ast.Name) and inner.value.id in aliases:
                 if isinstance(inner.slice, ast.Tuple):
                     return "pycpp::Array2D<double>"
                 inferred = "pycpp::Array1D<double>"
+            if isinstance(inner, ast.BinOp) and isinstance(inner.op, (ast.Sub, ast.Add)):
+                if isinstance(inner.left, ast.Name) and inner.left.id in aliases:
+                    other_type = self.infer_expr_type(inner.right, local_types)
+                    if other_type == "pycpp::Array2D<double>":
+                        return "pycpp::Array1D<double>"
+                if isinstance(inner.right, ast.Name) and inner.right.id in aliases:
+                    other_type = self.infer_expr_type(inner.left, local_types)
+                    if other_type == "pycpp::Array2D<double>":
+                        return "pycpp::Array1D<double>"
         return inferred
+
+    def extract_argparse_spec(self, node: ast.FunctionDef) -> None:
+        parser_var = None
+        args_var = None
+        fields: list[dict[str, object]] = []
+        for stmt in node.body:
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and self.attr_chain(stmt.value.func)[:2] == ["argparse", "ArgumentParser"]
+            ):
+                parser_var = stmt.targets[0].id
+            elif (
+                parser_var is not None
+                and isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "add_argument"
+                and isinstance(stmt.value.func.value, ast.Name)
+                and stmt.value.func.value.id == parser_var
+            ):
+                field = self.parse_add_argument(stmt.value)
+                if field is not None:
+                    fields.append(field)
+            elif (
+                parser_var is not None
+                and isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "parse_args"
+                and isinstance(stmt.value.func.value, ast.Name)
+                and stmt.value.func.value.id == parser_var
+            ):
+                args_var = stmt.targets[0].id
+        if parser_var is None or args_var is None or not fields:
+            return
+        struct_name = f"{self.function_cpp_names.get(node.name, node.name)}_args"
+        self.struct_fields[struct_name] = {field["name"]: field["type"] for field in fields}
+        self.argparse_specs[node.name] = {
+            "parser_var": parser_var,
+            "args_var": args_var,
+            "struct_name": struct_name,
+            "fields": fields,
+        }
+
+    def parse_add_argument(self, call: ast.Call) -> dict[str, object] | None:
+        if not call.args:
+            return None
+        first = call.args[0]
+        if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+            return None
+        name_text = first.value
+        default_node = next((kw.value for kw in call.keywords if kw.arg == "default"), None)
+        type_kw = next((kw.value for kw in call.keywords if kw.arg == "type"), None)
+        if name_text.startswith("--"):
+            field_name = name_text[2:].replace("-", "_")
+            field_type = "double"
+            if isinstance(type_kw, ast.Name) and type_kw.id == "int":
+                field_type = "int"
+            elif isinstance(type_kw, ast.Name) and type_kw.id == "float":
+                field_type = "double"
+            default_expr = self.expr(default_node, {}) if default_node is not None else ("0" if field_type == "int" else "0.0")
+            return {"kind": "option", "flag": name_text, "name": field_name, "type": field_type, "default_expr": default_expr}
+        field_name = name_text.replace("-", "_")
+        field_type = "std::string"
+        default_expr = self.expr(default_node, {}) if default_node is not None else '""'
+        return {"kind": "positional", "flag": name_text, "name": field_name, "type": field_type, "default_expr": default_expr}
 
     def binop(self, op: ast.operator) -> str:
         mapping = {
@@ -1243,8 +1782,11 @@ class CppTranspiler:
 
 
 def transpile_python_to_cpp(input_path: Path, output_path: Path) -> None:
-    source = input_path.read_text(encoding="utf-8")
+    source = input_path.read_text(encoding="utf-8-sig")
     tree = ast.parse(source)
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            setattr(child, "_codex_parent", parent)
     transpiler = CppTranspiler()
     cpp_source = transpiler.transpile(tree)
     output_path.write_text(cpp_source, encoding="utf-8")
