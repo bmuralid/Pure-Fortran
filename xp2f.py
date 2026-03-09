@@ -3163,6 +3163,12 @@ def detect_needed_helpers(tree):
                 and node.func.attr == "reader"
             ):
                 needed.add("csv_split_line")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "read"
+                and len(node.args) == 0
+            ):
+                needed.add("file_read")
 
             def _is_scipy_special_attr_call(fn):
                 if not isinstance(fn, ast.Attribute):
@@ -5718,6 +5724,7 @@ class translator(ast.NodeVisitor):
         self.callable_aliases = {}
         self.csv_reader_vars = set()
         self.csv_reader_specs = {}
+        self.file_handle_vars = set()
         self.with_open_paths = {}
 
     def _resolve_list_alias(self, name):
@@ -6835,6 +6842,18 @@ class translator(ast.NodeVisitor):
                     return "char"
             if (
                 isinstance(node.func, ast.Attribute)
+                and node.func.attr == "readline"
+                and len(node.args) == 0
+            ):
+                return "char"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "read"
+                and len(node.args) == 0
+            ):
+                return "char"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "split"
                 and len(node.args) <= 1
             ):
@@ -6914,6 +6933,16 @@ class translator(ast.NodeVisitor):
                         return "real"
                     if spec in {"int", "alloc_int"}:
                         return "int"
+                if node.func.id in {"open", "len", "ord", "int", "isqrt", "size"}:
+                    return "int"
+                if node.func.id in {"str", "repr"}:
+                    return "char"
+                if node.func.id == "pow" and len(node.args) >= 2:
+                    k0 = self._expr_kind(node.args[0])
+                    k1 = self._expr_kind(node.args[1])
+                    if "real" in {k0, k1}:
+                        return "real"
+                    return "int"
                 if node.func.id in {"float"}:
                     return "real"
                 if node.func.id in {"abs"} and len(node.args) >= 1:
@@ -6930,17 +6959,13 @@ class translator(ast.NodeVisitor):
                 and len(node.args) >= 1
             ):
                 return "real"
-                if node.func.id in {"int", "isqrt", "size", "len"}:
+            if isinstance(node.func, ast.Name) and node.func.id == "set":
+                if len(node.args) == 0:
                     return "int"
-                if node.func.id in {"str", "repr"}:
-                    return "char"
-                if node.func.id == "set":
-                    if len(node.args) == 0:
-                        return "int"
-                    if len(node.args) >= 1:
-                        return self._expr_kind(node.args[0])
-                if node.func.id == "sorted" and len(node.args) >= 1:
+                if len(node.args) >= 1:
                     return self._expr_kind(node.args[0])
+            if isinstance(node.func, ast.Name) and node.func.id == "sorted" and len(node.args) >= 1:
+                return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -10114,6 +10139,8 @@ class translator(ast.NodeVisitor):
                     if attr == "split":
                         return f"str_split({base_expr}, {arg0})" if arg0 is not None else f"str_split({base_expr})"
                     return f"str_join({base_expr}, {arg0})"
+                if attr == "read" and len(node.args) == 0:
+                    return f"file_read({base_expr})"
                 if attr == "sum":
                     axis_node = None
                     keepdims = False
@@ -13070,6 +13097,38 @@ class translator(ast.NodeVisitor):
             return None
 
         for node in nodes:
+            if isinstance(node, ast.With):
+                for it in getattr(node, "items", []):
+                    ctx = getattr(it, "context_expr", None)
+                    opt = getattr(it, "optional_vars", None)
+                    if (
+                        isinstance(ctx, ast.Call)
+                        and isinstance(ctx.func, ast.Name)
+                        and ctx.func.id == "open"
+                        and isinstance(opt, ast.Name)
+                    ):
+                        self._mark_int(opt.id)
+                        self.file_handle_vars.add(opt.id)
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "open"
+            ):
+                self._mark_int(node.targets[0].id)
+                self.file_handle_vars.add(node.targets[0].id)
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "readline"
+                and isinstance(node.value.func.value, ast.Name)
+            ):
+                self._mark_char(node.targets[0].id)
             for _a in ast.walk(node):
                 if (
                     isinstance(_a, ast.Attribute)
@@ -15038,6 +15097,7 @@ class translator(ast.NodeVisitor):
     def visit_With(self, node):
         self._emit_comments_for(node)
         pushed = []
+        opened = []
         for it in getattr(node, "items", []):
             ctx = getattr(it, "context_expr", None)
             opt = getattr(it, "optional_vars", None)
@@ -15050,8 +15110,32 @@ class translator(ast.NodeVisitor):
             ):
                 self.with_open_paths[opt.id] = self.expr(ctx.args[0])
                 pushed.append(opt.id)
+                self._mark_int(opt.id)
+                path_node = ctx.args[0]
+                mode_node = ctx.args[1] if len(ctx.args) >= 2 else None
+                for kw in getattr(ctx, "keywords", []):
+                    if kw.arg == "file":
+                        path_node = kw.value
+                    elif kw.arg == "mode":
+                        mode_node = kw.value
+                if path_node is None:
+                    raise NotImplementedError("open() requires file path")
+                path_txt = self.expr(path_node)
+                mode_txt = "r"
+                if isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str):
+                    mode_txt = str(mode_node.value)
+                if "w" in mode_txt:
+                    self.o.w(f"open(newunit={opt.id}, file=trim({path_txt}), status='replace', action='write')")
+                elif "a" in mode_txt:
+                    self.o.w(f"open(newunit={opt.id}, file=trim({path_txt}), status='unknown', action='write', position='append')")
+                else:
+                    self.o.w(f"open(newunit={opt.id}, file=trim({path_txt}), status='old', action='read')")
+                self.file_handle_vars.add(opt.id)
+                opened.append(opt.id)
         for s in node.body:
             self.visit(s)
+        for nm in reversed(opened):
+            self.o.w(f"close({nm})")
         for nm in pushed:
             self.with_open_paths.pop(nm, None)
 
@@ -15126,6 +15210,59 @@ class translator(ast.NodeVisitor):
             if hasattr(ast, "unparse"):
                 raise NotImplementedError(f"unsupported call: {ast.unparse(v)}")
             raise NotImplementedError("unsupported call: solve_ivp(...)")
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Name)
+            and v.func.id == "open"
+        ):
+            path_node = v.args[0] if len(v.args) >= 1 else None
+            mode_node = v.args[1] if len(v.args) >= 2 else None
+            for kw in v.keywords:
+                if kw.arg == "file":
+                    path_node = kw.value
+                elif kw.arg == "mode":
+                    mode_node = kw.value
+            if path_node is None:
+                raise NotImplementedError("open() requires file path")
+            path_txt = self.expr(path_node)
+            mode_txt = "r"
+            if isinstance(mode_node, ast.Constant) and isinstance(mode_node.value, str):
+                mode_txt = str(mode_node.value)
+            if "w" in mode_txt:
+                self.o.w(f"open(newunit={t.id}, file=trim({path_txt}), status='replace', action='write')")
+            elif "a" in mode_txt:
+                self.o.w(f"open(newunit={t.id}, file=trim({path_txt}), status='unknown', action='write', position='append')")
+            else:
+                self.o.w(f"open(newunit={t.id}, file=trim({path_txt}), status='old', action='read')")
+            self.file_handle_vars.add(t.id)
+            return
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "readline"
+            and isinstance(v.func.value, ast.Name)
+            and len(v.args) == 0
+        ):
+            hu = self.expr(v.func.value)
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: ios_readline")
+            self.o.w("character(len=4096) :: line_readline")
+            self.o.w(f"read({hu}, '(A)', iostat=ios_readline) line_readline")
+            self.o.w("if (ios_readline == 0) then")
+            self.o.push()
+            self.o.w(f"{t.id} = line_readline")
+            self.o.pop()
+            self.o.w("else")
+            self.o.push()
+            self.o.w(f"{t.id} = \"\"")
+            self.o.pop()
+            self.o.w("end if")
+            self.o.pop()
+            self.o.w("end block")
+            return
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
@@ -19164,6 +19301,27 @@ class translator(ast.NodeVisitor):
             and c.func.attr in {"lower", "upper", "strip", "lstrip", "rstrip", "replace", "zfill", "split", "join"}
         ):
             return
+        if (
+            isinstance(c.func, ast.Attribute)
+            and c.func.attr == "close"
+            and isinstance(c.func.value, ast.Name)
+            and len(c.args) == 0
+        ):
+            self.o.w(f"close({self.expr(c.func.value)})")
+            return
+        if (
+            isinstance(c.func, ast.Attribute)
+            and c.func.attr == "write"
+            and isinstance(c.func.value, ast.Name)
+            and len(c.args) == 1
+        ):
+            u = self.expr(c.func.value)
+            arg_txt = self.expr(c.args[0])
+            if self._expr_kind(c.args[0]) == "char":
+                self.o.w(f"write({u}, '(a)', advance='no') {arg_txt}")
+            else:
+                self.o.w(f"write({u}, '(a)', advance='no') py_str({arg_txt})")
+            return
 
         cmd_node = _shell_command_node(c)
         if cmd_node is not None:
@@ -19613,6 +19771,7 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
 
     def _emit_print_call(self, call):
+        unit_txt = "*"
         def _fortran_write_for_percent_format(fmt_text, rhs_node, advance_no):
             conv_chars = set("diouxXeEfFgGcrs")
             def _parse_width_prec(spec_text):
@@ -19713,9 +19872,9 @@ class translator(ast.NodeVisitor):
             ffmt = "(" + ",".join(fmt_parts) + ")"
             adv = ", advance='no'" if advance_no else ""
             if write_args:
-                self.o.w(f"write(*,{fstr(ffmt)}{adv}) " + ", ".join(write_args))
+                self.o.w(f"write({unit_txt},{fstr(ffmt)}{adv}) " + ", ".join(write_args))
             else:
-                self.o.w(f"write(*,{fstr(ffmt)}{adv})")
+                self.o.w(f"write({unit_txt},{fstr(ffmt)}{adv})")
 
         end_txt = None
         for kw in getattr(call, "keywords", []):
@@ -19724,13 +19883,18 @@ class translator(ast.NodeVisitor):
                     end_txt = kw.value.value
                 else:
                     raise NotImplementedError("print(end=...) currently supports only string literals")
+            elif kw.arg == "file":
+                unit_txt = self.expr(kw.value)
         advance_no = (end_txt == "")
 
         if len(call.args) == 0:
             if advance_no:
-                self.o.w(f"write(*,{fstr('(a)')}, advance='no') {fstr('')}")
+                self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr('')}")
             else:
-                self.o.w("print *")
+                if unit_txt == "*":
+                    self.o.w("print *")
+                else:
+                    self.o.w(f"write({unit_txt},*)")
             return
         if len(call.args) == 1:
             a0 = call.args[0]
@@ -19755,9 +19919,12 @@ class translator(ast.NodeVisitor):
                         cnt = self.list_counts[a.id]
                         self.o.w(f"call print_int_list({a.id}, {cnt})")
                     elif is_const_str(a):
-                        self.o.w(f"write(*,{fstr('(a)')}) {fstr(a.value)}")
+                        self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr(a.value)}")
                     else:
-                        self.o.w(f"print *, {self.expr(a)}")
+                        if unit_txt == "*":
+                            self.o.w(f"print *, {self.expr(a)}")
+                        else:
+                            self.o.w(f"write({unit_txt},*) {self.expr(a)}")
                 return
             parts = []
             for a in call.args:
@@ -19767,7 +19934,10 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("f-string in multi-argument print not supported")
                 else:
                     parts.append(self.expr(a))
-            self.o.w("print *, " + ", ".join(parts))
+            if unit_txt == "*":
+                self.o.w("print *, " + ", ".join(parts))
+            else:
+                self.o.w(f"write({unit_txt},*) " + ", ".join(parts))
             return
         a = call.args[0]
 
@@ -19784,14 +19954,20 @@ class translator(ast.NodeVisitor):
             if fmt_args:
                 rhs = ", ".join(self.expr(x) for x in fmt_args)
                 if advance_no:
-                    self.o.w(f"write(*,*, advance='no') {rhs}")
+                    self.o.w(f"write({unit_txt},*, advance='no') {rhs}")
                 else:
-                    self.o.w(f"print *, {rhs}")
+                    if unit_txt == "*":
+                        self.o.w(f"print *, {rhs}")
+                    else:
+                        self.o.w(f"write({unit_txt},*) {rhs}")
             else:
                 if advance_no:
-                    self.o.w("write(*,*, advance='no')")
+                    self.o.w(f"write({unit_txt},*, advance='no')")
                 else:
-                    self.o.w("print *")
+                    if unit_txt == "*":
+                        self.o.w("print *")
+                    else:
+                        self.o.w(f"write({unit_txt},*)")
             return
 
         # print('...%d...' % (...), end='') old-style formatting.
@@ -19806,9 +19982,9 @@ class translator(ast.NodeVisitor):
         # print("literal")
         if is_const_str(a):
             if advance_no:
-                self.o.w(f"write(*,{fstr('(a)')}, advance='no') {fstr(a.value)}")
+                self.o.w(f"write({unit_txt},{fstr('(a)')}, advance='no') {fstr(a.value)}")
             else:
-                self.o.w(f"write(*,{fstr('(a)')}) {fstr(a.value)}")
+                self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr(a.value)}")
             return
 
         # print(f"...{x}...")
@@ -19842,12 +20018,12 @@ class translator(ast.NodeVisitor):
                 else:
                     raise NotImplementedError("unsupported f-string part")
             fmt = fstr("(" + ",".join(fmt_parts) + ")")
-            self.o.w(f"write(*,{fmt}) " + ", ".join(items))
+            self.o.w(f"write({unit_txt},{fmt}) " + ", ".join(items))
             return
 
         # print([])
         if isinstance(a, ast.List) and len(a.elts) == 0:
-            self.o.w(f"write(*,{fstr('(a)')}) {fstr('[]')}")
+            self.o.w(f"write({unit_txt},{fstr('(a)')}) {fstr('[]')}")
             return
 
         # print(primes)
@@ -19857,7 +20033,10 @@ class translator(ast.NodeVisitor):
             return
 
         # fallback
-        self.o.w(f"print *, {self.expr(a)}")
+        if unit_txt == "*":
+            self.o.w(f"print *, {self.expr(a)}")
+        else:
+            self.o.w(f"write({unit_txt},*) {self.expr(a)}")
 
 
 # -------------------------
