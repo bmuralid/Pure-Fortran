@@ -3165,10 +3165,22 @@ def detect_needed_helpers(tree):
                 needed.add("csv_split_line")
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "random"
+                and node.func.attr == "Random"
+            ):
+                needed.add("seed_rng")
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr == "read"
                 and len(node.args) == 0
             ):
                 needed.add("file_read")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "gauss"
+            ):
+                needed.add("rnorm")
 
             def _is_scipy_special_attr_call(fn):
                 if not isinstance(fn, ast.Attribute):
@@ -3271,6 +3283,11 @@ def detect_needed_helpers(tree):
                     needed.add("special_binom")
             if isinstance(node.func, ast.Name) and node.func.id == "float":
                 needed.add("py_float")
+            if isinstance(node.func, ast.Name) and node.func.id == "int":
+                # Lowering may route int(char_expr) through py_float(...) + nint(...).
+                needed.add("py_float")
+            if isinstance(node.func, ast.Name) and node.func.id == "range":
+                needed.add("arange_int")
             if isinstance(node.func, ast.Name) and node.func.id in {"runif", "rnorm"}:
                 needed.add(node.func.id)
             if isinstance(node.func, ast.Name) and node.func.id in {"py_str", "py_ctime", "py_time"}:
@@ -7669,7 +7686,9 @@ class translator(ast.NodeVisitor):
                     return "real"
                 if node.func.value.id == "math" and node.func.attr in {"floor", "ceil", "trunc"}:
                     return "int"
-                if node.func.value.id == "math" and node.func.attr in {"expm1", "log1p"}:
+                if node.func.value.id == "math" and node.func.attr in {"expm1", "log1p", "exp", "log"}:
+                    return "real"
+                if node.func.value.id == "math" and node.func.attr in {"erf", "erfc"}:
                     return "real"
                 if node.func.value.id == "math" and node.func.attr == "isclose":
                     return "logical"
@@ -9828,12 +9847,25 @@ class translator(ast.NodeVisitor):
                 gen = node.generators[0]
                 it = gen.iter
                 loop_var = gen.target.id
-                base = self.expr(it.func.value) if (
+                if (
+                    isinstance(it, ast.Call)
+                    and isinstance(it.func, ast.Name)
+                    and it.func.id == "range"
+                ):
+                    r_start, r_stop, r_step = self._range_parts(it)
+                    base = (
+                        f"arange_int(int({self.expr(r_start)}), "
+                        f"int({self.expr(r_stop)}), int({self.expr(r_step)}))"
+                    )
+                elif (
                     isinstance(it, ast.Call)
                     and isinstance(it.func, ast.Attribute)
                     and it.func.attr == "tolist"
                     and len(it.args) == 0
-                ) else self.expr(it)
+                ):
+                    base = self.expr(it.func.value)
+                else:
+                    base = self.expr(it)
 
                 def _map_expr(n):
                     if isinstance(n, ast.Name) and n.id == loop_var:
@@ -9842,7 +9874,21 @@ class translator(ast.NodeVisitor):
                         return self.expr(n)
                     if isinstance(n, ast.Name):
                         return self.expr(n)
+                    if isinstance(n, ast.Subscript):
+                        btxt = self.expr(n.value)
+                        if isinstance(n.slice, ast.Tuple):
+                            raise NotImplementedError("ListComp subscript currently supports rank-1 indexing only")
+                        itxt = _map_expr(n.slice)
+                        return f"{btxt}(int({itxt}) + 1)"
                     if isinstance(n, ast.Call):
+                        if (
+                            isinstance(n.func, ast.Name)
+                            and n.func.id in {"max", "min"}
+                            and len(n.args) >= 2
+                            and not getattr(n, "keywords", [])
+                        ):
+                            args_m = [_map_expr(a) for a in n.args]
+                            return f"{n.func.id}(" + ", ".join(args_m) + ")"
                         if (
                             isinstance(n.func, ast.Name)
                             and len(n.args) == 1
@@ -10360,6 +10406,8 @@ class translator(ast.NodeVisitor):
                 return f"py_str({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id == "repr" and len(node.args) == 1:
                 return f"py_str({self.expr(node.args[0])})"
+            if isinstance(node.func, ast.Name) and node.func.id == "abs" and len(node.args) == 1:
+                return f"abs({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id == "bool" and len(node.args) == 1:
                 a0 = node.args[0]
                 e0 = self.expr(a0)
@@ -12546,14 +12594,18 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "math"
-                and node.func.attr == "sqrt"
+                and node.func.attr in {"sqrt", "erf", "erfc"}
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
-                return f"sqrt({a0})"
+                if node.func.attr == "sqrt":
+                    return f"sqrt({a0})"
+                if node.func.attr == "erf":
+                    return f"erf({a0})"
+                return f"erfc({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -12567,6 +12619,18 @@ class translator(ast.NodeVisitor):
                     a0 = f"real({a0}, kind=dp)"
                 fmap = {"atan": "atan", "asin": "asin", "acos": "acos", "tan": "tan", "sin": "sin", "cos": "cos"}
                 return f"{fmap[node.func.attr]}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "math"
+                and node.func.attr in {"exp", "log"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"{node.func.attr}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -13176,6 +13240,18 @@ class translator(ast.NodeVisitor):
             ):
                 self._mark_int(node.targets[0].id)
                 self.file_handle_vars.add(node.targets[0].id)
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "random"
+                and node.value.func.attr == "Random"
+            ):
+                self._mark_int(node.targets[0].id)
+                self.rng_vars.add(node.targets[0].id)
             if (
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
@@ -15505,6 +15581,43 @@ class translator(ast.NodeVisitor):
             # Python list aliasing semantics: x = v binds to same list object.
             if isinstance(v, ast.Name) and self._is_python_list_expr(v):
                 root = self._resolve_list_alias(v.id)
+                # For count-mapped list-backed arrays, prefer value copy semantics
+                # to keep runtime behavior correct across loop iterations
+                # (e.g. values = next_values in dynamic programming patterns).
+                if t.id in self.list_counts and root in self.list_counts:
+                    if t.id == root:
+                        return
+                    cnt_lhs = self.list_counts[t.id]
+                    cnt_rhs = self.list_counts[root]
+                    self.list_aliases.pop(t.id, None)
+                    self.python_list_vars.add(t.id)
+                    self.o.w(f"{cnt_lhs} = {cnt_rhs}")
+                    self.o.w(f"if (allocated({t.id})) deallocate({t.id})")
+                    self.o.w(f"if ({cnt_lhs} > 0) then")
+                    self.o.push()
+                    if t.id in self.alloc_chars or root in self.alloc_chars:
+                        self.o.w(f"allocate(character(len=len({root})) :: {t.id}(1:{cnt_lhs}))")
+                    else:
+                        self.o.w(f"allocate({t.id}(1:{cnt_lhs}))")
+                    self.o.w(f"{t.id}(1:{cnt_lhs}) = {root}(1:{cnt_lhs})")
+                    self.o.pop()
+                    self.o.w("else")
+                    self.o.push()
+                    if t.id in self.alloc_chars or root in self.alloc_chars:
+                        self.o.w(f"allocate(character(len=1) :: {t.id}(1))")
+                        self.o.w(f"{t.id} = \"\"")
+                    elif t.id in self.alloc_logs:
+                        self.o.w(f"allocate({t.id}(1))")
+                        self.o.w(f"{t.id} = .false.")
+                    elif t.id in self.alloc_complexes:
+                        self.o.w(f"allocate({t.id}(1))")
+                        self.o.w(f"{t.id} = cmplx(0.0_dp, 0.0_dp, kind=dp)")
+                    else:
+                        self.o.w(f"allocate({t.id}(1))")
+                        self.o.w(f"{t.id} = 0")
+                    self.o.pop()
+                    self.o.w("end if")
+                    return
                 if t.id != root:
                     self.list_aliases[t.id] = root
                 else:
@@ -16342,6 +16455,20 @@ class translator(ast.NodeVisitor):
             self.o.w(f"{t.id} = runif()")
             return
 
+        # x = rng.gauss(mu, sigma)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id in self.rng_vars
+            and v.func.attr == "gauss"
+        ):
+            mu_txt = self.expr(v.args[0]) if len(v.args) >= 1 else "0.0_dp"
+            sig_txt = self.expr(v.args[1]) if len(v.args) >= 2 else "1.0_dp"
+            self.o.w(f"{t.id} = ({mu_txt}) + ({sig_txt}) * rnorm()")
+            return
+
         # x = random.random(size=...) / np.random.random(size=...) / rng.random(size=...)
         if (
             isinstance(t, ast.Name)
@@ -16670,6 +16797,27 @@ class translator(ast.NodeVisitor):
                 seed_expr = self.expr(seed_node)
                 self.o.w(f"call seed_rng(int({seed_expr}))")
             # Keep a placeholder scalar for the RNG object name.
+            self.o.w(f"{self._aliased_name(t.id)} = 0")
+            self.rng_vars.add(t.id)
+            return
+
+        # rng = random.Random(seed)
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
+            and isinstance(v.func.value, ast.Name)
+            and v.func.value.id == "random"
+            and v.func.attr == "Random"
+        ):
+            seed_node = v.args[0] if v.args else None
+            for kw in v.keywords:
+                if kw.arg in {"seed", "x"}:
+                    seed_node = kw.value
+            if seed_node is None or is_none(seed_node):
+                self.o.w("call seed_rng()")
+            else:
+                self.o.w(f"call seed_rng(int({self.expr(seed_node)}))")
             self.o.w(f"{self._aliased_name(t.id)} = 0")
             self.rng_vars.add(t.id)
             return
@@ -19665,6 +19813,8 @@ class translator(ast.NodeVisitor):
             val = self.expr(c.args[0])
             if cnt is not None:
                 self.o.w(f"{cnt} = {cnt} + 1")
+                self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
+                self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {val}]")
                 self.o.w(f"{name}({cnt}) = {val}")
                 return
             # Fallback for list-like allocatable rank-1 arrays that are not using
@@ -19708,6 +19858,8 @@ class translator(ast.NodeVisitor):
                 self.o.w(f"do i_ext = 1, size({vals})")
                 self.o.push()
                 self.o.w(f"{cnt} = {cnt} + 1")
+                self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
+                self.o.w(f"if ({cnt} > size({name})) {name} = [{name}, {vals}(i_ext)]")
                 self.o.w(f"{name}({cnt}) = {vals}(i_ext)")
                 self.o.pop()
                 self.o.w("end do")
@@ -20077,7 +20229,15 @@ class translator(ast.NodeVisitor):
                     fmt_parts.append("a")
                     items.append(fstr(part.value))
                 elif isinstance(part, ast.FormattedValue):
-                    fcode = "g0"
+                    pv_kind = self._expr_kind(part.value)
+                    if pv_kind == "int":
+                        fcode = "i0"
+                    elif pv_kind == "logical":
+                        fcode = "l1"
+                    elif pv_kind == "char":
+                        fcode = "a"
+                    else:
+                        fcode = "g0"
                     if part.format_spec is not None:
                         # support basic Python format specs like .10f
                         spec = ""
@@ -20191,19 +20351,25 @@ def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
         crank = 0
         if isinstance(v, ast.Name):
             nm = v.id
-            if nm in tr0.alloc_reals:
-                ckind = "real_array"
-                crank = max(1, tr0.alloc_real_rank.get(nm, 1))
-            elif nm in tr0.alloc_ints:
-                ckind = "int_array"
-                crank = 1
-            elif nm in tr0.alloc_logs:
-                ckind = "logical_array"
-                crank = 1
-            elif nm in tr0.reals:
-                ckind = "real_scalar"
+            ek = tr0._expr_kind(v)
+            vrank = tr0._rank_expr(v)
+            if vrank > 0:
+                if ek == "int":
+                    ckind = "int_array"
+                elif ek == "logical":
+                    ckind = "logical_array"
+                else:
+                    ckind = "real_array"
+                crank = max(1, int(vrank))
             else:
-                ckind = "int_scalar"
+                if ek == "int":
+                    ckind = "int_scalar"
+                elif ek == "logical":
+                    ckind = "logical_scalar"
+                else:
+                    # Unknown scalar kinds in dict returns are more often REAL
+                    # in numerical code; prefer REAL over INTEGER fallback.
+                    ckind = "real_scalar"
         else:
             if (
                 isinstance(v, ast.Subscript)
@@ -20226,19 +20392,23 @@ def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
                 and isinstance(v.func.value, ast.Name)
             ):
                 nm = v.func.value.id
-                if nm in tr0.alloc_reals:
-                    ckind = "real_array"
-                    crank = max(1, tr0.alloc_real_rank.get(nm, 1))
-                elif nm in tr0.alloc_ints:
-                    ckind = "int_array"
-                    crank = 1
-                elif nm in tr0.alloc_logs:
-                    ckind = "logical_array"
-                    crank = 1
-                elif nm in tr0.reals:
-                    ckind = "real_scalar"
+                ek = tr0._expr_kind(ast.Name(id=nm, ctx=ast.Load()))
+                vrank = tr0._rank_expr(ast.Name(id=nm, ctx=ast.Load()))
+                if vrank > 0:
+                    if ek == "int":
+                        ckind = "int_array"
+                    elif ek == "logical":
+                        ckind = "logical_array"
+                    else:
+                        ckind = "real_array"
+                    crank = max(1, int(vrank))
                 else:
-                    ckind = "int_scalar"
+                    if ek == "int":
+                        ckind = "int_scalar"
+                    elif ek == "logical":
+                        ckind = "logical_scalar"
+                    else:
+                        ckind = "real_scalar"
                 comps.append((cname, ckind, v, crank))
                 continue
             if (
@@ -22771,7 +22941,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                                 kinds.append("int")
                                 ranks.append(0)
                             else:
-                                kinds.append("int")
+                                kinds.append("real")
                                 ranks.append(0)
                     else:
                         ek = tr._expr_kind(e)
@@ -22786,7 +22956,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                             elif ek == "char":
                                 kinds.append("alloc_char")
                             else:
-                                kinds.append("alloc_int")
+                                kinds.append("alloc_real")
                             ranks.append(int(er))
                         else:
                             if ek == "real":
@@ -22798,7 +22968,7 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                             elif ek == "char":
                                 kinds.append("char")
                             else:
-                                kinds.append("int")
+                                kinds.append("real")
                             ranks.append(0)
                 if tuple_out.get(fn.name) != kinds or tuple_out_ranks.get(fn.name) != ranks:
                     changed = True
@@ -23843,7 +24013,6 @@ def generate_flat(
     if use_proc_module:
         proc_tree = ast.Module(body=list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
-        proc_needed |= {"runif", "rnorm", "py_str", "py_float", "py_time", "py_ctime", "eye", "diag"}
         for mod, syms in helper_uses.items():
             keep = sorted([s for s in syms if s in proc_needed])
             if keep:
@@ -24092,16 +24261,36 @@ def generate_flat(
     if prog_name in prog_name_conflicts:
         prog_name = f"{stem}_prog"
 
+    helper_uses_main = helper_uses
+    if use_proc_module:
+        _main_nodes = [
+            _n for _n in tree.body
+            if not isinstance(_n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        _main_tree = ast.Module(body=list(_main_nodes), type_ignores=[])
+        main_needed = detect_needed_helpers(_main_tree)
+        helper_uses_main = {}
+        for mod, syms in helper_uses.items():
+            keep = sorted([s for s in syms if s in main_needed])
+            if keep:
+                helper_uses_main[mod] = keep
+        if _tree_uses_sys_argv(_main_tree):
+            helper_uses_main.setdefault("python_mod", [])
+            for _sym in ("sys_argv_init", "sys_argv_delete"):
+                if _sym not in helper_uses_main["python_mod"]:
+                    helper_uses_main["python_mod"].append(_sym)
+
     o = emit()
     o.w(f"program {prog_name}")
     o.push()
     if use_proc_module:
         o.w(f"use {proc_mod_name}, only: " + ", ".join(proc_public_syms))
-    for mod, syms in helper_uses.items():
+    for mod, syms in helper_uses_main.items():
         if syms:
             o.w(f"use {mod}, only: " + ", ".join(sorted(syms)))
-    o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
-    o.w("use, intrinsic :: iso_fortran_env, only: real64")
+    if not use_proc_module:
+        o.w("use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, ieee_is_finite, ieee_is_nan")
+        o.w("use, intrinsic :: iso_fortran_env, only: real64")
     o.w("implicit none")
     if not use_proc_module:
         o.w("integer, parameter :: dp = real64")
@@ -24826,10 +25015,6 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
     needed = detect_needed_helpers(helper_scan_tree)
-    # Some helper calls are introduced during lowering (for example callback
-    # rewrites to runif/py_str) and are not always visible in the original AST.
-    # Keep these imports available to avoid undeclared helper symbols.
-    needed |= {"runif", "rnorm", "py_str", "py_float", "py_time", "py_ctime", "eye", "diag"}
     if _tree_uses_shell_exec(helper_scan_tree):
         needed.add("exec_cmd_status")
     list_counts = build_list_count_map(effective_tree)
