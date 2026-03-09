@@ -3232,6 +3232,23 @@ def detect_needed_helpers(tree):
                 needed.add("sort_vec")
             if (
                 isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "itertools"
+            ):
+                if node.func.attr == "product":
+                    needed.add("itertools_product2_int")
+                elif node.func.attr == "combinations":
+                    needed.add("itertools_combinations_int")
+                elif node.func.attr == "combinations_with_replacement":
+                    needed.add("itertools_combinations_wr_int")
+                elif node.func.attr == "permutations":
+                    needed.add("itertools_permutations_int")
+                elif node.func.attr == "accumulate":
+                    needed.add("cumsum_int")
+                    needed.add("cumsum_real")
+
+            if (
+                isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"add", "discard"}
             ):
                 needed.add("unique_char")
@@ -7404,6 +7421,24 @@ class translator(ast.NodeVisitor):
                     return "int"
                 if node.func.value.id == "random" and node.func.attr == "random":
                     return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "itertools"
+                and node.func.attr in {
+                    "product",
+                    "combinations",
+                    "combinations_with_replacement",
+                    "permutations",
+                    "accumulate",
+                    "chain",
+                }
+            ):
+                if node.func.attr == "accumulate" and len(node.args) >= 1:
+                    return self._expr_kind(node.args[0])
+                if node.func.attr == "chain" and len(node.args) >= 1:
+                    return self._expr_kind(node.args[0])
+                return "int"
             if isinstance(node.func, ast.Name) and node.func.id == "norm" and len(node.args) >= 1:
                 return "real"
             return None
@@ -7873,6 +7908,8 @@ class translator(ast.NodeVisitor):
         ):
             return 1
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "list" and len(node.args) == 1:
+                return self._rank_expr(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
                 and self._is_scipy_special_call_attr(node.func)
@@ -8405,6 +8442,22 @@ class translator(ast.NodeVisitor):
                 if len(node.args) >= 1:
                     return max(1, len(node.args))
                 return self._rank_expr(node.func.value)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "itertools"
+                and node.func.attr in {
+                    "product",
+                    "combinations",
+                    "combinations_with_replacement",
+                    "permutations",
+                    "accumulate",
+                    "chain",
+                }
+            ):
+                if node.func.attr in {"accumulate", "chain"}:
+                    return 1
+                return 2
         return 0
 
     def _is_row2_expr(self, node):
@@ -9666,6 +9719,48 @@ class translator(ast.NodeVisitor):
                     args_nodes.append(kw.value)
                 args = ", ".join(self.expr(a) for a in args_nodes)
                 return f"{self.vectorize_aliases[node.func.id]}({args})"
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "list"
+                and len(node.args) == 1
+                and not getattr(node, "keywords", [])
+            ):
+                return self.expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "itertools"
+            ):
+                if node.func.attr == "product" and len(node.args) == 2:
+                    if self._expr_kind(node.args[0]) != "int" or self._expr_kind(node.args[1]) != "int":
+                        raise NotImplementedError("itertools.product currently supports only integer iterables")
+                    return f"itertools_product2_int({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                if node.func.attr == "combinations" and len(node.args) == 2:
+                    if self._expr_kind(node.args[0]) != "int":
+                        raise NotImplementedError("itertools.combinations currently supports only integer iterables")
+                    return f"itertools_combinations_int({self.expr(node.args[0])}, int({self.expr(node.args[1])}))"
+                if node.func.attr == "combinations_with_replacement" and len(node.args) == 2:
+                    if self._expr_kind(node.args[0]) != "int":
+                        raise NotImplementedError("itertools.combinations_with_replacement currently supports only integer iterables")
+                    return f"itertools_combinations_wr_int({self.expr(node.args[0])}, int({self.expr(node.args[1])}))"
+                if node.func.attr == "permutations" and len(node.args) == 2:
+                    if self._expr_kind(node.args[0]) != "int":
+                        raise NotImplementedError("itertools.permutations currently supports only integer iterables")
+                    return f"itertools_permutations_int({self.expr(node.args[0])}, int({self.expr(node.args[1])}))"
+                if node.func.attr == "accumulate" and len(node.args) >= 1:
+                    k0 = self._expr_kind(node.args[0])
+                    if k0 == "real":
+                        return f"cumsum_real({self.expr(node.args[0])})"
+                    if k0 == "int":
+                        return f"cumsum_int({self.expr(node.args[0])})"
+                    raise NotImplementedError("itertools.accumulate currently supports only integer/real iterables")
+                if node.func.attr == "chain" and len(node.args) >= 1:
+                    if all(isinstance(a, (ast.List, ast.Tuple)) for a in node.args):
+                        flat_elts = []
+                        for a in node.args:
+                            flat_elts.extend(list(a.elts))
+                        return _array_constructor(flat_elts)
+                    return "[" + ", ".join(self.expr(a) for a in node.args) + "]"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
                 return f"conjg({self.expr(node.func.value)})"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
@@ -18452,6 +18547,101 @@ class translator(ast.NodeVisitor):
                     enum_start_node = kw.value
             enum_start_txt = "0" if enum_start_node is None else self.expr(enum_start_node)
             _emit_for_over_rank1_iter(seq_node, t_val.id, idx_name=t_idx.id, enum_start_txt=enum_start_txt)
+            return
+
+        # for i, j in itertools.product(a, b):
+        if (
+            isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Attribute)
+            and isinstance(node.iter.func.value, ast.Name)
+            and node.iter.func.value.id == "itertools"
+            and node.iter.func.attr == "product"
+            and len(node.iter.args) == 2
+            and isinstance(node.target, (ast.Tuple, ast.List))
+            and len(node.target.elts) == 2
+            and all(isinstance(t, ast.Name) for t in node.target.elts)
+        ):
+            a_node = node.iter.args[0]
+            b_node = node.iter.args[1]
+            if self._rank_expr(a_node) < 1 or self._rank_expr(b_node) < 1:
+                raise NotImplementedError("itertools.product loop currently expects rank-1 iterables")
+            ak = self._expr_kind(a_node)
+            bk = self._expr_kind(b_node)
+            if ak != bk:
+                raise NotImplementedError("itertools.product loop currently expects same element kind on both iterables")
+            if ak not in {"int", "real", "logical", "char"}:
+                raise NotImplementedError("itertools.product loop kind unsupported")
+            t0 = node.target.elts[0].id
+            t1 = node.target.elts[1].id
+            i0 = f"i_prod0_{node.lineno}"
+            i1 = f"i_prod1_{node.lineno}"
+            self._mark_int(i0)
+            self._mark_int(i1)
+            if t0 != "_":
+                if ak == "real":
+                    self._mark_real(t0)
+                elif ak == "logical":
+                    self._mark_log(t0)
+                elif ak == "char":
+                    self._mark_char(t0)
+                else:
+                    self._mark_int(t0)
+            if t1 != "_":
+                if ak == "real":
+                    self._mark_real(t1)
+                elif ak == "logical":
+                    self._mark_log(t1)
+                elif ak == "char":
+                    self._mark_char(t1)
+                else:
+                    self._mark_int(t1)
+            self.o.w("block")
+            self.o.push()
+            if ak == "real":
+                self.o.w("real(kind=dp), allocatable :: it_prod_a(:), it_prod_b(:)")
+            elif ak == "logical":
+                self.o.w("logical, allocatable :: it_prod_a(:), it_prod_b(:)")
+            elif ak == "char":
+                self.o.w("character(len=:), allocatable :: it_prod_a(:), it_prod_b(:)")
+            else:
+                self.o.w("integer, allocatable :: it_prod_a(:), it_prod_b(:)")
+            self.o.w(f"integer :: {i0}, {i1}")
+            if t0 != "_":
+                if ak == "real":
+                    self.o.w(f"real(kind=dp) :: {t0}")
+                elif ak == "logical":
+                    self.o.w(f"logical :: {t0}")
+                elif ak == "char":
+                    self.o.w(f"character(len=:), allocatable :: {t0}")
+                else:
+                    self.o.w(f"integer :: {t0}")
+            if t1 != "_":
+                if ak == "real":
+                    self.o.w(f"real(kind=dp) :: {t1}")
+                elif ak == "logical":
+                    self.o.w(f"logical :: {t1}")
+                elif ak == "char":
+                    self.o.w(f"character(len=:), allocatable :: {t1}")
+                else:
+                    self.o.w(f"integer :: {t1}")
+            self.o.w(f"it_prod_a = {self.expr(a_node)}")
+            self.o.w(f"it_prod_b = {self.expr(b_node)}")
+            self.o.w(f"do {i0} = 1, size(it_prod_a)")
+            self.o.push()
+            if t0 != "_":
+                self.o.w(f"{t0} = it_prod_a({i0})")
+            self.o.w(f"do {i1} = 1, size(it_prod_b)")
+            self.o.push()
+            if t1 != "_":
+                self.o.w(f"{t1} = it_prod_b({i1})")
+            for s in node.body:
+                self.visit(s)
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         # tuple-target loops over literal tuple/list containers, e.g.
