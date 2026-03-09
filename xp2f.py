@@ -1995,6 +1995,18 @@ def remove_unused_use_only_imports(lines):
 
             prefix = m.group(1)
             payload = m.group(2).rstrip()
+            mod_m = re.match(
+                r"^\s*use(?:\s*,\s*intrinsic)?\s*(?:::)?\s*([a-z_]\w*)",
+                out[s0],
+                flags=re.IGNORECASE,
+            )
+            mod_name = mod_m.group(1).lower() if mod_m else ""
+            # Keep python_mod imports intact: lowering may introduce helper calls
+            # after this pass (or in branches that static matching misses), and
+            # over-pruning here causes false "no IMPLICIT type" build failures.
+            if mod_name == "python_mod":
+                k = s1 + 1
+                continue
             for t in range(s0 + 1, s1 + 1):
                 seg = out[t].strip()
                 if seg.startswith("&"):
@@ -3253,6 +3265,12 @@ def detect_needed_helpers(tree):
                     needed.add("special_binom")
             if isinstance(node.func, ast.Name) and node.func.id == "float":
                 needed.add("py_float")
+            if isinstance(node.func, ast.Name) and node.func.id in {"runif", "rnorm"}:
+                needed.add(node.func.id)
+            if isinstance(node.func, ast.Name) and node.func.id in {"py_str", "py_ctime", "py_time"}:
+                needed.add(node.func.id)
+            if isinstance(node.func, ast.Name) and node.func.id in {"eye", "diag"}:
+                needed.add(node.func.id)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -3852,6 +3870,96 @@ def collect_scipy_special_aliases(tree):
                     if nm in supported:
                         func_aliases[asn or nm] = nm
     return module_aliases, func_aliases
+
+
+def collect_module_global_decls(local_funcs):
+    """Collect Python `global` names used in local functions with rough type/rank."""
+    if not local_funcs:
+        return {}
+
+    def _merge_kind(k0, k1):
+        if k0 is None:
+            return k1
+        if k1 is None or k1 == k0:
+            return k0
+        order = {"logical": 0, "int": 1, "real": 2, "char": 3, "complex": 4}
+        if {k0, k1} <= {"logical", "int", "real"}:
+            return k0 if order.get(k0, 0) >= order.get(k1, 0) else k1
+        return k0
+
+    def _infer_from_node(n):
+        if isinstance(n, ast.Constant):
+            v = n.value
+            if isinstance(v, bool):
+                return "logical", 0
+            if isinstance(v, int):
+                return "int", 0
+            if isinstance(v, float):
+                return "real", 0
+            if isinstance(v, complex):
+                return "complex", 0
+            if isinstance(v, str):
+                return "char", 0
+            return None, 0
+        if isinstance(n, (ast.List, ast.Tuple)):
+            k = None
+            for e in n.elts:
+                ke, _ = _infer_from_node(e)
+                k = _merge_kind(k, ke)
+            return (k or "real"), 1
+        if isinstance(n, ast.Set):
+            k = None
+            for e in n.elts:
+                ke, _ = _infer_from_node(e)
+                k = _merge_kind(k, ke)
+            return (k or "int"), 1
+        if isinstance(n, ast.UnaryOp):
+            return _infer_from_node(n.operand)
+        if isinstance(n, ast.BinOp):
+            kl, _ = _infer_from_node(n.left)
+            kr, _ = _infer_from_node(n.right)
+            return (_merge_kind(kl, kr) or "real"), 0
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name):
+                if n.func.value.id in {"np", "numpy"} and n.func.attr in {
+                    "array", "asarray", "linspace", "arange", "zeros", "ones", "empty"
+                }:
+                    return "real", 1
+                if n.func.value.id in {"np", "numpy"} and n.func.attr in {
+                    "zeros_like", "ones_like", "empty_like"
+                }:
+                    return "real", 1
+            return "real", 0
+        return None, 0
+
+    global_names = set()
+    for fn in (local_funcs or []):
+        for st in ast.walk(fn):
+            if isinstance(st, ast.Global):
+                for nm in st.names:
+                    global_names.add(nm)
+
+    decls = {}
+    for fn in (local_funcs or []):
+        fn_globals = set()
+        for st in ast.walk(fn):
+            if isinstance(st, ast.Global):
+                fn_globals.update(st.names)
+        if not fn_globals:
+            continue
+        for st in ast.walk(fn):
+            if isinstance(st, ast.Assign):
+                for t in st.targets:
+                    if isinstance(t, ast.Name) and t.id in fn_globals:
+                        k, r = _infer_from_node(st.value)
+                        old = decls.get(t.id, (None, 0))
+                        decls[t.id] = (_merge_kind(old[0], k), max(int(old[1]), int(r)))
+
+    for nm in global_names:
+        if nm not in decls:
+            decls[nm] = ("real", 0)
+
+    return {nm: ((k or "real"), int(r)) for nm, (k, r) in decls.items()}
 
 
 def collect_statistics_aliases(tree):
@@ -6656,6 +6764,10 @@ class translator(ast.NodeVisitor):
                     return "int"
             return None
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in {
+                "py_str", "py_ctime", "str_zfill", "to_lower", "to_upper", "str_strip", "str_lstrip", "str_rstrip", "str_replace", "str_join"
+            }:
+                return "char"
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
@@ -6783,23 +6895,19 @@ class translator(ast.NodeVisitor):
                 if node.func.id in self.user_class_types:
                     return None
                 if node.func.id in self.local_func_arg_ranks:
-                    ranks = self.local_func_arg_ranks.get(node.func.id, [])
-                    parts = []
-                    for i, a in enumerate(node.args):
-                        ae = self.expr(a)
-                        er = ranks[i] if i < len(ranks) else 0
-                        ar = self._rank_expr(a)
-                        if er == 2 and ar == 1:
-                            ae = f"reshape({ae}, [size({ae}), 1])"
-                        elif er == 1 and ar == 2:
-                            ae = f"reshape({ae}, [size({ae})])"
-                        parts.append(ae)
-                    for kw in getattr(node, "keywords", []):
-                        if kw.arg is None:
-                            raise NotImplementedError("**kwargs not supported")
-                        parts.append(self.expr(kw.value))
-                    args = ", ".join(parts)
-                    return f"{node.func.id}({args})"
+                    if node.func.id in self.local_return_specs:
+                        spec = self.local_return_specs[node.func.id]
+                        if spec in {"real", "alloc_real"}:
+                            return "real"
+                        if spec in {"int", "alloc_int"}:
+                            return "int"
+                        if spec in {"logical", "alloc_log"}:
+                            return "logical"
+                        if spec in {"complex", "alloc_complex"}:
+                            return "complex"
+                        if spec in {"char", "alloc_char"}:
+                            return "char"
+                    return None
                 if node.func.id in self.local_return_specs:
                     spec = self.local_return_specs[node.func.id]
                     if spec in {"real", "alloc_real"}:
@@ -7523,6 +7631,8 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "chain" and len(node.args) >= 1:
                     return self._expr_kind(node.args[0])
                 return "int"
+            if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr", "py_str", "py_ctime"}:
+                return "char"
             stat_fn = None
             if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
                 stat_fn = self.statistics_func_aliases[node.func.id]
@@ -8852,6 +8962,40 @@ class translator(ast.NodeVisitor):
                 return ".false."
             if node.id in self.callable_aliases:
                 return self.callable_aliases[node.id]
+            known_names = (
+                set(self.ints)
+                | set(self.reals)
+                | set(self.logs)
+                | set(self.complexes)
+                | set(self.chars)
+                | set(self.alloc_ints)
+                | set(self.alloc_reals)
+                | set(self.alloc_logs)
+                | set(self.alloc_complexes)
+                | set(self.alloc_chars)
+                | set(self.params.keys())
+                | set(self.list_counts.keys())
+                | set(self.list_counts.values())
+                | set(getattr(self, "local_scalar_or_array", {}).keys())
+                | set(self.local_void_funcs)
+                | set(self.local_return_specs.keys())
+                | set(self.lambda_vars.keys())
+                | set(self.python_list_vars)
+                | set(self.python_set_vars)
+                | set(self.dict_typed_vars.keys())
+            )
+            for _fn_args in self.local_func_arg_names.values():
+                known_names |= set(_fn_args)
+            module_like = {
+                "np", "numpy", "math", "random", "time", "platform", "sys",
+                "scipy", "itertools", "statistics", "csv", "pprint",
+                "subprocess", "os", "plt", "pyplot", "matplotlib", "graphviz",
+                "Image", "ET", "ElementTree",
+            }
+            # Only enforce undefined-name diagnostics when local dummy argument
+            # metadata is available; early inference passes may not provide it.
+            if self.local_func_arg_names and node.id not in known_names and node.id not in module_like:
+                raise NotImplementedError(f"undefined name: {node.id}")
             return self._aliased_name(self._resolve_list_alias(node.id))
 
         if isinstance(node, ast.Constant):
@@ -10294,31 +10438,36 @@ class translator(ast.NodeVisitor):
                 if node.func.id == "norm" and len(node.args) >= 1:
                     a0 = self.expr(node.args[0])
                     return f"sqrt(sum(({a0})**2))"
-                args_nodes = self._build_local_call_actual_nodes(node.func.id, node)
-                ranks = self.local_func_arg_ranks.get(node.func.id, [])
-                parts = []
-                for i, a in enumerate(args_nodes):
-                    ae = self.expr(a)
-                    ae = self._coerce_local_actual_kind(node.func.id, i, a, ae)
-                    er = ranks[i] if i < len(ranks) else 0
-                    ar = self._rank_expr(a)
-                    if er == 2 and ar == 1:
-                        ae = f"reshape({ae}, [size({ae}), 1])"
-                    elif er == 1 and ar == 2:
-                        ae = f"reshape({ae}, [size({ae})])"
-                    parts.append(ae)
-                args = ", ".join(parts)
-                disp_name = node.func.id
-                dmap = self.local_overload_dispatch.get(node.func.id, None)
-                if dmap:
-                    iv = int(dmap.get("arg_index", 0))
-                    if 0 <= iv < len(args_nodes):
-                        a0_node = args_nodes[iv]
-                        if self._expr_kind(a0_node) == "int" and self._rank_expr(a0_node) == 1:
-                            key = "list" if self._is_python_list_expr(a0_node) else "array"
-                            if key in dmap:
-                                disp_name = dmap[key]
-                return f"{disp_name}({args})"
+                if (
+                    node.func.id in self.local_func_arg_names
+                    or node.func.id in self.local_return_specs
+                    or node.func.id in self.local_overload_dispatch
+                ):
+                    args_nodes = self._build_local_call_actual_nodes(node.func.id, node)
+                    ranks = self.local_func_arg_ranks.get(node.func.id, [])
+                    parts = []
+                    for i, a in enumerate(args_nodes):
+                        ae = self.expr(a)
+                        ae = self._coerce_local_actual_kind(node.func.id, i, a, ae)
+                        er = ranks[i] if i < len(ranks) else 0
+                        ar = self._rank_expr(a)
+                        if er == 2 and ar == 1:
+                            ae = f"reshape({ae}, [size({ae}), 1])"
+                        elif er == 1 and ar == 2:
+                            ae = f"reshape({ae}, [size({ae})])"
+                        parts.append(ae)
+                    args = ", ".join(parts)
+                    disp_name = node.func.id
+                    dmap = self.local_overload_dispatch.get(node.func.id, None)
+                    if dmap:
+                        iv = int(dmap.get("arg_index", 0))
+                        if 0 <= iv < len(args_nodes):
+                            a0_node = args_nodes[iv]
+                            if self._expr_kind(a0_node) == "int" and self._rank_expr(a0_node) == 1:
+                                key = "list" if self._is_python_list_expr(a0_node) else "array"
+                                if key in dmap:
+                                    disp_name = dmap[key]
+                    return f"{disp_name}({args})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -12890,6 +13039,28 @@ class translator(ast.NodeVisitor):
         raise NotImplementedError(f"unsupported expr: {type(node).__name__}")
 
     def prescan(self, nodes):
+        empty_list_append_kind = {}
+        for _n in nodes:
+            for _c in ast.walk(_n):
+                if not (
+                    isinstance(_c, ast.Call)
+                    and isinstance(_c.func, ast.Attribute)
+                    and _c.func.attr == "append"
+                    and isinstance(_c.func.value, ast.Name)
+                    and len(_c.args) == 1
+                ):
+                    continue
+                _nm = self._resolve_list_alias(_c.func.value.id)
+                _k = self._expr_kind(_c.args[0])
+                if _k is None:
+                    continue
+                _prev = empty_list_append_kind.get(_nm)
+                if _prev is None:
+                    empty_list_append_kind[_nm] = _k
+                elif _prev != _k:
+                    # Mixed append kinds default to REAL to avoid narrowing.
+                    empty_list_append_kind[_nm] = "real"
+
         def _attr_root_name(n):
             cur = n
             while isinstance(cur, ast.Attribute):
@@ -12908,6 +13079,27 @@ class translator(ast.NodeVisitor):
                 ):
                     self.uses_sys_argv = True
                     self._mark_alloc_char("sys_argv", rank=1)
+            for _c in ast.walk(node):
+                if not (
+                    isinstance(_c, ast.Call)
+                    and isinstance(_c.func, ast.Attribute)
+                    and _c.func.attr == "append"
+                    and isinstance(_c.func.value, ast.Name)
+                    and len(_c.args) == 1
+                ):
+                    continue
+                _tgt = self._resolve_list_alias(_c.func.value.id)
+                _k = self._expr_kind(_c.args[0])
+                if _k == "char":
+                    self._mark_alloc_char(_tgt)
+                elif _k == "logical":
+                    self._mark_alloc_log(_tgt)
+                elif _k == "real":
+                    self._mark_alloc_real(_tgt)
+                elif _k == "complex":
+                    self._mark_alloc_complex(_tgt)
+                elif _k == "int":
+                    self._mark_alloc_int(_tgt)
             # Propagate known local function dict-typed dummy arguments to
             # call-site variables (e.g., foo(a) where foo expects foo_dict_t).
             for c in ast.walk(node):
@@ -13803,7 +13995,15 @@ class translator(ast.NodeVisitor):
 
                 if isinstance(t, ast.Name) and isinstance(v, ast.List) and len(v.elts) == 0:
                     if self.context == "flat":
-                        self._mark_alloc_int(t.id)
+                        _k = empty_list_append_kind.get(t.id)
+                        if _k == "char":
+                            self._mark_alloc_char(t.id)
+                        elif _k == "logical":
+                            self._mark_alloc_log(t.id)
+                        elif _k == "real":
+                            self._mark_alloc_real(t.id)
+                        else:
+                            self._mark_alloc_int(t.id)
 
                 # logical sieve init: [True] * (n+1)
                 if isinstance(t, ast.Name) and isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult):
@@ -14916,6 +15116,16 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("multiple assignment not supported")
         t = node.targets[0]
         v = node.value
+        if (
+            isinstance(v, ast.Call)
+            and (
+                (isinstance(v.func, ast.Name) and v.func.id == "solve_ivp")
+                or (isinstance(v.func, ast.Attribute) and v.func.attr == "solve_ivp")
+            )
+        ):
+            if hasattr(ast, "unparse"):
+                raise NotImplementedError(f"unsupported call: {ast.unparse(v)}")
+            raise NotImplementedError("unsupported call: solve_ivp(...)")
         if (
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
@@ -17487,9 +17697,17 @@ class translator(ast.NodeVisitor):
             if cnt is None:
                 raise NotImplementedError("list without count mapping")
             if self.context == "flat":
-                self.o.w(f"if (.not. allocated({name})) allocate({name}(1:n))")
+                if name in self.alloc_chars:
+                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1), source=\"\")")
+                else:
+                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
             self.o.w(f"{cnt} = 0")
-            self.o.w(f"{name} = 0")
+            if name in self.alloc_chars:
+                self.o.w(f"{name} = \"\"")
+            elif name in self.alloc_logs:
+                self.o.w(f"{name} = .false.")
+            else:
+                self.o.w(f"{name} = 0")
             return
 
         # a = np.split(x, [i1, i2, ...]) / b = np.array_split(x, n)
@@ -19867,6 +20085,7 @@ def _emit_local_function(
     force_non_elemental_funcs=None,
     force_complex_funcs=None,
     local_tuple_return_out_names=None,
+    module_global_decls=None,
 ):
     # Local-function lowering for guarded-main scripts (integer/real scalar args).
     arg_nodes = list(fn.args.args) + list(fn.args.kwonlyargs)
@@ -20035,6 +20254,7 @@ def _emit_local_function(
 
     local_tree = ast.Module(body=list(fn.body), type_ignores=[])
     local_list_counts = build_list_count_map(local_tree)
+    module_global_names = set((module_global_decls or {}).keys())
     tr = translator(
         o,
         params={},
@@ -20733,16 +20953,16 @@ def _emit_local_function(
         alloc_reals_set -= set(out_names)
         alloc_complexes_set -= set(out_names)
         alloc_chars_set -= set(out_names)
-    remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names))
+    remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names)) | module_global_names
     complexes = sorted((tr.complexes - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
     ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     chars = sorted((getattr(tr, "chars", set()) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
-    alloc_logs = sorted(alloc_logs_set)
-    alloc_ints = sorted(alloc_ints_set)
-    alloc_complexes = sorted(alloc_complexes_set)
-    alloc_chars = sorted(alloc_chars_set)
+    alloc_logs = sorted([nm for nm in alloc_logs_set if nm not in module_global_names])
+    alloc_ints = sorted([nm for nm in alloc_ints_set if nm not in module_global_names])
+    alloc_complexes = sorted([nm for nm in alloc_complexes_set if nm not in module_global_names])
+    alloc_chars = sorted([nm for nm in alloc_chars_set if nm not in module_global_names])
 
     is_pure_fn = function_is_pure(fn, known_pure_calls=known_pure_calls)
     # Preserve a declaration/body separator only when Python source had
@@ -21781,7 +22001,7 @@ def _emit_local_function(
         rr = max(1, tr.alloc_int_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"integer, allocatable :: {nm}({dims})")
-    for nm in sorted(alloc_reals_set):
+    for nm in sorted([_nm for _nm in alloc_reals_set if _nm not in module_global_names]):
         rr = max(1, tr.alloc_real_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"real(kind=dp), allocatable :: {nm}({dims})")
@@ -23346,6 +23566,7 @@ def generate_flat(
     if use_proc_module:
         proc_tree = ast.Module(body=list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
+        proc_needed |= {"runif", "rnorm", "py_str", "py_float", "py_time", "py_ctime", "eye", "diag"}
         for mod, syms in helper_uses.items():
             keep = sorted([s for s in syms if s in proc_needed])
             if keep:
@@ -23446,6 +23667,7 @@ def generate_flat(
             local_func_dict_arg_types[fn.name] = by_idx
 
     module_text = ""
+    module_global_decls = collect_module_global_decls(local_funcs)
     if use_proc_module:
         om = emit()
         om.w(f"module {proc_mod_name}")
@@ -23458,6 +23680,31 @@ def generate_flat(
         om.w("implicit none")
         om.w("private")
         om.w("integer, parameter :: dp = real64")
+        for _gnm in sorted(module_global_decls):
+            _gk, _gr = module_global_decls[_gnm]
+            if _gr > 0:
+                _dims = ",".join(":" for _ in range(max(1, _gr)))
+                if _gk == "int":
+                    om.w(f"integer, allocatable :: {_gnm}({_dims})")
+                elif _gk == "logical":
+                    om.w(f"logical, allocatable :: {_gnm}({_dims})")
+                elif _gk == "char":
+                    om.w(f"character(len=:), allocatable :: {_gnm}({_dims})")
+                elif _gk == "complex":
+                    om.w(f"complex(kind=dp), allocatable :: {_gnm}({_dims})")
+                else:
+                    om.w(f"real(kind=dp), allocatable :: {_gnm}({_dims})")
+            else:
+                if _gk == "int":
+                    om.w(f"integer :: {_gnm}")
+                elif _gk == "logical":
+                    om.w(f"logical :: {_gnm}")
+                elif _gk == "char":
+                    om.w(f"character(len=:), allocatable :: {_gnm}")
+                elif _gk == "complex":
+                    om.w(f"complex(kind=dp) :: {_gnm}")
+                else:
+                    om.w(f"real(kind=dp) :: {_gnm}")
         type_names = _emit_type_defs(om)
         overload_proc_names = []
         for _gn, _specs in local_overload_specs.items():
@@ -23521,6 +23768,7 @@ def generate_flat(
                         force_non_elemental_funcs=passed_as_actual,
                         force_complex_funcs=force_complex_funcs,
                         local_tuple_return_out_names=local_tuple_return_out_names,
+                        module_global_decls=module_global_decls,
                     )
             else:
                 _emit_local_function(
@@ -23554,6 +23802,7 @@ def generate_flat(
                     force_non_elemental_funcs=passed_as_actual,
                     force_complex_funcs=force_complex_funcs,
                     local_tuple_return_out_names=local_tuple_return_out_names,
+                    module_global_decls=module_global_decls,
                 )
         om.w(f"end module {proc_mod_name}")
         module_text = om.text()
@@ -23742,6 +23991,7 @@ def generate_flat(
                 force_non_elemental_funcs=passed_as_actual,
                 force_complex_funcs=force_complex_funcs,
                 local_tuple_return_out_names=local_tuple_return_out_names,
+                module_global_decls=module_global_decls,
             )
 
     o.pop()
@@ -24299,6 +24549,10 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     if local_funcs:
         helper_scan_tree = ast.Module(body=list(effective_tree.body) + list(local_funcs), type_ignores=[])
     needed = detect_needed_helpers(helper_scan_tree)
+    # Some helper calls are introduced during lowering (for example callback
+    # rewrites to runif/py_str) and are not always visible in the original AST.
+    # Keep these imports available to avoid undeclared helper symbols.
+    needed |= {"runif", "rnorm", "py_str", "py_float", "py_time", "py_ctime", "eye", "diag"}
     if _tree_uses_shell_exec(helper_scan_tree):
         needed.add("exec_cmd_status")
     list_counts = build_list_count_map(effective_tree)
