@@ -1453,6 +1453,15 @@ def rename_conflicting_identifiers(src_text):
             new = rename_map.get(nm)
             if not new:
                 return nm
+            # Do not rewrite INTENT spec keywords, even if a user variable named
+            # `out`/`in`/`inout` is being renamed elsewhere.
+            if nm.lower() in {"in", "out", "inout"}:
+                head = code[: m.start()]
+                tail = code[m.end() :]
+                if re.search(r"intent\s*\(\s*$", head, flags=re.IGNORECASE) and re.match(
+                    r"^\s*\)", tail
+                ):
+                    return nm
             # Keep function/intrinsic call forms untouched.
             tail = code[m.end() :]
             if re.match(r"^\s*\(", tail) and nm.lower() in callable_forbidden:
@@ -3358,9 +3367,12 @@ def detect_needed_helpers(tree):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id in self.rng_names
-                and node.func.attr in {"normal", "standard_normal"}
+                and node.func.attr in {"normal", "standard_normal", "multivariate_normal"}
             ):
-                needed.add("rnorm")
+                if node.func.attr == "multivariate_normal":
+                    needed.add("random_mvn_samples")
+                else:
+                    needed.add("rnorm")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Attribute)
@@ -6738,6 +6750,10 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.IfExp):
             bk = self._expr_kind(node.body)
             ok = self._expr_kind(node.orelse)
+            if bk == "char" and ok == "char":
+                return "char"
+            if bk == "logical" and ok == "logical":
+                return "logical"
             if bk == "real" or ok == "real":
                 return "real"
             if bk == "complex" or ok == "complex":
@@ -6807,6 +6823,8 @@ class translator(ast.NodeVisitor):
                         return "logical"
             if isinstance(node.value, ast.Name):
                 nm = node.value.id
+                if nm == "sys_argv":
+                    return "char"
                 if nm in self.alloc_reals:
                     return "real"
                 if nm in self.alloc_complexes:
@@ -9665,6 +9683,19 @@ class translator(ast.NodeVisitor):
                 and int(node.slice.value) == 0
             ):
                 # 1D np.nonzero(x)[0] is the index vector itself.
+                return self.expr(node.value)
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "np"
+                and node.value.func.attr == "where"
+                and len(node.value.args) == 1
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and int(node.slice.value) == 0
+            ):
+                # 1D np.where(cond)[0] is the index vector itself in this subset.
                 return self.expr(node.value)
             # 1D np.nonzero(...) compatibility: nz is stored as index vector;
             # map nz[0] back to that vector.
@@ -13185,6 +13216,7 @@ class translator(ast.NodeVisitor):
     def prescan(self, nodes):
         empty_list_append_kind = {}
         index_name_hits = set()
+        asarray_aliases = {}
 
         def _names_in_expr(enode):
             out = set()
@@ -13258,6 +13290,19 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.value, ast.Call)
                 and isinstance(node.value.func, ast.Attribute)
                 and isinstance(node.value.func.value, ast.Name)
+                and node.value.func.value.id == "np"
+                and node.value.func.attr in {"asarray", "array"}
+                and len(node.value.args) >= 1
+                and isinstance(node.value.args[0], ast.Name)
+            ):
+                asarray_aliases[node.targets[0].id] = node.value.args[0].id
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and isinstance(node.value.func.value, ast.Name)
                 and node.value.func.value.id == "random"
                 and node.value.func.attr == "Random"
             ):
@@ -13294,6 +13339,58 @@ class translator(ast.NodeVisitor):
                 ):
                     self.uses_sys_argv = True
                     self._mark_alloc_char("sys_argv", rank=1)
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                _lhs = node.targets[0].id
+                _rhs = node.value
+                _uses_argv = False
+                for _n in ast.walk(_rhs):
+                    if (
+                        isinstance(_n, ast.Attribute)
+                        and isinstance(_n.value, ast.Name)
+                        and _n.value.id == "sys"
+                        and _n.attr == "argv"
+                    ):
+                        _uses_argv = True
+                        break
+                if _uses_argv:
+                    self._mark_char(_lhs)
+            for _c in ast.walk(node):
+                if not (
+                    isinstance(_c, ast.Call)
+                    and isinstance(_c.func, ast.Attribute)
+                    and _c.func.attr == "multivariate_normal"
+                    and len(_c.args) >= 2
+                ):
+                    continue
+                src = _c.func.value
+                is_rng = False
+                if (
+                    isinstance(src, ast.Attribute)
+                    and isinstance(src.value, ast.Name)
+                    and src.value.id == "np"
+                    and src.attr == "random"
+                ):
+                    is_rng = True
+                elif isinstance(src, ast.Name) and src.id in self.rng_vars:
+                    is_rng = True
+                if not is_rng:
+                    continue
+                mean_arg = _c.args[0]
+                cov_arg = _c.args[1]
+                if isinstance(mean_arg, ast.Subscript) and isinstance(mean_arg.value, ast.Name):
+                    self._mark_alloc_real(mean_arg.value.id, rank=2)
+                    _src = asarray_aliases.get(mean_arg.value.id)
+                    if _src is not None:
+                        self._mark_alloc_real(_src, rank=2)
+                if isinstance(cov_arg, ast.Subscript) and isinstance(cov_arg.value, ast.Name):
+                    self._mark_alloc_real(cov_arg.value.id, rank=3)
+                    _src = asarray_aliases.get(cov_arg.value.id)
+                    if _src is not None:
+                        self._mark_alloc_real(_src, rank=3)
             for _c in ast.walk(node):
                 if not (
                     isinstance(_c, ast.Call)
@@ -14697,6 +14794,21 @@ class translator(ast.NodeVisitor):
                         self._mark_alloc_log(t.id)
                     else:
                         self._mark_alloc_int(t.id)
+                # idx = np.where(cond)[0] -> integer index vector
+                if (
+                    isinstance(t, ast.Name)
+                    and isinstance(v, ast.Subscript)
+                    and isinstance(v.value, ast.Call)
+                    and isinstance(v.value.func, ast.Attribute)
+                    and isinstance(v.value.func.value, ast.Name)
+                    and v.value.func.value.id == "np"
+                    and v.value.func.attr == "where"
+                    and len(v.value.args) == 1
+                    and isinstance(v.slice, ast.Constant)
+                    and isinstance(v.slice.value, int)
+                    and int(v.slice.value) == 0
+                ):
+                    self._mark_alloc_int(t.id, rank=1)
 
                 # np.max/sum/mean/min(..., keepdims=True)
                 if (
@@ -18605,6 +18717,43 @@ class translator(ast.NodeVisitor):
 
         # subscript assignment
         if isinstance(t, ast.Subscript):
+            # x[idx] = rng.multivariate_normal(mean, cov, size=n)
+            if (
+                isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Attribute)
+                and v.func.attr == "multivariate_normal"
+                and len(v.args) >= 2
+                and (
+                    (isinstance(v.func.value, ast.Name) and v.func.value.id in self.rng_vars)
+                    or (
+                        isinstance(v.func.value, ast.Attribute)
+                        and isinstance(v.func.value.value, ast.Name)
+                        and v.func.value.value.id == "np"
+                        and v.func.value.attr == "random"
+                    )
+                )
+            ):
+                mean_expr = self.expr(v.args[0])
+                cov_expr = self.expr(v.args[1])
+                size_node = v.args[2] if len(v.args) >= 3 else None
+                for kw in v.keywords:
+                    if kw.arg == "size":
+                        size_node = kw.value
+                if size_node is None:
+                    raise NotImplementedError("rng.multivariate_normal currently requires size=...")
+                if isinstance(size_node, (ast.Tuple, ast.List)):
+                    raise NotImplementedError("rng.multivariate_normal size tuple not supported")
+                n_expr = self.expr(size_node)
+                lhs_expr = self.expr(t)
+                self.o.w("block")
+                self.o.push()
+                self.o.w("real(kind=dp), allocatable :: mvn_tmp(:,:)")
+                self.o.w(f"allocate(mvn_tmp(1:int({n_expr}),1:size({mean_expr})))")
+                self.o.w(f"call random_mvn_samples({mean_expr}, {cov_expr}, mvn_tmp)")
+                self.o.w(f"{lhs_expr} = mvn_tmp")
+                self.o.pop()
+                self.o.w("end block")
+                return
             # Statement-level lowering for ternary RHS preserves Python
             # short-circuit semantics when assigning into indexed targets.
             if isinstance(v, ast.IfExp):
@@ -22101,13 +22250,12 @@ def _emit_local_function(
         o.w(arg_decl + (f" ! {argument_comment(arg, 'in')}" if not no_comment else ""))
         if (
             intent_txt == "in"
-            and int(arr_rank) == 0
             and _arg_is_rebound_name(arg)
             and decl_kind is not None
             and (not str(decl_kind).lower().startswith("type("))
         ):
             alias = f"{arg}_local"
-            local_rebind_aliases.append((arg, alias, decl_kind))
+            local_rebind_aliases.append((arg, alias, decl_kind, int(arr_rank)))
             tr.name_aliases[arg] = alias
         if (
             arg in optional_args
@@ -22484,21 +22632,38 @@ def _emit_local_function(
         rr = max(1, tr.alloc_char_rank.get(nm, 1))
         dims = ",".join(":" for _ in range(rr))
         o.w(f"character(len=:), allocatable :: {nm}({dims})")
-    for arg, alias, decl_kind in local_rebind_aliases:
+    for arg, alias, decl_kind, arr_rank in local_rebind_aliases:
         if "character" in str(decl_kind).lower():
-            o.w(f"character(len=:), allocatable :: {alias}")
-            tr._mark_char(alias)
-        else:
-            o.w(f"{decl_kind} :: {alias}")
-            lk = str(decl_kind).lower()
-            if "logical" in lk:
-                tr._mark_log(alias)
-            elif "complex" in lk:
-                tr._mark_complex(alias)
-            elif "real" in lk:
-                tr._mark_real(alias)
+            if int(arr_rank) > 0:
+                dims = ",".join(":" for _ in range(int(arr_rank)))
+                o.w(f"character(len=:), allocatable :: {alias}({dims})")
+                tr._mark_alloc_char(alias, rank=int(arr_rank))
             else:
-                tr._mark_int(alias)
+                o.w(f"character(len=:), allocatable :: {alias}")
+                tr._mark_char(alias)
+        else:
+            lk = str(decl_kind).lower()
+            if int(arr_rank) > 0:
+                dims = ",".join(":" for _ in range(int(arr_rank)))
+                o.w(f"{decl_kind}, allocatable :: {alias}({dims})")
+                if "logical" in lk:
+                    tr._mark_alloc_log(alias, rank=int(arr_rank))
+                elif "complex" in lk:
+                    tr._mark_alloc_complex(alias, rank=int(arr_rank))
+                elif "real" in lk:
+                    tr._mark_alloc_real(alias, rank=int(arr_rank))
+                else:
+                    tr._mark_alloc_int(alias, rank=int(arr_rank))
+            else:
+                o.w(f"{decl_kind} :: {alias}")
+                if "logical" in lk:
+                    tr._mark_log(alias)
+                elif "complex" in lk:
+                    tr._mark_complex(alias)
+                elif "real" in lk:
+                    tr._mark_real(alias)
+                else:
+                    tr._mark_int(alias)
     if tr.uses_sys_argv:
         if needed_helpers is not None:
             needed_helpers.add("sys_argv_init")
@@ -22506,7 +22671,7 @@ def _emit_local_function(
         o.w("sys_argv = sys_argv_init()")
     if tr.uses_csv_split_line and needed_helpers is not None:
         needed_helpers.add("csv_split_line")
-    for arg, alias, _decl_kind in local_rebind_aliases:
+    for arg, alias, _decl_kind, _arr_rank in local_rebind_aliases:
         o.w(f"{alias} = {arg}")
     for arg, alias, dflt_expr, arr_rank in optional_default_inits:
         if int(arr_rank) == 0:
@@ -24040,6 +24205,20 @@ def generate_flat(
             if isinstance(_n, ast.Name) and isinstance(getattr(_n, "ctx", None), ast.Load):
                 out.add(_n.id)
         return out
+    def _tree_called_names(_tree):
+        out = set()
+        for _n in ast.walk(_tree):
+            if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name):
+                out.add(_n.func.id)
+        return out
+    def _tree_has_real_literal(_tree):
+        for _n in ast.walk(_tree):
+            if (
+                isinstance(_n, ast.Constant)
+                and isinstance(_n.value, float)
+            ):
+                return True
+        return False
     if use_proc_module:
         proc_tree = ast.Module(body=list(local_funcs), type_ignores=[])
         proc_needed = detect_needed_helpers(proc_tree)
@@ -24300,7 +24479,17 @@ def generate_flat(
         ]
         _main_tree = ast.Module(body=list(_main_nodes), type_ignores=[])
         _main_loaded = _tree_loaded_names(_main_tree)
-        proc_main_syms = sorted([_s for _s in proc_public_syms if _s in _main_loaded])
+        proc_main_needed = set(_main_loaded)
+        # Typed local-function returns can require derived types in main declarations.
+        _main_called = _tree_called_names(_main_tree)
+        for _fn_name in _main_called:
+            _spec = dict_return_specs.get(_fn_name)
+            if isinstance(_spec, dict) and _spec.get("type_name"):
+                proc_main_needed.add(_spec["type_name"])
+        # Keep dp when main includes real literals and generated declarations use kind=dp.
+        if _tree_has_real_literal(_main_tree):
+            proc_main_needed.add("dp")
+        proc_main_syms = sorted([_s for _s in proc_public_syms if _s in proc_main_needed])
         main_needed = detect_needed_helpers(_main_tree)
         helper_uses_main = {}
         for mod, syms in helper_uses.items():
