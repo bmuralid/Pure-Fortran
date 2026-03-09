@@ -3027,6 +3027,7 @@ def detect_needed_helpers(tree):
     needed = set()
     linalg_aliases = collect_linalg_aliases(tree)
     scipy_aliases, _ = collect_scipy_special_aliases(tree)
+    statistics_aliases, statistics_func_aliases = collect_statistics_aliases(tree)
     np_helper_map = {
         "arange": {"arange_int"},
         "linspace": {"arange_int"},
@@ -3107,6 +3108,7 @@ def detect_needed_helpers(tree):
             super().__init__()
             self.rng_names = set()
             self.scipy_special_aliases, self.scipy_special_func_aliases = collect_scipy_special_aliases(tree)
+            self.statistics_aliases, self.statistics_func_aliases = collect_statistics_aliases(tree)
 
         def visit_Assign(self, node):
             if (
@@ -3188,6 +3190,48 @@ def detect_needed_helpers(tree):
             )
             if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr"}:
                 needed.add("py_str")
+            if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
+                sf = self.statistics_func_aliases[node.func.id]
+                if sf in {"mean", "fmean"}:
+                    needed.add("mean_1d")
+                    needed.add("weighted_mean_1d")
+                elif sf in {"variance", "pvariance"}:
+                    needed.add("var_1d")
+                elif sf in {"stdev", "pstdev"}:
+                    needed.add("std")
+                elif sf in {"median", "median_grouped"}:
+                    needed.add("median_1d_real")
+                elif sf == "median_low":
+                    needed.add("median_low_int")
+                elif sf == "median_high":
+                    needed.add("median_high_int")
+                elif sf == "mode":
+                    needed.add("mode_int")
+                elif sf == "multimode":
+                    needed.add("multimode_int")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.statistics_aliases
+            ):
+                sf = node.func.attr
+                if sf in {"mean", "fmean"}:
+                    needed.add("mean_1d")
+                    needed.add("weighted_mean_1d")
+                elif sf in {"variance", "pvariance"}:
+                    needed.add("var_1d")
+                elif sf in {"stdev", "pstdev"}:
+                    needed.add("std")
+                elif sf in {"median", "median_grouped"}:
+                    needed.add("median_1d_real")
+                elif sf == "median_low":
+                    needed.add("median_low_int")
+                elif sf == "median_high":
+                    needed.add("median_high_int")
+                elif sf == "mode":
+                    needed.add("mode_int")
+                elif sf == "multimode":
+                    needed.add("multimode_int")
             if isinstance(node.func, ast.Name) and node.func.id in self.scipy_special_func_aliases:
                 fnm = self.scipy_special_func_aliases[node.func.id]
                 if fnm == "factorial":
@@ -3802,6 +3846,42 @@ def collect_scipy_special_aliases(tree):
                     if nm == "special":
                         module_aliases.add(asn or "special")
             elif mod == "scipy.special":
+                for al in node.names:
+                    nm = (al.name or "").strip()
+                    asn = (al.asname or "").strip()
+                    if nm in supported:
+                        func_aliases[asn or nm] = nm
+    return module_aliases, func_aliases
+
+
+def collect_statistics_aliases(tree):
+    """Collect aliases for statistics module and directly imported functions."""
+    module_aliases = set()
+    func_aliases = {}
+    supported = {
+        "mean",
+        "fmean",
+        "median",
+        "median_low",
+        "median_high",
+        "variance",
+        "stdev",
+        "pvariance",
+        "pstdev",
+        "median_grouped",
+        "mode",
+        "multimode",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if mod == "statistics":
+                    module_aliases.add(asn or "statistics")
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").strip()
+            if mod == "statistics":
                 for al in node.names:
                     nm = (al.name or "").strip()
                     asn = (al.asname or "").strip()
@@ -5413,6 +5493,8 @@ class translator(ast.NodeVisitor):
     global_linalg_aliases = set()
     global_scipy_special_aliases = set()
     global_scipy_special_func_aliases = {}
+    global_statistics_aliases = set()
+    global_statistics_func_aliases = {}
 
     def __init__(
         self,
@@ -5503,6 +5585,8 @@ class translator(ast.NodeVisitor):
         self.linalg_aliases = set(translator.global_linalg_aliases)
         self.scipy_special_aliases = set(translator.global_scipy_special_aliases)
         self.scipy_special_func_aliases = dict(translator.global_scipy_special_func_aliases)
+        self.statistics_aliases = set(translator.global_statistics_aliases)
+        self.statistics_func_aliases = dict(translator.global_statistics_func_aliases)
         self.promoted_colvec_results = set()
         self.uses_sys_argv = False
         self.uses_csv_split_line = False
@@ -7439,6 +7523,21 @@ class translator(ast.NodeVisitor):
                 if node.func.attr == "chain" and len(node.args) >= 1:
                     return self._expr_kind(node.args[0])
                 return "int"
+            stat_fn = None
+            if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
+                stat_fn = self.statistics_func_aliases[node.func.id]
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.statistics_aliases
+            ):
+                stat_fn = node.func.attr
+            if stat_fn is not None:
+                if stat_fn == "multimode":
+                    return "int"
+                if stat_fn in {"mode", "median_low", "median_high"}:
+                    return "int"
+                return "real"
             if isinstance(node.func, ast.Name) and node.func.id == "norm" and len(node.args) >= 1:
                 return "real"
             return None
@@ -9761,6 +9860,63 @@ class translator(ast.NodeVisitor):
                             flat_elts.extend(list(a.elts))
                         return _array_constructor(flat_elts)
                     return "[" + ", ".join(self.expr(a) for a in node.args) + "]"
+            stat_fn = None
+            stat_args = None
+            if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
+                stat_fn = self.statistics_func_aliases[node.func.id]
+                stat_args = node.args
+            elif (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.statistics_aliases
+            ):
+                stat_fn = node.func.attr
+                stat_args = node.args
+            if stat_fn is not None:
+                if len(stat_args) < 1:
+                    raise NotImplementedError(f"statistics.{stat_fn} expects at least one argument")
+                x_node = stat_args[0]
+                xk = self._expr_kind(x_node)
+                x_expr = self.expr(x_node)
+                x_real = x_expr if xk == "real" else f"real({x_expr}, kind=dp)"
+                if stat_fn in {"mean", "median", "median_grouped"}:
+                    return f"mean_1d({x_real})" if stat_fn == "mean" else f"median_1d_real({x_real})"
+                if stat_fn == "fmean":
+                    w_node = stat_args[1] if len(stat_args) >= 2 else None
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg == "weights":
+                            w_node = kw.value
+                    if w_node is None:
+                        return f"mean_1d({x_real})"
+                    w_expr = self.expr(w_node)
+                    wk = self._expr_kind(w_node)
+                    w_real = w_expr if wk == "real" else f"real({w_expr}, kind=dp)"
+                    return f"weighted_mean_1d({x_real}, {w_real})"
+                if stat_fn == "variance":
+                    return f"var_1d({x_real}, 1)"
+                if stat_fn == "pvariance":
+                    return f"var_1d({x_real}, 0)"
+                if stat_fn == "stdev":
+                    return f"std({x_real}, 1)"
+                if stat_fn == "pstdev":
+                    return f"std({x_real}, 0)"
+                if stat_fn == "median_low":
+                    if xk != "int":
+                        raise NotImplementedError("statistics.median_low currently supports integer iterables")
+                    return f"median_low_int({x_expr})"
+                if stat_fn == "median_high":
+                    if xk != "int":
+                        raise NotImplementedError("statistics.median_high currently supports integer iterables")
+                    return f"median_high_int({x_expr})"
+                if stat_fn == "mode":
+                    if xk != "int":
+                        raise NotImplementedError("statistics.mode currently supports integer iterables")
+                    return f"mode_int({x_expr})"
+                if stat_fn == "multimode":
+                    if xk != "int":
+                        raise NotImplementedError("statistics.multimode currently supports integer iterables")
+                    return f"multimode_int({x_expr})"
+
             if isinstance(node.func, ast.Attribute) and node.func.attr == "conjugate" and len(node.args) == 0:
                 return f"conjg({self.expr(node.func.value)})"
             if isinstance(node.func, ast.Attribute) and node.func.attr == "copy" and len(node.args) == 0:
@@ -24014,6 +24170,8 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     translator.global_linalg_aliases = set()
     translator.global_scipy_special_aliases = set()
     translator.global_scipy_special_func_aliases = {}
+    translator.global_statistics_aliases = set()
+    translator.global_statistics_func_aliases = {}
     comment_map = extract_python_comments(src)
 
     exec_nodes = [
@@ -24128,6 +24286,10 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
         translator.global_scipy_special_aliases,
         translator.global_scipy_special_func_aliases,
     ) = collect_scipy_special_aliases(tree)
+    (
+        translator.global_statistics_aliases,
+        translator.global_statistics_func_aliases,
+    ) = collect_statistics_aliases(tree)
     structured_type_components, structured_array_types, structured_dtype_strings = collect_structured_dtype_info(effective_tree)
     user_class_types, user_type_components = collect_dataclass_info(tree)
     for tnm, fields in user_type_components.items():
