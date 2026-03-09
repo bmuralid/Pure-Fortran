@@ -98,6 +98,7 @@ public :: ones_logical !@pyapi kind=function ret=logical(:) args=n:integer:inten
 public :: strvec_t !@pyapi kind=type desc="string vector helper type"
 public :: py_str !@pyapi kind=function ret=character args=x:any:intent(in) desc="python-like str() conversion for scalar int/real/logical/char"
 public :: py_float !@pyapi kind=function ret=real(dp) args=s:character:intent(in) desc="parse string to real(dp), NaN on read failure"
+public :: py_int !@pyapi kind=function ret=integer args=s:character:intent(in) desc="parse string to integer, 0 on read failure"
 public :: special_factorial !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial approximation via gamma(x+1)"
 public :: special_factorial2 !@pyapi kind=function ret=real(dp) args=x:real(dp):intent(in) desc="scipy.special.factorial2 for integer-like x"
 public :: special_binom !@pyapi kind=function ret=real(dp) args=n:real(dp):intent(in),k:real(dp):intent(in) desc="binomial coefficient via gamma"
@@ -116,6 +117,7 @@ public :: str_zfill !@pyapi kind=function ret=character args=s:character:intent(
 public :: str_split !@pyapi kind=function ret=type(strvec_t) args=s:character:intent(in),sep:character:intent(in):optional desc="split into string vector"
 public :: str_join !@pyapi kind=function ret=character args=sep:character:intent(in),items:type(strvec_t):intent(in) desc="join string vector with separator"
 public :: str_count !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="count non-overlapping occurrences"
+public :: csv_split_line !@pyapi kind=function ret=character(:) args=line:character:intent(in),delimiter:character:intent(in):optional,quotechar:character:intent(in):optional desc="split one CSV line into fields (basic quote-aware parser)"
 public :: str_isdigit !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are digits"
 public :: str_isalpha !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are letters"
 public :: str_isalnum !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are alnum"
@@ -135,6 +137,10 @@ public :: repeat_int_axis0_2d !@pyapi kind=function ret=integer(:,:) args=x:inte
 public :: repeat_int_axis1_2d !@pyapi kind=function ret=integer(:,:) args=x:integer(:,:):intent(in),reps:integer:intent(in) desc="repeat columns of integer matrix reps times"
 public :: diag_from_mat_real !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in) desc="return main diagonal of real matrix"
 public :: cumsum_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="cumulative sum of integer vector"
+public :: itertools_product2_int !@pyapi kind=function ret=integer(:,:) args=a:integer(:):intent(in),b:integer(:):intent(in) desc="itertools.product(a,b) for integer vectors"
+public :: itertools_combinations_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations(x,r) for integer vectors (r=2 currently)"
+public :: itertools_combinations_wr_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.combinations_with_replacement(x,r) for integer vectors (r=2 currently)"
+public :: itertools_permutations_int !@pyapi kind=function ret=integer(:,:) args=x:integer(:):intent(in),r:integer:intent(in) desc="itertools.permutations(x,r) for integer vectors (r=2 currently)"
 public :: diag_from_vec_real !@pyapi kind=function ret=real(dp)(:,:) args=v:real(dp)(:):intent(in) desc="return diagonal matrix from real vector"
 public :: repeat_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),reps:integer:intent(in) desc="repeat each real element reps times"
 public :: repeat_real_axis0_2d !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:,:):intent(in),reps:integer:intent(in) desc="repeat rows of real matrix reps times"
@@ -201,7 +207,12 @@ public :: cov_matrix_rows_real !@pyapi kind=function ret=real(dp)(:,:) args=x:re
 public :: corrcoef2_real !@pyapi kind=function ret=real(dp)(:,:) args=x:real(dp)(:):intent(in),y:real(dp)(:):intent(in) desc="2x2 correlation matrix for two real vectors"
 public :: convolve_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in),h:real(dp)(:):intent(in),mode:character:intent(in):optional desc="1D convolution with mode full/same/valid"
 public :: convolve_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in),h:integer(:):intent(in),mode:character:intent(in):optional desc="1D integer convolution with mode full/same/valid"
-public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load real matrix text file with basic numpy-like options"
+public :: loadtxt_real_2d !@pyapi kind=function ret=real(dp)(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load real matrix text file with basic numpy-like options"
+public :: loadtxt_real_1d !@pyapi kind=function ret=real(dp)(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected real column as vector"
+public :: loadtxt_int_2d !@pyapi kind=function ret=integer(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load integer matrix from text file"
+public :: loadtxt_int_1d !@pyapi kind=function ret=integer(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected integer column as vector"
+public :: loadtxt_logical_2d !@pyapi kind=function ret=logical(:,:) args=path:character:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional,usecols:integer(:):intent(in):optional desc="load logical matrix from text file (nonzero=>true)"
+public :: loadtxt_logical_1d !@pyapi kind=function ret=logical(:) args=path:character:intent(in),usecol:integer:intent(in),skiprows:integer:intent(in):optional,max_rows:integer:intent(in):optional,skip_footer:integer:intent(in):optional,delimiter:character:intent(in):optional,comments:character:intent(in):optional desc="load one selected logical column as vector (nonzero=>true)"
 public :: savetxt_real_2d !@pyapi kind=subroutine args=path:character:intent(in),x:real(dp)(:,:):intent(in),delimiter:character:intent(in):optional,fmt:character:intent(in):optional desc="write real matrix text file with basic delimiter/fmt options"
 public :: print_matrix !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),label:character:intent(in):optional desc="print 2D real matrix with aligned columns"
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
@@ -652,19 +663,24 @@ contains
          s = trim(buf)
       end function py_ctime
 
-      function loadtxt_real_2d(path, skiprows, delimiter, comments, usecols) result(x)
+      function loadtxt_real_2d(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols) result(x)
          character(len=*), intent(in) :: path
          integer, intent(in), optional :: skiprows
+         integer, intent(in), optional :: max_rows, skip_footer
          character(len=*), intent(in), optional :: delimiter, comments
          integer, intent(in), optional :: usecols(:)
          real(kind=dp), allocatable :: x(:,:)
          integer :: u, ios, nskip, nrow, ncol, irow, i, ntok, j
          integer :: i1, i2, max_col0
+         integer :: max_rows_loc, skip_footer_loc, nvalid, nkeep
+         integer :: valid_seen
          character(len=4096) :: line, work, delim_txt, comm_txt
          real(kind=dp), allocatable :: vals(:)
          logical :: usecols_present
 
          nskip = optval(skiprows, 0)
+         max_rows_loc = optval(max_rows, huge(1))
+         skip_footer_loc = max(0, optval(skip_footer, 0))
          delim_txt = ""
          comm_txt = "#"
          if (present(delimiter)) delim_txt = delimiter
@@ -691,6 +707,7 @@ contains
          end do
 
          nrow = 0
+          nvalid = 0
          if (.not. usecols_present) ncol = 0
          do
             read(u, "(A)", iostat=ios) line
@@ -704,9 +721,11 @@ contains
             else
                if (ncol == 0) ncol = ntok
             end if
-            nrow = nrow + 1
+            nvalid = nvalid + 1
          end do
 
+         nkeep = max(0, nvalid - skip_footer_loc)
+         nrow = min(nkeep, max(0, max_rows_loc))
          if (nrow <= 0 .or. ncol <= 0) then
             close(u)
             allocate(x(0,0))
@@ -721,6 +740,7 @@ contains
 
          allocate(x(nrow, ncol))
          irow = 0
+         valid_seen = 0
          do
             read(u, "(A)", iostat=ios) line
             if (ios /= 0) exit
@@ -731,6 +751,9 @@ contains
             if (usecols_present) then
                if (max_col0 + 1 > ntok) cycle
             end if
+            valid_seen = valid_seen + 1
+            if (valid_seen > nkeep) exit
+            if (irow >= nrow) exit
             irow = irow + 1
             allocate(vals(max(1, ntok)))
             vals = 0.0_dp
@@ -756,7 +779,7 @@ contains
             deallocate(vals)
          end do
          close(u)
-      contains
+       contains
          pure function preprocess_line(s, delim, cmt) result(out)
             character(len=*), intent(in) :: s, delim, cmt
             character(len=4096) :: out
@@ -793,6 +816,77 @@ contains
             end do
          end function count_tokens
       end function loadtxt_real_2d
+
+      function loadtxt_real_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in) :: usecol
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         real(kind=dp), allocatable :: x(:)
+         integer :: ucs(1)
+         real(kind=dp), allocatable :: tmp(:,:)
+         ucs(1) = usecol
+         tmp = loadtxt_real_2d(path, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments, usecols=ucs)
+         allocate(x(size(tmp,1)))
+         if (size(tmp,2) >= 1) then
+            x = tmp(:,1)
+         else
+            x = 0.0_dp
+         end if
+      end function loadtxt_real_1d
+
+      function loadtxt_int_2d(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: usecols(:)
+         integer, allocatable :: x(:,:)
+         real(kind=dp), allocatable :: tmp(:,:)
+         tmp = loadtxt_real_2d(path, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments, usecols=usecols)
+         allocate(x(size(tmp,1), size(tmp,2)))
+         x = int(tmp)
+      end function loadtxt_int_2d
+
+      function loadtxt_int_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in) :: usecol
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         integer, allocatable :: x(:)
+         real(kind=dp), allocatable :: tmp(:)
+         tmp = loadtxt_real_1d(path, usecol, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments)
+         allocate(x(size(tmp)))
+         x = int(tmp)
+      end function loadtxt_int_1d
+
+      function loadtxt_logical_2d(path, skiprows, max_rows, skip_footer, delimiter, comments, usecols) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         integer, intent(in), optional :: usecols(:)
+         logical, allocatable :: x(:,:)
+         real(kind=dp), allocatable :: tmp(:,:)
+         tmp = loadtxt_real_2d(path, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments, usecols=usecols)
+         allocate(x(size(tmp,1), size(tmp,2)))
+         x = (tmp /= 0.0_dp)
+      end function loadtxt_logical_2d
+
+      function loadtxt_logical_1d(path, usecol, skiprows, max_rows, skip_footer, delimiter, comments) result(x)
+         character(len=*), intent(in) :: path
+         integer, intent(in) :: usecol
+         integer, intent(in), optional :: skiprows, max_rows, skip_footer
+         character(len=*), intent(in), optional :: delimiter, comments
+         logical, allocatable :: x(:)
+         real(kind=dp), allocatable :: tmp(:)
+         tmp = loadtxt_real_1d(path, usecol, skiprows=skiprows, max_rows=max_rows, skip_footer=skip_footer, &
+            delimiter=delimiter, comments=comments)
+         allocate(x(size(tmp)))
+         x = (tmp /= 0.0_dp)
+      end function loadtxt_logical_1d
 
       subroutine savetxt_real_2d(path, x, delimiter, fmt)
          character(len=*), intent(in) :: path
@@ -3040,6 +3134,79 @@ contains
          if (pos <= len(s) + 1) call append_strvec(out, s(pos:))
       end function str_split
 
+      function csv_split_line(line, delimiter, quotechar) result(fields)
+         character(len=*), intent(in) :: line
+         character(len=*), intent(in), optional :: delimiter, quotechar
+         character(len=:), allocatable :: fields(:)
+         character(len=1) :: d, q, ch
+         integer :: i, j, nf, maxlen, pos
+         logical :: inq
+         character(len=4096) :: tok
+
+         d = ","
+         q = '"'
+         if (present(delimiter)) then
+            if (len_trim(delimiter) > 0) d = delimiter(1:1)
+         end if
+         if (present(quotechar)) then
+            if (len_trim(quotechar) > 0) q = quotechar(1:1)
+         end if
+
+         nf = 1
+         inq = .false.
+         do i = 1, len_trim(line)
+            ch = line(i:i)
+            if (ch == q) then
+               inq = .not. inq
+            else if (ch == d .and. .not. inq) then
+               nf = nf + 1
+            end if
+         end do
+
+         maxlen = 1
+         inq = .false.
+         j = 1
+         tok = ""
+         pos = 0
+         do i = 1, len_trim(line)
+            ch = line(i:i)
+            if (ch == q) then
+               inq = .not. inq
+            else if (ch == d .and. .not. inq) then
+               maxlen = max(maxlen, len_trim(tok))
+               tok = ""
+               pos = 0
+               j = j + 1
+            else
+               pos = pos + 1
+               if (pos <= len(tok)) tok(pos:pos) = ch
+            end if
+         end do
+         maxlen = max(maxlen, len_trim(tok))
+
+         allocate(character(len=maxlen) :: fields(nf))
+         fields = ""
+         inq = .false.
+         j = 1
+         tok = ""
+         pos = 0
+         do i = 1, len_trim(line)
+            ch = line(i:i)
+            if (ch == q) then
+               inq = .not. inq
+            else if (ch == d .and. .not. inq) then
+               fields(j) = trim(tok)
+               tok = ""
+               pos = 0
+               j = j + 1
+            else
+               pos = pos + 1
+               if (pos <= len(tok)) tok(pos:pos) = ch
+            end if
+         end do
+         if (j <= nf) fields(j) = trim(tok)
+      end function csv_split_line
+
       function str_join(sep, items) result(out)
          character(len=*), intent(in) :: sep
          type(strvec_t), intent(in) :: items
@@ -4812,6 +4979,104 @@ contains
       end function fft_rfftfreq
 
 
+      function itertools_product2_int(a, b) result(out)
+         integer, intent(in) :: a(:), b(:)
+         integer, allocatable :: out(:,:)
+         integer :: i, j, k, na, nb
+
+         na = size(a)
+         nb = size(b)
+         allocate(out(na * nb, 2))
+         k = 0
+         do i = 1, na
+            do j = 1, nb
+               k = k + 1
+               out(k, 1) = a(i)
+               out(k, 2) = b(j)
+            end do
+         end do
+      end function itertools_product2_int
+
+
+      function itertools_combinations_int(x, r) result(out)
+         integer, intent(in) :: x(:), r
+         integer, allocatable :: out(:,:)
+         integer :: i, j, k, n
+
+         n = size(x)
+         if (r /= 2) then
+            allocate(out(0, max(1, r)))
+            return
+         end if
+         if (n < 2) then
+            allocate(out(0, 2))
+            return
+         end if
+         allocate(out((n * (n - 1)) / 2, 2))
+         k = 0
+         do i = 1, n - 1
+            do j = i + 1, n
+               k = k + 1
+               out(k, 1) = x(i)
+               out(k, 2) = x(j)
+            end do
+         end do
+      end function itertools_combinations_int
+
+
+      function itertools_combinations_wr_int(x, r) result(out)
+         integer, intent(in) :: x(:), r
+         integer, allocatable :: out(:,:)
+         integer :: i, j, k, n
+
+         n = size(x)
+         if (r /= 2) then
+            allocate(out(0, max(1, r)))
+            return
+         end if
+         if (n <= 0) then
+            allocate(out(0, 2))
+            return
+         end if
+         allocate(out((n * (n + 1)) / 2, 2))
+         k = 0
+         do i = 1, n
+            do j = i, n
+               k = k + 1
+               out(k, 1) = x(i)
+               out(k, 2) = x(j)
+            end do
+         end do
+      end function itertools_combinations_wr_int
+
+
+      function itertools_permutations_int(x, r) result(out)
+         integer, intent(in) :: x(:), r
+         integer, allocatable :: out(:,:)
+         integer :: i, j, k, n
+
+         n = size(x)
+         if (r /= 2) then
+            allocate(out(0, max(1, r)))
+            return
+         end if
+         if (n < 2) then
+            allocate(out(0, 2))
+            return
+         end if
+         allocate(out(n * (n - 1), 2))
+         k = 0
+         do i = 1, n
+            do j = 1, n
+               if (j == i) cycle
+               k = k + 1
+               out(k, 1) = x(i)
+               out(k, 2) = x(j)
+            end do
+         end do
+      end function itertools_permutations_int
+
+
       pure function py_float(s) result(x)
          character(len=*), intent(in) :: s
          real(kind=dp) :: x
@@ -4820,6 +5085,15 @@ contains
          read(s, *, iostat=ios) x
          if (ios /= 0) x = ieee_value(0.0_dp, ieee_quiet_nan)
       end function py_float
+
+      pure function py_int(s) result(x)
+         character(len=*), intent(in) :: s
+         integer :: x
+         integer :: ios
+
+         read(s, *, iostat=ios) x
+         if (ios /= 0) x = 0
+      end function py_int
 
 
       function sys_argv_init() result(argv)
