@@ -23,6 +23,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
+from fortran_source_fixes import reconcile_allocatable_decl_ranks
 import xformat_mismatch as xfmm
 
 
@@ -146,6 +147,16 @@ def _build_and_run_program(srcs: list[Path], tag: str, tee_both: bool = False) -
 
 def _read_lines(path: Path) -> list[str]:
     return path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
+def _apply_shared_source_fixes(path: Path) -> int:
+    lines = _read_lines(path)
+    changed = 0
+    new_lines = reconcile_allocatable_decl_ranks(lines)
+    if new_lines != lines:
+        path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        changed += 1
+    return changed
 
 
 def _print_unified_diff(path: Path, before: list[str], after: list[str]) -> None:
@@ -1810,6 +1821,13 @@ def main() -> int:
     for it in range(1, args.max_iter + 1):
         src = work_target
         srcs_str = " ".join(_q(s) for s in build_inputs)
+        before_shared = _read_lines(src) if args.diff else []
+        shared_edits = _apply_shared_source_fixes(src)
+        if shared_edits:
+            if args.diff:
+                _print_unified_diff(src, before_shared, _read_lines(src))
+            edits += shared_edits
+            print(f"Fix: reconciled allocatable declaration/usage rank mismatch in {src}.")
 
         if args.runtime:
             exe = Path(tempfile.gettempdir()) / f"{work_target.stem}_xautofix_runtime.exe"
