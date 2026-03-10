@@ -3154,6 +3154,56 @@ def detect_needed_helpers(tree):
                 self.rng_names.add(node.targets[0].id)
             self.generic_visit(node)
 
+        def visit_Try(self, node):
+            def _scan_is_linalg_attr(expr_node, attr_name):
+                return (
+                    isinstance(expr_node, ast.Call)
+                    and isinstance(expr_node.func, ast.Attribute)
+                    and (
+                        (
+                            isinstance(expr_node.func.value, ast.Attribute)
+                            and isinstance(expr_node.func.value.value, ast.Name)
+                            and expr_node.func.value.value.id in {"np", "numpy"}
+                            and expr_node.func.value.attr == "linalg"
+                        )
+                        or (
+                            isinstance(expr_node.func.value, ast.Attribute)
+                            and isinstance(expr_node.func.value.value, ast.Name)
+                            and expr_node.func.value.value.id in scipy_aliases
+                            and expr_node.func.value.attr == "linalg"
+                        )
+                        or (
+                            isinstance(expr_node.func.value, ast.Name)
+                            and expr_node.func.value.id in linalg_aliases
+                        )
+                        or (
+                            is_linalg_name_node(expr_node.func.value)
+                        )
+                    )
+                    and expr_node.func.attr == attr_name
+                )
+
+            if not node.orelse and not node.finalbody and len(node.handlers) == 1 and len(node.body) == 1 and len(node.handlers[0].body) == 1:
+                body_st = node.body[0]
+                h_st = node.handlers[0].body[0]
+                if (
+                    isinstance(body_st, ast.Assign)
+                    and len(body_st.targets) == 1
+                    and isinstance(body_st.targets[0], ast.Name)
+                    and _scan_is_linalg_attr(body_st.value, "solve")
+                    and isinstance(h_st, ast.Assign)
+                    and len(h_st.targets) == 1
+                    and isinstance(h_st.targets[0], ast.Name)
+                    and h_st.targets[0].id == body_st.targets[0].id
+                    and isinstance(h_st.value, ast.Subscript)
+                    and isinstance(h_st.value.slice, ast.Constant)
+                    and h_st.value.slice.value == 0
+                    and isinstance(h_st.value.value, ast.Call)
+                    and _scan_is_linalg_attr(h_st.value.value, "lstsq")
+                ):
+                    needed.add("linalg_solve_safe")
+            self.generic_visit(node)
+
         def visit_Call(self, node):
             def _attr_chain_parts(n):
                 parts = []
@@ -3790,7 +3840,7 @@ def detect_needed_helpers(tree):
     return needed
 
 
-def build_list_count_map(tree):
+def build_list_count_map(tree, reserved_names=None):
     # recognize python list used like:
     #   primes = []
     #   primes.append(i)
@@ -3798,12 +3848,37 @@ def build_list_count_map(tree):
     list_vars = set()
     printed_lists = set()
     appended_lists = set()
+    used_names = set(reserved_names or [])
 
     class scan(ast.NodeVisitor):
         def visit_Assign(self, node):
+            for t in node.targets:
+                used_names.update(extract_target_names(t))
             if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
                 if isinstance(node.value, ast.List) and len(node.value.elts) == 0:
                     list_vars.add(node.targets[0].id)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node):
+            used_names.update(extract_target_names(node.target))
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node):
+            used_names.update(extract_target_names(node.target))
+            self.generic_visit(node)
+
+        def visit_For(self, node):
+            used_names.update(extract_target_names(node.target))
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node):
+            used_names.add(node.name)
+            for a in list(node.args.args) + list(node.args.kwonlyargs):
+                used_names.add(a.arg)
+            if node.args.vararg is not None:
+                used_names.add(node.args.vararg.arg)
+            if node.args.kwarg is not None:
+                used_names.add(node.args.kwarg.arg)
             self.generic_visit(node)
 
         def visit_Expr(self, node):
@@ -3821,11 +3896,19 @@ def build_list_count_map(tree):
     scan().visit(tree)
 
     out = {}
+    used_names_lower = {n.lower() for n in used_names}
     for name in sorted(list_vars):
         if name == "primes":
-            out[name] = "npr"
+            cand = "npr"
         else:
-            out[name] = f"n_{name}"
+            cand = f"n_{name}"
+        if cand.lower() in used_names_lower:
+            cand = f"{name}_count"
+        i = 2
+        while cand.lower() in used_names_lower or cand.lower() in {v.lower() for v in out.values()}:
+            cand = f"{name}_count_{i}"
+            i += 1
+        out[name] = cand
 
     # keep lists that are appended to or printed
     keep = {name for name in out if name in appended_lists or name in printed_lists}
@@ -5726,6 +5809,7 @@ class translator(ast.NodeVisitor):
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
+        self.local_assigned_names = set()
         self.dict_var_components = {}
         self.synthetic_slices = dict(translator.global_synthetic_slices)
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
@@ -8187,6 +8271,13 @@ class translator(ast.NodeVisitor):
             return 1
         if isinstance(node, ast.Subscript):
             if (
+                isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id in {"np", "numpy"}
+                and node.value.attr == "r_"
+            ):
+                return 1
+            if (
                 isinstance(node.value, ast.Name)
                 and self._aliased_name(node.value.id) in self.structured_array_types
                 and isinstance(node.slice, ast.Constant)
@@ -9190,6 +9281,7 @@ class translator(ast.NodeVisitor):
                 | set(self.list_counts.keys())
                 | set(self.list_counts.values())
                 | set(getattr(self, "local_scalar_or_array", {}).keys())
+                | set(self.local_assigned_names)
                 | set(self.local_void_funcs)
                 | set(self.local_return_specs.keys())
                 | set(self.lambda_vars.keys())
@@ -9205,10 +9297,6 @@ class translator(ast.NodeVisitor):
                 "subprocess", "os", "plt", "pyplot", "matplotlib", "graphviz",
                 "Image", "ET", "ElementTree",
             }
-            # Only enforce undefined-name diagnostics when local dummy argument
-            # metadata is available; early inference passes may not provide it.
-            if self.local_func_arg_names and node.id not in known_names and node.id not in module_like:
-                raise NotImplementedError(f"undefined name: {node.id}")
             return self._aliased_name(self._resolve_list_alias(node.id))
 
         if isinstance(node, ast.Constant):
@@ -9782,6 +9870,22 @@ class translator(ast.NodeVisitor):
                 if self._expr_kind(node) == "real":
                     return f"[real(kind=dp) :: {inner}]"
                 return f"[{inner}]"
+            if (
+                isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and self._is_linalg_module_attr(node.value.func.value)
+                and node.value.func.attr == "lstsq"
+                and len(node.value.args) >= 2
+                and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, int)
+                and int(node.slice.value) == 0
+            ):
+                a0 = self.expr(node.value.args[0])
+                b0 = self.expr(node.value.args[1])
+                return (
+                    f"linalg_solve(matmul(transpose({a0}), {a0}), "
+                    f"matmul(transpose({a0}), {b0}))"
+                )
             # Collapse nested reverse slices: a[i:j][::-1] -> a(j:i:-1)
             if (
                 isinstance(node.value, ast.Subscript)
@@ -13474,6 +13578,8 @@ class translator(ast.NodeVisitor):
         index_name_hits = set()
         asarray_aliases = {}
 
+        self.local_assigned_names = set()
+
         def _names_in_expr(enode):
             out = set()
             if enode is None:
@@ -13483,7 +13589,68 @@ class translator(ast.NodeVisitor):
                     out.add(_n.id)
             return out
 
+        def _record_assigned_names(n):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    self.local_assigned_names.update(extract_target_names(t))
+            elif isinstance(n, ast.AnnAssign):
+                self.local_assigned_names.update(extract_target_names(n.target))
+            elif isinstance(n, ast.AugAssign):
+                self.local_assigned_names.update(extract_target_names(n.target))
+            elif isinstance(n, ast.For):
+                self.local_assigned_names.update(extract_target_names(n.target))
+            elif isinstance(n, ast.With):
+                for _it in getattr(n, "items", []):
+                    _opt = getattr(_it, "optional_vars", None)
+                    if _opt is not None:
+                        self.local_assigned_names.update(extract_target_names(_opt))
+            elif isinstance(n, ast.ExceptHandler) and isinstance(getattr(n, "name", None), str):
+                self.local_assigned_names.add(n.name)
+
+        def _mark_name_from_expr(_nm, _expr):
+            if not isinstance(_nm, str) or not _nm:
+                return
+            if isinstance(_expr, (ast.List, ast.Tuple)) and len(getattr(_expr, "elts", [])) == 0:
+                return
+            _k = self._expr_kind(_expr)
+            _r = max(0, int(self._rank_expr(_expr)))
+            if _k == "real":
+                if _r > 0:
+                    self._mark_alloc_real(_nm, rank=_r)
+                else:
+                    self._mark_real(_nm)
+            elif _k == "complex":
+                if _r > 0:
+                    self._mark_alloc_complex(_nm, rank=_r)
+                else:
+                    self._mark_complex(_nm)
+            elif _k == "logical":
+                if _r > 0:
+                    self._mark_alloc_log(_nm, rank=_r)
+                else:
+                    self._mark_log(_nm)
+            elif _k == "char":
+                if _r > 0:
+                    self._mark_alloc_char(_nm, rank=_r)
+                else:
+                    self._mark_char(_nm)
+            elif _k == "int":
+                if _r > 0:
+                    self._mark_alloc_int(_nm, rank=_r)
+                else:
+                    self._mark_int(_nm)
+
         for _n in nodes:
+            for _m in ast.walk(_n):
+                _record_assigned_names(_m)
+                if (
+                    isinstance(_m, ast.Assign)
+                    and len(_m.targets) == 1
+                    and isinstance(_m.targets[0], ast.Name)
+                ):
+                    _mark_name_from_expr(_m.targets[0].id, _m.value)
+                elif isinstance(_m, ast.AnnAssign) and isinstance(_m.target, ast.Name) and _m.value is not None:
+                    _mark_name_from_expr(_m.target.id, _m.value)
             if isinstance(_n, ast.For) and isinstance(_n.target, ast.Name) and _n.target.id != "_":
                 _rr_iter = max(0, int(self._rank_expr(_n.iter)))
                 _kk_iter = self._expr_kind(_n.iter)
@@ -13695,16 +13862,17 @@ class translator(ast.NodeVisitor):
                     continue
                 _tgt = self._resolve_list_alias(_c.func.value.id)
                 _k = self._expr_kind(_c.args[0])
+                _rr = max(0, int(self._rank_expr(_c.args[0])))
                 if _k == "char":
-                    self._mark_alloc_char(_tgt)
+                    self._mark_alloc_char(_tgt, rank=max(1, _rr + 1))
                 elif _k == "logical":
-                    self._mark_alloc_log(_tgt)
+                    self._mark_alloc_log(_tgt, rank=max(1, _rr + 1))
                 elif _k == "real":
-                    self._mark_alloc_real(_tgt)
+                    self._mark_alloc_real(_tgt, rank=max(1, _rr + 1))
                 elif _k == "complex":
-                    self._mark_alloc_complex(_tgt)
+                    self._mark_alloc_complex(_tgt, rank=max(1, _rr + 1))
                 elif _k == "int":
-                    self._mark_alloc_int(_tgt)
+                    self._mark_alloc_int(_tgt, rank=max(1, _rr + 1))
             # Propagate known local function dict-typed dummy arguments to
             # call-site variables (e.g., foo(a) where foo expects foo_dict_t).
             for c in ast.walk(node):
@@ -15604,14 +15772,17 @@ class translator(ast.NodeVisitor):
                         if isinstance(c.func.value, ast.Name):
                             if self.context == "flat":
                                 k = self._expr_kind(c.args[0]) if c.args else None
+                                rr = max(0, int(self._rank_expr(c.args[0]))) if c.args else 0
                                 if k == "real":
-                                    self._mark_alloc_real(c.func.value.id)
+                                    self._mark_alloc_real(c.func.value.id, rank=max(1, rr + 1))
                                 elif k == "char":
-                                    self._mark_alloc_char(c.func.value.id)
+                                    self._mark_alloc_char(c.func.value.id, rank=max(1, rr + 1))
                                 elif k == "logical":
-                                    self._mark_alloc_log(c.func.value.id)
+                                    self._mark_alloc_log(c.func.value.id, rank=max(1, rr + 1))
+                                elif k == "complex":
+                                    self._mark_alloc_complex(c.func.value.id, rank=max(1, rr + 1))
                                 else:
-                                    self._mark_alloc_int(c.func.value.id)
+                                    self._mark_alloc_int(c.func.value.id, rank=max(1, rr + 1))
         for _nm in index_name_hits:
             self._force_int_name(_nm, rank_hint=0)
 
@@ -15702,6 +15873,69 @@ class translator(ast.NodeVisitor):
             return
         fake = ast.Assign(targets=[node.target], value=node.value)
         self.visit_Assign(fake)
+
+    def visit_Try(self, node):
+        def _is_linalg_attr_call(expr_node, attr_name):
+            return (
+                isinstance(expr_node, ast.Call)
+                and isinstance(expr_node.func, ast.Attribute)
+                and self._is_linalg_module_attr(expr_node.func.value)
+                and expr_node.func.attr == attr_name
+            )
+
+        def _match_solve_fallback(body_st, handler_st):
+            if not (
+                isinstance(body_st, ast.Assign)
+                and len(body_st.targets) == 1
+                and isinstance(body_st.targets[0], ast.Name)
+                and _is_linalg_attr_call(body_st.value, "solve")
+            ):
+                return None
+            tgt = body_st.targets[0].id
+            if not (
+                isinstance(handler_st, ast.Assign)
+                and len(handler_st.targets) == 1
+                and isinstance(handler_st.targets[0], ast.Name)
+                and handler_st.targets[0].id == tgt
+                and isinstance(handler_st.value, ast.Subscript)
+                and isinstance(handler_st.value.slice, ast.Constant)
+                and handler_st.value.slice.value == 0
+                and _is_linalg_attr_call(handler_st.value.value, "lstsq")
+            ):
+                return None
+            solve_call = body_st.value
+            lstsq_call = handler_st.value.value
+            if len(solve_call.args) < 2 or len(lstsq_call.args) < 2:
+                return None
+            return tgt, solve_call.args[0], solve_call.args[1]
+
+        self._emit_comments_for(node)
+        if node.orelse or node.finalbody:
+            raise NotImplementedError("unsupported try/except/else/finally pattern")
+        if len(node.handlers) != 1:
+            raise NotImplementedError("unsupported try with multiple except handlers")
+        handler = node.handlers[0]
+        if len(node.body) == 1 and len(handler.body) == 1:
+            matched = _match_solve_fallback(node.body[0], handler.body[0])
+            if matched is not None:
+                tgt, a_node, b_node = matched
+                self.o.w("block")
+                self.o.push()
+                self.o.w("logical :: solve_ok_try")
+                self.o.w(f"call linalg_solve_safe({self.expr(a_node)}, {self.expr(b_node)}, {tgt}, solve_ok_try)")
+                self.o.w("if (.not. solve_ok_try) then")
+                self.o.push()
+                self.visit(handler.body[0])
+                self.o.pop()
+                self.o.w("end if")
+                self.o.pop()
+                self.o.w("end block")
+                return
+        if len(handler.body) == 1 and isinstance(handler.body[0], ast.Return):
+            for st in node.body:
+                self.visit(st)
+            return
+        raise NotImplementedError("unsupported try/except pattern")
 
     def visit_With(self, node):
         self._emit_comments_for(node)
@@ -18601,18 +18835,8 @@ class translator(ast.NodeVisitor):
             cnt = self.list_counts.get(name, None)
             if cnt is None:
                 raise NotImplementedError("list without count mapping")
-            if self.context == "flat":
-                if name in self.alloc_chars:
-                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1), source=\"\")")
-                else:
-                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
+            self.o.w(f"if (allocated({name})) deallocate({name})")
             self.o.w(f"{cnt} = 0")
-            if name in self.alloc_chars:
-                self.o.w(f"{name} = \"\"")
-            elif name in self.alloc_logs:
-                self.o.w(f"{name} = .false.")
-            else:
-                self.o.w(f"{name} = 0")
             return
 
         # a = np.split(x, [i1, i2, ...]) / b = np.array_split(x, n)
@@ -20597,12 +20821,77 @@ class translator(ast.NodeVisitor):
             name = self._resolve_list_alias(c.func.value.id)
             if len(c.args) != 1:
                 raise NotImplementedError("append expects exactly one argument")
-            if self._rank_expr(c.args[0]) > 0:
+            arg_rank = max(0, int(self._rank_expr(c.args[0])))
+            name_rank = max(0, int(self._rank_expr(ast.Name(id=name, ctx=ast.Load()))))
+            cnt = self.list_counts.get(name, None)
+            val = self.expr(c.args[0])
+            if arg_rank > 0 and cnt is not None and name_rank == (arg_rank + 1):
+                self.o.w(f"{cnt} = {cnt} + 1")
+                if name_rank == 2:
+                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1, size({val})))")
+                    self.o.w(f"if ({cnt} > size({name},1)) then")
+                    self.o.push()
+                    self.o.w(
+                        f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
+                        f"[size({name},1) + 1, size({name},2)])"
+                    )
+                    self.o.pop()
+                    self.o.w("end if")
+                    self.o.w(f"{name}({cnt}, :) = {val}")
+                    return
+                if name_rank == 3:
+                    self.o.w(f"if (.not. allocated({name})) allocate({name}(1, size({val},1), size({val},2)))")
+                    self.o.w(f"if ({cnt} > size({name},1)) then")
+                    self.o.push()
+                    self.o.w(
+                        f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
+                        f"[size({name},1) + 1, size({name},2), size({name},3)])"
+                    )
+                    self.o.pop()
+                    self.o.w("end if")
+                    self.o.w(f"{name}({cnt}, :, :) = {val}")
+                    return
+                raise NotImplementedError(
+                    "append of non-scalar value currently supports only vector and matrix elements"
+                )
+            if arg_rank > 0 and name_rank == (arg_rank + 1):
+                if name_rank == 2:
+                    self.o.w(f"if (allocated({name})) then")
+                    self.o.push()
+                    self.o.w(
+                        f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
+                        f"[size({name},1) + 1, size({name},2)])"
+                    )
+                    self.o.pop()
+                    self.o.w("else")
+                    self.o.push()
+                    self.o.w(f"allocate({name}(1, size({val})))")
+                    self.o.w(f"{name}(1, :) = {val}")
+                    self.o.pop()
+                    self.o.w("end if")
+                    return
+                if name_rank == 3:
+                    self.o.w(f"if (allocated({name})) then")
+                    self.o.push()
+                    self.o.w(
+                        f"{name} = reshape([reshape({name}, [size({name})]), reshape({val}, [size({val})])], "
+                        f"[size({name},1) + 1, size({name},2), size({name},3)])"
+                    )
+                    self.o.pop()
+                    self.o.w("else")
+                    self.o.push()
+                    self.o.w(f"allocate({name}(1, size({val},1), size({val},2)))")
+                    self.o.w(f"{name}(1, :, :) = {val}")
+                    self.o.pop()
+                    self.o.w("end if")
+                    return
+                raise NotImplementedError(
+                    "append of non-scalar value currently supports only vector and matrix elements"
+                )
+            if arg_rank > 0:
                 raise NotImplementedError(
                     "append of non-scalar value is unsupported for homogeneous Fortran arrays; use extend/concatenation semantics explicitly"
                 )
-            cnt = self.list_counts.get(name, None)
-            val = self.expr(c.args[0])
             if cnt is not None:
                 self.o.w(f"{cnt} = {cnt} + 1")
                 self.o.w(f"if (.not. allocated({name})) allocate({name}(1))")
@@ -21076,7 +21365,15 @@ class translator(ast.NodeVisitor):
 # code generation
 # -------------------------
 
-def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
+def _analyze_dict_return_spec(
+    fn,
+    params,
+    known_key_kinds=None,
+    local_return_specs=None,
+    local_return_ranks=None,
+    tuple_return_out_kinds=None,
+    tuple_return_out_ranks=None,
+):
     # Recognize functions that return a local dict variable:
     #   d = {"k": expr, ...}
     #   return d
@@ -21114,6 +21411,96 @@ def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
     tr0.prescan(fn.body)
     comps = []
     list_elem_kind = {}
+
+    def _spec_to_kind_rank(_spec, _rank):
+        if _spec == "alloc_real":
+            return "real", max(1, int(_rank))
+        if _spec == "alloc_int":
+            return "int", max(1, int(_rank))
+        if _spec == "alloc_log":
+            return "logical", max(1, int(_rank))
+        if _spec == "alloc_complex":
+            return "complex", max(1, int(_rank))
+        if _spec == "alloc_char":
+            return "char", max(1, int(_rank))
+        if _spec in {"real", "int", "logical", "complex", "char"}:
+            return _spec, 0
+        return None, 0
+
+    def _infer_local_name_spec_dict(name_nm):
+        best_rank = 0
+        best_kind = None
+        for _st in ast.walk(fn):
+            if (
+                isinstance(_st, ast.Assign)
+                and len(_st.targets) == 1
+                and isinstance(_st.targets[0], (ast.Tuple, ast.List))
+                and isinstance(_st.value, ast.Call)
+                and isinstance(_st.value.func, ast.Name)
+            ):
+                _callee = _st.value.func.id
+                _outs_k = list((tuple_return_out_kinds or {}).get(_callee, []))
+                _outs_r = list((tuple_return_out_ranks or {}).get(_callee, []))
+                for _i, _elt in enumerate(_st.targets[0].elts):
+                    if not (isinstance(_elt, ast.Name) and _elt.id == name_nm):
+                        continue
+                    if _i >= len(_outs_k):
+                        continue
+                    _k2, _r2 = _spec_to_kind_rank(_outs_k[_i], _outs_r[_i] if _i < len(_outs_r) else 0)
+                    if _k2 is not None and _r2 >= best_rank:
+                        best_kind = _k2
+                        best_rank = _r2
+            if not (
+                isinstance(_st, ast.Assign)
+                and len(_st.targets) == 1
+                and isinstance(_st.targets[0], ast.Name)
+                and _st.targets[0].id == name_nm
+            ):
+                continue
+            _rhs = _st.value
+            rr = int(tr0._rank_expr(_rhs))
+            kk = tr0._expr_kind(_rhs)
+            if rr > best_rank:
+                best_rank = rr
+                best_kind = kk
+            elif best_kind is None and kk is not None:
+                best_kind = kk
+            if isinstance(_rhs, ast.Name):
+                _rnm = _rhs.id
+                rr2 = max(
+                    int(tr0.alloc_real_rank.get(_rnm, 0)),
+                    int(tr0.alloc_int_rank.get(_rnm, 0)),
+                    int(tr0.alloc_log_rank.get(_rnm, 0)),
+                    int(tr0.alloc_complex_rank.get(_rnm, 0)),
+                    int(tr0.alloc_char_rank.get(_rnm, 0)),
+                )
+                if rr2 > best_rank:
+                    best_rank = rr2
+                    if _rnm in tr0.alloc_reals or _rnm in tr0.reals:
+                        best_kind = "real"
+                    elif _rnm in tr0.alloc_ints or _rnm in tr0.ints:
+                        best_kind = "int"
+                    elif _rnm in tr0.alloc_logs or _rnm in tr0.logs:
+                        best_kind = "logical"
+                    elif _rnm in tr0.alloc_complexes or _rnm in tr0.complexes:
+                        best_kind = "complex"
+                    elif _rnm in tr0.alloc_chars or _rnm in tr0.chars:
+                        best_kind = "char"
+            if (
+                isinstance(_rhs, ast.Call)
+                and isinstance(_rhs.func, ast.Name)
+                and isinstance(_st.targets[0], ast.Name)
+                and _st.targets[0].id == name_nm
+            ):
+                _callee = _rhs.func.id
+                _sp = (local_return_specs or {}).get(_callee, None)
+                _sr = int((local_return_ranks or {}).get(_callee, 0))
+                _k2, _r2 = _spec_to_kind_rank(_sp, _sr)
+                if _k2 is not None and _r2 >= best_rank:
+                    best_kind = _k2
+                    best_rank = _r2
+        return best_kind, best_rank
+
     for st in ast.walk(fn):
         if (
             isinstance(st, ast.Call)
@@ -21143,8 +21530,11 @@ def _analyze_dict_return_spec(fn, params, known_key_kinds=None):
         crank = 0
         if isinstance(v, ast.Name):
             nm = v.id
-            ek = tr0._expr_kind(v)
-            vrank = tr0._rank_expr(v)
+            ek, vrank = _infer_local_name_spec_dict(nm)
+            if ek is None:
+                ek = tr0._expr_kind(v)
+            if not vrank:
+                vrank = tr0._rank_expr(v)
             if vrank > 0:
                 if ek == "int":
                     ckind = "int_array"
@@ -21475,7 +21865,12 @@ def _emit_local_function(
         return
 
     local_tree = ast.Module(body=list(fn.body), type_ignores=[])
-    local_list_counts = build_list_count_map(local_tree)
+    _reserved_local_names = {a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))}
+    if fn.args.vararg is not None:
+        _reserved_local_names.add(fn.args.vararg.arg)
+    if fn.args.kwarg is not None:
+        _reserved_local_names.add(fn.args.kwarg.arg)
+    local_list_counts = build_list_count_map(local_tree, reserved_names=_reserved_local_names)
     module_global_names = set((module_global_decls or {}).keys())
     tr = translator(
         o,
@@ -21806,9 +22201,21 @@ def _emit_local_function(
                     and _n.args[0].id == nm
                 ):
                     rr = max(rr, 1)
+                if (
+                    isinstance(_n, ast.Call)
+                    and isinstance(_n.func, ast.Attribute)
+                    and is_numpy_name_node(_n.func.value)
+                    and _n.func.attr in {"column_stack", "stack", "concatenate", "hstack", "vstack"}
+                    and len(_n.args) >= 1
+                    and isinstance(_n.args[0], (ast.Tuple, ast.List))
+                ):
+                    for _e in _n.args[0].elts:
+                        if isinstance(_e, ast.Name) and _e.id == nm:
+                            rr = max(rr, 1)
         return rr
 
     dict_arg_names = set((dict_arg_types or {}).keys())
+    inferred_array_arg_specs = {}
     for a in arg_nodes:
         if a.arg in callback_args:
             continue
@@ -21829,6 +22236,14 @@ def _emit_local_function(
         _self_norm_kind = _arg_self_normalized_kind(a.arg)
         if _self_norm_kind is not None:
             rk_hint = _self_norm_kind
+        if rk_hint is None and a.arg in defaults_map and (not is_none(defaults_map[a.arg])):
+            _dk = tr._expr_kind(defaults_map[a.arg])
+            if _dk is not None:
+                rk_hint = _dk
+        elif rk_hint in {"int", "real"} and a.arg in defaults_map and (not is_none(defaults_map[a.arg])):
+            _dk = tr._expr_kind(defaults_map[a.arg])
+            if _dk in {"char", "logical", "complex"}:
+                rk_hint = _dk
         if rk_hint is None:
             if _arg_used_in_numeric_arith(a.arg) and (not _arg_used_as_index_or_range(a.arg)):
                 rk_hint = "real"
@@ -21847,6 +22262,7 @@ def _emit_local_function(
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
                 rr = max(rr, int(local_func_arg_ranks[fn.name][idx]))
         if rr > 0:
+            inferred_array_arg_specs[a.arg] = (rk_hint, rr)
             if rk_hint == "int":
                 tr._mark_alloc_int(a.arg, rank=rr)
             elif rk_hint == "logical":
@@ -21870,6 +22286,19 @@ def _emit_local_function(
                 tr._mark_char(a.arg)
 
     tr.prescan(fn.body)
+    for _an, (_ak, _rr) in inferred_array_arg_specs.items():
+        if int(_rr) <= 0:
+            continue
+        if _ak == "int":
+            tr._mark_alloc_int(_an, rank=int(_rr))
+        elif _ak == "logical":
+            tr._mark_alloc_log(_an, rank=int(_rr))
+        elif _ak == "complex":
+            tr._mark_alloc_complex(_an, rank=int(_rr))
+        elif _ak == "char":
+            tr._mark_alloc_char(_an, rank=int(_rr))
+        else:
+            tr._mark_alloc_real(_an, rank=int(_rr))
     # Ensure overload-forced dummy kinds/ranks survive body prescan heuristics.
     if force_arg_kinds:
         for _an, _ak in force_arg_kinds.items():
@@ -22904,6 +23333,17 @@ def _emit_local_function(
                     and n.args[0].id == nm
                 ):
                     rr = max(rr, 1)
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and is_numpy_name_node(n.func.value)
+                    and n.func.attr in {"column_stack", "stack", "concatenate", "hstack", "vstack"}
+                    and len(n.args) >= 1
+                    and isinstance(n.args[0], (ast.Tuple, ast.List))
+                ):
+                    for _e in n.args[0].elts:
+                        if isinstance(_e, ast.Name) and _e.id == nm:
+                            rr = max(rr, 1)
         return rr
 
     def _arg_is_assigned(nm):
@@ -23119,6 +23559,14 @@ def _emit_local_function(
         _self_norm_kind = _arg_self_normalized_kind(arg)
         if _self_norm_kind is not None:
             hint_kind = _self_norm_kind
+        if hint_kind is None and arg in defaults_map and (not is_none(defaults_map[arg])):
+            _dk = tr._expr_kind(defaults_map[arg])
+            if _dk is not None:
+                hint_kind = _dk
+        elif hint_kind in {"int", "real"} and arg in defaults_map and (not is_none(defaults_map[arg])):
+            _dk = tr._expr_kind(defaults_map[arg])
+            if _dk in {"char", "logical", "complex"}:
+                hint_kind = _dk
         if _self_norm_kind is None and _arg_used_as_index_or_range(arg):
             hint_kind = "int"
             if (
@@ -24252,7 +24700,30 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
             rr_spec = 0
             if isinstance(r0, ast.Name):
                 nm = r0.id
-                if _is_scalar_shape_ctor_name_local(nm):
+                lk_local, lr_local = _infer_local_name_spec(fn, nm, tr)
+                if lr_local > 0:
+                    if lk_local == "int":
+                        spec = "alloc_int"
+                    elif lk_local == "logical":
+                        spec = "alloc_log"
+                    elif lk_local == "complex":
+                        spec = "alloc_complex"
+                    elif lk_local == "char":
+                        spec = "alloc_char"
+                    else:
+                        spec = "alloc_real"
+                    rr_spec = int(lr_local)
+                elif lk_local == "real":
+                    spec = "real"
+                elif lk_local == "logical":
+                    spec = "logical"
+                elif lk_local == "complex":
+                    spec = "complex"
+                elif lk_local == "char":
+                    spec = "char"
+                elif lk_local == "int":
+                    spec = "int"
+                elif _is_scalar_shape_ctor_name_local(nm):
                     spec = "alloc_real"
                     rr_spec = 1
                 elif nm in tr.alloc_reals:
@@ -24306,12 +24777,22 @@ def _local_return_maps(local_funcs, params, arg_rank_hints=None, arg_kind_hints=
                         spec = "alloc_int"
                     elif k == "logical":
                         spec = "alloc_log"
+                    elif k == "complex":
+                        spec = "alloc_complex"
+                    elif k == "char":
+                        spec = "alloc_char"
                     rr_spec = rr
                 else:
                     if k == "real":
                         spec = "real"
                     elif k == "int":
                         spec = "int"
+                    elif k == "logical":
+                        spec = "logical"
+                    elif k == "complex":
+                        spec = "complex"
+                    elif k == "char":
+                        spec = "char"
             if spec is None:
                 continue
             if scalar_or_array.get(fn.name) != spec or int(scalar_or_array_ranks.get(fn.name, 0)) != int(rr_spec):
@@ -25052,7 +25533,15 @@ def generate_flat(
     dict_type_components = {}
     known_key_kinds = {}
     for fn in (local_funcs or []):
-        spec = _analyze_dict_return_spec(fn, params, known_key_kinds=known_key_kinds)
+        spec = _analyze_dict_return_spec(
+            fn,
+            params,
+            known_key_kinds=known_key_kinds,
+            local_return_specs=local_return_specs,
+            local_return_ranks=local_return_ranks,
+            tuple_return_out_kinds=tuple_return_out_kinds,
+            tuple_return_out_ranks=tuple_return_out_ranks,
+        )
         if spec is not None:
             dict_return_specs[fn.name] = spec
             dict_return_types[fn.name] = spec["type_name"]

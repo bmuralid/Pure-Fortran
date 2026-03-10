@@ -88,7 +88,13 @@ public :: arange_int !@pyapi kind=function ret=integer(:) args=start:integer:int
 public :: logspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional,base:real(dp):intent(in):optional desc="logspace(start, stop, num=50, endpoint=True, base=10)"
 public :: geomspace !@pyapi kind=function ret=real(dp)(:) args=start:real(dp):intent(in),stop:real(dp):intent(in),num:integer:intent(in):optional,endpoint:logical:intent(in):optional desc="geomspace(start, stop, num=50, endpoint=True)"
 public :: mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="mean of 1D real vector"
+public :: weighted_mean_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),w:real(dp)(:):intent(in) desc="weighted mean of 1D real vector"
 public :: var_1d !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in),ddof:integer:intent(in):optional desc="variance of 1D real vector with optional ddof (numpy-style)"
+public :: median_1d_real !@pyapi kind=function ret=real(dp) args=x:real(dp)(:):intent(in) desc="median of 1D real vector"
+public :: median_low_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="median_low of 1D integer vector"
+public :: median_high_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="median_high of 1D integer vector"
+public :: mode_int !@pyapi kind=function ret=integer args=x:integer(:):intent(in) desc="mode of 1D integer vector"
+public :: multimode_int !@pyapi kind=function ret=integer(:) args=x:integer(:):intent(in) desc="multimode of 1D integer vector"
 public :: zeros_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 0"
 public :: ones_real !@pyapi kind=function ret=real(dp)(:) args=n:integer:intent(in) desc="allocate and return length-n real array initialized to 1"
 public :: zeros_int !@pyapi kind=function ret=integer(:) args=n:integer:intent(in) desc="allocate and return length-n integer array initialized to 0"
@@ -118,6 +124,7 @@ public :: str_split !@pyapi kind=function ret=type(strvec_t) args=s:character:in
 public :: str_join !@pyapi kind=function ret=character args=sep:character:intent(in),items:type(strvec_t):intent(in) desc="join string vector with separator"
 public :: str_count !@pyapi kind=function ret=integer args=s:character:intent(in),sub:character:intent(in) desc="count non-overlapping occurrences"
 public :: csv_split_line !@pyapi kind=function ret=character(:) args=line:character:intent(in),delimiter:character:intent(in):optional,quotechar:character:intent(in):optional desc="split one CSV line into fields (basic quote-aware parser)"
+public :: file_read !@pyapi kind=function ret=character args=u:integer:intent(in) desc="read remaining text from open unit as a single string"
 public :: str_isdigit !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are digits"
 public :: str_isalpha !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are letters"
 public :: str_isalnum !@pyapi kind=function ret=logical args=s:character:intent(in) desc="true when all chars are alnum"
@@ -184,6 +191,7 @@ public :: reduceat_logical_or !@pyapi kind=function ret=logical(:) args=x:logica
 public :: cumprod_real !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="cumulative product of real vector"
 public :: gradient_1d !@pyapi kind=function ret=real(dp)(:) args=x:real(dp)(:):intent(in) desc="1D gradient with unit spacing (numpy-style edge handling)"
 public :: linalg_solve !@pyapi kind=function ret=real(dp)(:) args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in) desc="solve linear system A x = b using LAPACK DGESV"
+public :: linalg_solve_safe !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),b:real(dp)(:):intent(in),x:real(dp)(:):intent(out),ok:logical:intent(out) desc="solve linear system A x = b using LAPACK DGESV and return success status"
 public :: linalg_cholesky !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="lower-triangular Cholesky factor using LAPACK DPOTRF"
 public :: linalg_det !@pyapi kind=function ret=real(dp) args=a:real(dp)(:,:):intent(in) desc="determinant of square matrix using LAPACK DGETRF"
 public :: linalg_inv !@pyapi kind=function ret=real(dp)(:,:) args=a:real(dp)(:,:):intent(in) desc="matrix inverse using LAPACK DGETRF/DGETRI"
@@ -218,6 +226,7 @@ public :: print_matrix !@pyapi kind=subroutine args=a:real(dp)(:,:):intent(in),l
 public :: polyval_real_scalar !@pyapi kind=function ret=real(dp) args=p:real(dp)(:):intent(in),x:real(dp):intent(in) desc="evaluate polynomial with descending coefficients at scalar x"
 public :: polyval_real_vec !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),x:real(dp)(:):intent(in) desc="evaluate polynomial with descending coefficients at vector x"
 public :: polyder_real !@pyapi kind=function ret=real(dp)(:) args=p:real(dp)(:):intent(in),m:integer:intent(in):optional desc="m-th derivative coefficients for descending-order polynomial"
+public :: polyroots_real !@pyapi kind=function ret=complex(dp)(:) args=p:real(dp)(:):intent(in) desc="roots of real-coefficient polynomial (descending order) via LAPACK DGEEV"
 public :: fft_fft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like fft for 1D real/complex input (naive DFT backend)"
 public :: fft_ifft !@pyapi kind=function ret=complex(dp)(:) args=x:complex(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like ifft for 1D complex input (naive DFT backend)"
 public :: fft_rfft !@pyapi kind=function ret=complex(dp)(:) args=x:real(dp)(:):intent(in),n:integer:intent(in):optional desc="numpy-like rfft for 1D real input"
@@ -344,6 +353,10 @@ end interface py_str
 interface linalg_solve
    module procedure linalg_solve_vec, linalg_solve_mat
 end interface linalg_solve
+
+interface linalg_solve_safe
+   module procedure linalg_solve_safe_vec
+end interface linalg_solve_safe
 
 interface optval
    module procedure optval_int
@@ -2802,6 +2815,24 @@ contains
          end if
       end function mean_1d
 
+      pure real(kind=dp) function weighted_mean_1d(x, w)
+         real(kind=dp), intent(in) :: x(:), w(:)
+         integer :: n
+         real(kind=dp) :: sw
+
+         n = min(size(x), size(w))
+         if (n <= 0) then
+            weighted_mean_1d = 0.0_dp
+            return
+         end if
+         sw = sum(w(1:n))
+         if (sw == 0.0_dp) then
+            weighted_mean_1d = 0.0_dp
+         else
+            weighted_mean_1d = sum(x(1:n) * w(1:n)) / sw
+         end if
+      end function weighted_mean_1d
+
       pure real(kind=dp) function var_1d(x, ddof)
          real(kind=dp), intent(in) :: x(:)
          integer, intent(in), optional :: ddof
@@ -2820,6 +2851,110 @@ contains
          mu = mean_1d(x)
          var_1d = sum((x - mu)**2) / real(n - d, kind=dp)
       end function var_1d
+
+      function median_1d_real(x) result(m)
+         real(kind=dp), intent(in) :: x(:)
+         real(kind=dp) :: m
+         real(kind=dp), allocatable :: xs(:)
+         integer :: n
+
+         n = size(x)
+         if (n <= 0) then
+            m = 0.0_dp
+            return
+         end if
+         allocate(xs(n))
+         xs = x
+         call sort_real_vec(xs)
+         if (mod(n, 2) == 1) then
+            m = xs((n + 1) / 2)
+         else
+            m = 0.5_dp * (xs(n / 2) + xs(n / 2 + 1))
+         end if
+      end function median_1d_real
+
+      function median_low_int(x) result(m)
+         integer, intent(in) :: x(:)
+         integer :: m
+         integer, allocatable :: xs(:)
+         integer :: n
+
+         n = size(x)
+         if (n <= 0) then
+            m = 0
+            return
+         end if
+         allocate(xs(n))
+         xs = x
+         call sort_int_vec(xs)
+         if (mod(n, 2) == 1) then
+            m = xs((n + 1) / 2)
+         else
+            m = xs(n / 2)
+         end if
+      end function median_low_int
+
+      function median_high_int(x) result(m)
+         integer, intent(in) :: x(:)
+         integer :: m
+         integer, allocatable :: xs(:)
+         integer :: n
+
+         n = size(x)
+         if (n <= 0) then
+            m = 0
+            return
+         end if
+         allocate(xs(n))
+         xs = x
+         call sort_int_vec(xs)
+         m = xs(n / 2 + 1)
+      end function median_high_int
+
+      function mode_int(x) result(m)
+         integer, intent(in) :: x(:)
+         integer :: m
+         integer, allocatable :: u(:), cnt(:)
+         integer :: i, best_i, best_c
+
+         if (size(x) <= 0) then
+            m = 0
+            return
+         end if
+         call unique_int_counts(x, u, cnt)
+         if (size(u) <= 0) then
+            m = 0
+            return
+         end if
+         best_i = 1
+         best_c = cnt(1)
+         do i = 2, size(cnt)
+            if (cnt(i) > best_c) then
+               best_c = cnt(i)
+               best_i = i
+            end if
+         end do
+         m = u(best_i)
+      end function mode_int
+
+      function multimode_int(x) result(mm)
+         integer, intent(in) :: x(:)
+         integer, allocatable :: mm(:)
+         integer, allocatable :: u(:), cnt(:)
+         integer :: maxc
+
+         if (size(x) <= 0) then
+            allocate(mm(0))
+            return
+         end if
+         call unique_int_counts(x, u, cnt)
+         if (size(u) <= 0) then
+            allocate(mm(0))
+            return
+         end if
+         maxc = maxval(cnt)
+         mm = pack(u, cnt == maxc)
+      end function multimode_int
 
       function zeros_real(n) result(x)
          integer, intent(in) :: n
@@ -3776,6 +3911,37 @@ contains
          x = bc(:,1)
       end function linalg_solve_vec
 
+      subroutine linalg_solve_safe_vec(a, b, x, ok)
+         real(kind=dp), intent(in) :: a(:,:), b(:)
+         real(kind=dp), allocatable, intent(out) :: x(:)
+         logical, intent(out) :: ok
+         real(kind=dp), allocatable :: ac(:,:), bc(:,:)
+         integer, allocatable :: ipiv(:)
+         integer :: n, info
+         interface
+            subroutine dgesv(n, nrhs, a, lda, ipiv, b, ldb, info)
+               integer, intent(in) :: n, nrhs, lda, ldb
+               integer, intent(out) :: ipiv(*), info
+               double precision, intent(inout) :: a(lda,*), b(ldb,*)
+            end subroutine dgesv
+         end interface
+         n = size(a, 1)
+         allocate(ac(1:n,1:n), source=a)
+         allocate(bc(1:n,1), source=0.0_dp)
+         bc(:,1) = b
+         allocate(ipiv(1:n))
+         call dgesv(n, 1, ac, n, ipiv, bc, n, info)
+         if (info /= 0) then
+            allocate(x(1:size(b)))
+            x = 0.0_dp
+            ok = .false.
+            return
+         end if
+         allocate(x(1:n))
+         x = bc(:,1)
+         ok = .true.
+      end subroutine linalg_solve_safe_vec
+
       function linalg_solve_mat(a, b) result(x)
          real(kind=dp), intent(in) :: a(:,:), b(:,:)
          real(kind=dp), allocatable :: x(:,:)
@@ -4690,6 +4856,52 @@ contains
          dpcoef = cur
       end function polyder_real
 
+      function polyroots_real(p) result(r)
+         real(kind=dp), intent(in) :: p(:)
+         complex(kind=dp), allocatable :: r(:)
+         real(kind=dp), allocatable :: ac(:,:), wr(:), wi(:), work(:), vl_dummy(:,:), vr_dummy(:,:)
+         integer :: n, i, info, lwork
+         interface
+            subroutine dgeev(jobvl, jobvr, n, a, lda, wr, wi, vl, ldvl, vr, ldvr, work, lwork, info)
+               character(len=1), intent(in) :: jobvl, jobvr
+               integer, intent(in) :: n, lda, ldvl, ldvr, lwork
+               integer, intent(out) :: info
+               double precision, intent(inout) :: a(lda,*)
+               double precision, intent(out) :: wr(*), wi(*), vl(ldvl,*), vr(ldvr,*), work(*)
+            end subroutine dgeev
+         end interface
+
+         n = size(p) - 1
+         if (n <= 0) then
+            allocate(r(0))
+            return
+         end if
+         if (abs(p(1)) <= tiny(1.0_dp)) stop "polyroots_real: leading coefficient must be nonzero"
+
+         allocate(ac(n, n), source=0.0_dp)
+         ac(1, :) = -p(2:n + 1) / p(1)
+         do i = 2, n
+            ac(i, i - 1) = 1.0_dp
+         end do
+
+         allocate(wr(n), wi(n))
+         allocate(vl_dummy(1, 1), vr_dummy(1, 1))
+         allocate(work(1))
+         lwork = -1
+         call dgeev('N', 'N', n, ac, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
+         if (info /= 0) stop "polyroots_real: dgeev workspace query failed"
+         lwork = max(1, int(work(1)))
+         deallocate(work)
+         allocate(work(lwork))
+         call dgeev('N', 'N', n, ac, n, wr, wi, vl_dummy, 1, vr_dummy, 1, work, lwork, info)
+         if (info /= 0) stop "polyroots_real: dgeev failed"
+
+         allocate(r(n))
+         do i = 1, n
+            r(i) = cmplx(wr(i), wi(i), kind=dp)
+         end do
+      end function polyroots_real
+
       pure logical function fft_is_power_of_two(n)
          integer, intent(in) :: n
          fft_is_power_of_two = n > 0 .and. iand(n, n - 1) == 0
@@ -5075,6 +5287,25 @@ contains
             end do
          end do
       end function itertools_permutations_int
+
+
+      function file_read(u) result(s)
+         integer, intent(in) :: u
+         character(len=:), allocatable :: s
+         character(len=4096) :: line
+         integer :: ios
+
+         s = ""
+         do
+            read(u, "(A)", iostat=ios) line
+            if (ios /= 0) exit
+            if (len(s) == 0) then
+               s = trim(line)
+            else
+               s = s // new_line("a") // trim(line)
+            end if
+         end do
+      end function file_read
 
 
       pure function py_float(s) result(x)
