@@ -500,7 +500,10 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
 
     Delegates to shared scan-time logic so rewrite behavior stays centralized.
     """
-    out = fscan.simplify_redundant_parens_in_lines(lines)
+    # Keep this pass semantics-safe for generated numeric kernels.
+    # The broad scan-time simplifier can over-rewrite multiplicative/additive
+    # groupings in some formulas; do local targeted simplifications below.
+    out = list(lines)
 
     def _split_top_level_add_ops(expr: str):
         def _is_exp_sign(pos: int) -> bool:
@@ -682,10 +685,21 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
                 inner = s[lpos + 1 : rpos].strip()
                 if not inner:
                     continue
-                prev = s[lpos - 1] if lpos > 0 else ""
-                next_ch = s[rpos + 1] if rpos + 1 < len(s) else ""
+                before = s[:lpos].rstrip()
+                after = s[rpos + 1 :].lstrip()
+                prev = before[-1] if before else ""
+                next_ch = after[0] if after else ""
+                # Keep required grouping after logical NOT:
+                #   .not. (a /= 0)
+                # must not become
+                #   .not. a /= 0
+                if before.lower().endswith(".not."):
+                    continue
                 # likely call/index context: name(...), arr(...), dt%comp(...)
                 if prev.isalnum() or prev in "_%)]":
+                    continue
+                # Keep denominator grouping: a / (b*c) must not become a / b*c.
+                if (("*" in inner) or ("/" in inner)) and (prev == "/" or next_ch == "/"):
                     continue
                 # likely intrinsic operator call style with no separator
                 if next_ch and (next_ch.isalnum() or next_ch == "_"):
@@ -809,6 +823,17 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
 
         return _sub_outside_quotes(expr)
 
+    def _rewrite_exp_linear_times_same(expr: str) -> str:
+        # Fix unsafe shape-changing simplifications that can turn:
+        #   exp(-0.5_dp * x * x)  -> exp(-0.5_dp * x) * x
+        # back into the intended Gaussian form, conservatively.
+        atom = r"[A-Za-z_][A-Za-z0-9_]*(?:%[A-Za-z_][A-Za-z0-9_]*)*"
+        pat = re.compile(
+            rf"exp\(\s*(?P<c>-\s*0\.5(?:_dp)?)\s*\*\s*(?P<v>{atom})\s*\)\s*\*\s*(?P=v)\b",
+            re.IGNORECASE,
+        )
+        return pat.sub(lambda m: f"exp({m.group('c')} * {m.group('v')}**2)", expr)
+
     cleaned: List[str] = []
     for ln in out:
         code, comment = xunused.split_code_comment(ln.rstrip("\r\n"))
@@ -818,15 +843,8 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
             lhs = m_asn.group(1)
             rhs = m_asn.group(2).rstrip()
             rhs = fscan.strip_redundant_outer_parens_expr(rhs)
-            rhs = _strip_simple_parenthesized_sections(rhs)
             rhs = _rewrite_safe_mul_self_to_pow2(rhs)
-            terms, ops = _split_top_level_add_ops(rhs)
-            if len(terms) > 1:
-                terms = [fscan.strip_redundant_outer_parens_expr(t) for t in terms]
-                rhs2 = terms[0]
-                for op, t in zip(ops, terms[1:]):
-                    rhs2 += f" {op} {t}"
-                rhs = rhs2
+            rhs = _rewrite_exp_linear_times_same(rhs)
             code = lhs + rhs
         else:
             # Also simplify redundant parentheses inside IF conditions.
@@ -836,15 +854,7 @@ def simplify_redundant_parentheses(lines: List[str]) -> List[str]:
                 cond = m_if.group(2).rstrip()
                 post = m_if.group(3)
                 cond = fscan.strip_redundant_outer_parens_expr(cond)
-                cond = _strip_simple_parenthesized_sections(cond)
                 cond = _rewrite_safe_mul_self_to_pow2(cond)
-                terms, ops = _split_top_level_add_ops(cond)
-                if len(terms) > 1:
-                    terms = [fscan.strip_redundant_outer_parens_expr(t) for t in terms]
-                    cond2 = terms[0]
-                    for op, t in zip(ops, terms[1:]):
-                        cond2 += f" {op} {t}"
-                    cond = cond2
                 rel = _split_top_level_relop(cond)
                 if rel is not None:
                     lhs_rel, op_rel, rhs_rel = rel
