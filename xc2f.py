@@ -73,6 +73,20 @@ DEFAULT_GFORTRAN_FLAGS = [
 ]
 
 
+def _xc2f_added_comment(text: str) -> str:
+    """Return a machine-detectable xc2f-generated comment line."""
+    return f"! added by xc2f.py: {text}"
+
+
+def _prepend_origin_comment(fsrc: str, sources: List[Path]) -> str:
+    """Add a source-origin comment at the top of generated Fortran."""
+    names = ", ".join(p.name for p in sources)
+    header = f"! created by xc2f.py from {names}\n"
+    if fsrc.startswith(header):
+        return fsrc
+    return header + fsrc
+
+
 @dataclass
 class VarInfo:
     ftype: str
@@ -500,6 +514,14 @@ class Emitter:
         # changes (for example: ss/(n-1) must not become ss/n-1).
         return expr.strip()
 
+    def cond_expr(self, n: c_ast.Node) -> str:
+        """Lower a C condition to a scalar Fortran logical expression."""
+        if isinstance(n, c_ast.BinaryOp) and n.op in {"&&", "||", "==", "!=", "<", "<=", ">", ">="}:
+            return self.simp(self.expr(n))
+        if isinstance(n, c_ast.UnaryOp) and n.op == "!":
+            return self.simp(self.expr(n))
+        return self.simp(f"({self.expr(n)} /= 0)")
+
     def _is_pointer_like_id(self, n: c_ast.Node) -> bool:
         return isinstance(n, c_ast.ID) and n.name.lower() in self.pointer_like_names
 
@@ -694,12 +716,12 @@ class Emitter:
     def emit_printf(self, fc: c_ast.FuncCall) -> bool:
         args = fc.args.exprs if fc.args is not None else []
         if not args:
-            self.emit("! approximated printf format by xc2f.py")
+            self.emit(_xc2f_added_comment("approximated printf format"))
             self.emit("write(*,*)")
             return True
         fmt_node = args[0]
         if not isinstance(fmt_node, c_ast.Constant) or fmt_node.type != "string":
-            self.emit("! approximated printf format by xc2f.py")
+            self.emit(_xc2f_added_comment("approximated printf format"))
             self.emit(f"write(*,*) {', '.join(self.expr(a) for a in args)}")
             return True
         fmt = fmt_node.value.strip('"')
@@ -720,7 +742,7 @@ class Emitter:
             self.emit(f'write(*,\'("min=",g0," max=",g0)\') {self.expr(vals[0])}, {self.expr(vals[1])}')
             return True
         # Fallback for unsupported formats: preserve data output list-directed.
-        self.emit(f'! approximated printf format by xc2f.py: "{fmt}"')
+        self.emit(_xc2f_added_comment(f'approximated printf format: "{fmt}"'))
         if vals:
             self.emit(f"write(*,*) {', '.join(self.expr(v) for v in vals)}")
         else:
@@ -746,6 +768,31 @@ class Emitter:
         for n, info in items:
             self.emit_decl(n, info, params=params, ret_name=ret_name)
 
+    def _emit_for_init(self, init: Optional[c_ast.Node]) -> None:
+        """Emit the initialization part of a C for-loop as standalone statements."""
+        if init is None:
+            return
+        if isinstance(init, c_ast.Assignment):
+            self.emit_assignment(init)
+            return
+        if isinstance(init, c_ast.DeclList):
+            for decl in init.decls or []:
+                if isinstance(decl, c_ast.Decl) and decl.init is not None:
+                    self.emit(f"{decl.name} = {self.expr(decl.init)}")
+            return
+        raise NotImplementedError("Unsupported for init")
+
+    def _stmt_contains_continue(self, node: Optional[c_ast.Node]) -> bool:
+        """Return True when subtree contains a C continue statement."""
+        if node is None:
+            return False
+        if isinstance(node, c_ast.Continue):
+            return True
+        for _name, child in node.children():
+            if isinstance(child, c_ast.Node) and self._stmt_contains_continue(child):
+                return True
+        return False
+
     def emit_for(self, st: c_ast.For) -> None:
         # Infinite loop: for(;;) { ... }
         if st.init is None and st.cond is None and st.next is None:
@@ -756,8 +803,6 @@ class Emitter:
             self.emit("end do")
             return
 
-        if not isinstance(st.cond, c_ast.BinaryOp):
-            raise NotImplementedError("Only simple for cond supported")
         if isinstance(st.init, c_ast.Assignment):
             var = self.expr(st.init.lvalue)
             lb = self.expr(st.init.rvalue)
@@ -770,19 +815,46 @@ class Emitter:
 
         var_l = var.strip().lower()
 
-        # Normalize C loop condition so either `i < ub` or reversed `lb <= i` work.
-        cond_op = st.cond.op
-        if isinstance(st.cond.left, c_ast.ID) and self.expr(st.cond.left).strip().lower() == var_l:
-            bound_expr = self.expr(st.cond.right)
-        elif isinstance(st.cond.right, c_ast.ID) and self.expr(st.cond.right).strip().lower() == var_l:
-            bound_expr = self.expr(st.cond.left)
-            invert = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
-            if cond_op in invert:
-                cond_op = invert[cond_op]
-            else:
-                raise NotImplementedError("Unsupported for condition operator")
-        else:
-            raise NotImplementedError("Only simple for cond supported")
+        simple_cond = False
+        cond_op = ""
+        bound_expr = ""
+        if isinstance(st.cond, c_ast.BinaryOp):
+            # Normalize C loop condition so either `i < ub` or reversed `lb <= i` work.
+            cond_op = st.cond.op
+            if isinstance(st.cond.left, c_ast.ID) and self.expr(st.cond.left).strip().lower() == var_l:
+                bound_expr = self.expr(st.cond.right)
+                simple_cond = True
+            elif isinstance(st.cond.right, c_ast.ID) and self.expr(st.cond.right).strip().lower() == var_l:
+                bound_expr = self.expr(st.cond.left)
+                invert = {"<": ">", "<=": ">=", ">": "<", ">=": "<="}
+                if cond_op in invert:
+                    cond_op = invert[cond_op]
+                    simple_cond = True
+                else:
+                    raise NotImplementedError("Unsupported for condition operator")
+
+        if not simple_cond:
+            if st.cond is None:
+                self._emit_for_init(st.init)
+                self.emit("do")
+                self.indent += 3
+                self.emit_stmt(st.stmt)
+                if st.next is not None:
+                    self.emit_stmt(st.next)
+                self.indent -= 3
+                self.emit("end do")
+                return
+            if self._stmt_contains_continue(st.stmt):
+                raise NotImplementedError("Only simple for cond supported")
+            self._emit_for_init(st.init)
+            self.emit(f"do while ({self.cond_expr(st.cond)})")
+            self.indent += 3
+            self.emit_stmt(st.stmt)
+            if st.next is not None:
+                self.emit_stmt(st.next)
+            self.indent -= 3
+            self.emit("end do")
+            return
 
         ub = bound_expr
         step = None
@@ -1004,7 +1076,7 @@ class Emitter:
         lhs_f, op_f, val_f = f_upd
         if lhs_t != lhs_f or op_t != op_f:
             return False
-        cond = self.simp(self.expr(st.cond))
+        cond = self.cond_expr(st.cond)
         self.emit(f"{lhs_t} = {lhs_t} {op_t} merge({val_t}, {val_f}, {cond})")
         return True
 
@@ -1035,7 +1107,7 @@ class Emitter:
             return
         if self._emit_if_as_merge_update(st):
             return
-        self.emit(f"if ({self.simp(self.expr(st.cond))}) then")
+        self.emit(f"if ({self.cond_expr(st.cond)}) then")
         self.indent += 3
         self.emit_stmt(st.iftrue, ret_name=ret_name, array_result_name=array_result_name)
         self.indent -= 3
@@ -1058,9 +1130,9 @@ class Emitter:
         if coord is not None and getattr(coord, "line", None):
             src_line = int(coord.line) - self.line_offset
             if src_line >= 1:
-                # Avoid importing unrelated inter-procedural comments from C
-                # statement coordinates; keep documentation at procedure level.
-                self.comment_cursor = max(self.comment_cursor, src_line + 1)
+                # Carry over only the nearest local comment cluster for this
+                # statement to avoid pulling unrelated comments from earlier code.
+                self.emit_leading_comments_before(src_line, window=2)
         if isinstance(st, c_ast.Compound):
             for b in st.block_items or []:
                 self.emit_stmt(b, ret_name=ret_name, array_result_name=array_result_name)
@@ -1162,7 +1234,7 @@ class Emitter:
                 self.indent -= 3
                 self.emit("end block")
                 return
-            self.emit(f"do while ({self.simp(self.expr(st.cond))})")
+            self.emit(f"do while ({self.cond_expr(st.cond)})")
             self.indent += 3
             self.emit_stmt(st.stmt, ret_name=ret_name, array_result_name=array_result_name)
             self.indent -= 3
@@ -1691,8 +1763,13 @@ def transpile_c_to_fortran(text: str, *, refactor: bool = False, raw: bool = Fal
     lines = fpost.hoist_repeated_open_file_literals(lines)
     lines = apply_dead_store_cleanup(lines)
     lines = fscan.prune_unused_use_only_lines(lines)
+    lines = fpost.hoist_module_use_only_imports(lines)
     lines = fscan.avoid_reserved_identifier_definitions(lines)
     lines = fpost.simplify_redundant_parentheses(lines)
+    lines = fpost.tighten_unary_minus_literal_spacing(lines)
+    lines = fpost.normalize_delimiter_inner_spacing(lines)
+    lines = fpost.simplify_norm2_patterns(lines)
+    lines = fpost.simplify_bfgs_rank1_update(lines)
     lines = fscan.simplify_integer_arithmetic_in_lines(lines)
     lines = fpost.collapse_single_stmt_if_blocks(lines)
     lines = fpost.simplify_do_while_true(lines)
@@ -1732,8 +1809,15 @@ def transpile_c_to_fortran(text: str, *, refactor: bool = False, raw: bool = Fal
         out_text = "".join(fpost.remove_unused_local_declarations(out_text.splitlines(keepends=True)))
     out_text = "".join(fscan.prune_unused_use_only_lines(out_text.splitlines(keepends=True)))
     out_text = "".join(fpost.simplify_redundant_parentheses(out_text.splitlines(keepends=True)))
+    out_text = "".join(fpost.tighten_unary_minus_literal_spacing(out_text.splitlines(keepends=True)))
+    out_text = "".join(fpost.normalize_delimiter_inner_spacing(out_text.splitlines(keepends=True)))
+    out_text = "".join(fpost.simplify_bfgs_rank1_update(out_text.splitlines(keepends=True)))
     out_text = "".join(fscan.simplify_do_bounds_parens(out_text.splitlines(keepends=True)))
+    out_text = "".join(fpost.rewrite_named_arguments(out_text.splitlines(keepends=True)))
+    out_text = "".join(fpost.wrap_long_lines(out_text.splitlines(keepends=True), max_len=80))
+    out_text = "".join(fpost.apply_xindent_defaults(out_text.splitlines(keepends=True), max_len=80))
     out_text = "".join(fpost.ensure_blank_line_between_module_procedures(out_text.splitlines(keepends=True)))
+    out_text = "".join(fpost.ensure_blank_line_between_program_units(out_text.splitlines(keepends=True)))
     out_text = "".join(fscan.ensure_space_before_inline_comments(out_text.splitlines(keepends=True)))
     out_text = _normalize_kind_intrinsic_literals(out_text)
     return out_text
@@ -2071,6 +2155,17 @@ def _detect_c_real_precision(src_no_comments: str) -> str:
 def _normalize_kind_intrinsic_literals(text: str) -> str:
     """Keep `kind(1.0)` / `kind(1.0d0)` free of `_dp` suffixes."""
     return re.sub(r"(?i)\bkind\s*\(\s*([0-9]+(?:\.[0-9]*)?(?:[ed][+\-]?[0-9]+)?)_(?:dp|sp)\s*\)", r"kind(\1)", text)
+
+
+def _format_transpile_error(exc: Exception) -> str:
+    """Return a concise one-line transpile failure description."""
+    msg = str(exc).strip()
+    name = exc.__class__.__name__
+    if not msg:
+        return name
+    if msg.startswith(f"{name}:"):
+        return msg
+    return f"{name}: {msg}"
 
 
 def collapse_int_array_write_implied_do(lines: List[str]) -> List[str]:
@@ -2661,6 +2756,8 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--out-dir", type=Path, default=None, help="Output directory for --mode each")
     ap.add_argument("--tee", action="store_true", help="Print generated Fortran")
+    ap.add_argument("--tee-orig", action="store_true", help="Print original C source")
+    ap.add_argument("--tee-both", action="store_true", help="Print original C source and generated Fortran")
     ap.add_argument("--raw", action="store_true", help="Emit raw transpilation output (skip optional post-processing)")
     ap.add_argument("--refactor", action="store_true", help="Extract long main-program blocks into module procedures")
     ap.add_argument("--array", action="store_true", help="Post-process generated Fortran with xarray.py")
@@ -2701,6 +2798,9 @@ def main() -> int:
         args.array = False
         args.array_inline = False
         args.inline_temp = False
+    if args.tee_both:
+        args.tee_orig = True
+        args.tee = True
     if args.run_diff or args.time_both:
         args.run_both = True
     if args.run_both:
@@ -2750,10 +2850,17 @@ def main() -> int:
     if args.mode == "combined":
         texts = [p.read_text(encoding="utf-8", errors="ignore") for p in args.c_files]
         text = "\n\n".join(texts)
-        fsrc = _transpile_text(text)
+        try:
+            fsrc = _transpile_text(text)
+        except Exception as exc:
+            print(f"Transpile: FAIL ({_format_transpile_error(exc)})")
+            return 1
+        fsrc = _prepend_origin_comment(fsrc, args.c_files)
         out_path = args.out if args.out is not None else Path("temp.f90")
         out_path.write_text(fsrc, encoding="utf-8")
         print(f"Wrote {out_path}")
+        if args.tee_orig:
+            print(text, end="" if text.endswith("\n") else "\n")
         if args.tee:
             print(fsrc, end="")
         orig_ok = False
@@ -2824,7 +2931,12 @@ def main() -> int:
     fail_count = 0
     for c_file in args.c_files:
         text = c_file.read_text(encoding="utf-8", errors="ignore")
-        fsrc = _transpile_text(text)
+        try:
+            fsrc = _transpile_text(text)
+        except Exception as exc:
+            print(f"Transpile: FAIL ({_format_transpile_error(exc)})")
+            return 1
+        fsrc = _prepend_origin_comment(fsrc, [c_file])
         if args.out_dir is not None:
             out_path = args.out_dir / f"{c_file.stem}.f90"
         elif args.out is not None:
@@ -2835,6 +2947,8 @@ def main() -> int:
             out_path = Path(f"{c_file.stem}.f90")
         out_path.write_text(fsrc, encoding="utf-8")
         print(f"Wrote {out_path}")
+        if args.tee_orig:
+            print(text, end="" if text.endswith("\n") else "\n")
         if args.tee:
             print(fsrc, end="")
         orig_ok = False
