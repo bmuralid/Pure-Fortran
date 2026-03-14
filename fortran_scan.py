@@ -2977,6 +2977,19 @@ def _break_candidates_for_wrap(body: str, start: int, end: int) -> List[int]:
                 if (i > 0 and body[i - 1] == "/") or (i + 1 < len(body) and body[i + 1] == "/"):
                     i += 1
                     continue
+            if ch in "+-":
+                # Never split between exponent marker and signed exponent,
+                # e.g. "1.23e-06_dp" or "1.0D+3".
+                j = i - 1
+                while j >= 0 and body[j].isspace():
+                    j -= 1
+                if j >= 0 and body[j] in "eEdD":
+                    k = j - 1
+                    while k >= 0 and body[k].isspace():
+                        k -= 1
+                    if k >= 0 and (body[k].isdigit() or body[k] == "."):
+                        i += 1
+                        continue
             if ch.isspace() or ch in ",+-*/)=]":
                 out.append(i)
         i += 1
