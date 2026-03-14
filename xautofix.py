@@ -30,6 +30,14 @@ import xformat_mismatch as xfmm
 LOC_RE = re.compile(r"^(.*?):(\d+):(\d+):")
 UNDECL_RE = re.compile(r"Error:\s+Symbol '([A-Za-z_][A-Za-z0-9_]*)'.*has no IMPLICIT type")
 FUNC_IMPLICIT_RE = re.compile(r"Error:\s+Function '([A-Za-z_][A-Za-z0-9_]*)'.*has no IMPLICIT type")
+INDEX_VAR_REDEF_RE = re.compile(
+    r"Error:\s+Index variable '([A-Za-z_][A-Za-z0-9_]*)' redefined.*called from within DO loop",
+    re.IGNORECASE,
+)
+LOOP_VAR_REDEF_RE = re.compile(
+    r"Error:\s+Variable '([A-Za-z_][A-Za-z0-9_]*)'.*cannot be redefined inside loop beginning at",
+    re.IGNORECASE,
+)
 RUNTIME_LOC_RE = re.compile(r"^\s*At line\s+(\d+)\s+of file\s+(.+?)\s+\(unit\s*=", re.IGNORECASE | re.MULTILINE)
 RUNTIME_FMT_MISMATCH_RE = re.compile(
     r"Fortran runtime error:\s+Expected\s+([A-Za-z]+)(?:\s+or\s+[A-Za-z]+)?\s+for item\s+(\d+)\s+in formatted transfer,\s+got\s+([A-Za-z]+)",
@@ -62,6 +70,18 @@ PRINT_MISSING_COMMA_RE = re.compile(r'^(\s*print\s*"[^"]*")\s+([^,].*?)\s*(?:!\s
 IF_NO_THEN_RE = re.compile(r"^(\s*)if\s*\((.+)\)\s*(?:!\s*(.*))?$", re.IGNORECASE)
 PROC_START_RE = re.compile(
     r"^\s*(?:pure\s+|elemental\s+|recursive\s+|impure\s+)*(subroutine|function)\s+[a-z_][a-z0-9_]*\b",
+    re.IGNORECASE,
+)
+PROC_END_RE = re.compile(r"^\s*end\s+(subroutine|function)\b|^\s*end\s*$", re.IGNORECASE)
+UNIT_START_RE = re.compile(
+    r"^\s*(?:program\b|(?:pure\s+|elemental\s+|recursive\s+|impure\s+)*(?:subroutine|function)\b)",
+    re.IGNORECASE,
+)
+UNIT_END_RE = re.compile(r"^\s*end\s+(?:program|subroutine|function)\b|^\s*end\s*$", re.IGNORECASE)
+SPEC_STMT_RE = re.compile(
+    r"^\s*(?:use|import|implicit|integer|real|logical|character|complex|double\s+precision|"
+    r"type\b|class\b|procedure\b|external\b|intrinsic\b|dimension\b|parameter\b|save\b|"
+    r"data\b|common\b|equivalence\b|namelist\b|include\b)",
     re.IGNORECASE,
 )
 
@@ -880,6 +900,241 @@ def _insert_decl_near_implicit_none(path: Path, line_no_1: int, decl: str) -> bo
     return True
 
 
+def _already_declared_in_range(lines: list[str], name: str, lo: int, hi: int) -> bool:
+    pat = re.compile(rf"\b{re.escape(name)}\b", re.IGNORECASE)
+    for i in range(max(0, lo), min(len(lines) - 1, hi) + 1):
+        s = lines[i].split("!", 1)[0]
+        if "::" in s and pat.search(s):
+            return True
+    return False
+
+
+def _find_enclosing_unit_start(lines: list[str], line_idx0: int) -> int | None:
+    stack: list[int] = []
+    for i in range(0, min(line_idx0, len(lines) - 1) + 1):
+        code = lines[i].split("!", 1)[0].strip()
+        if not code:
+            continue
+        if UNIT_END_RE.match(code):
+            if stack:
+                stack.pop()
+            continue
+        if UNIT_START_RE.match(code):
+            stack.append(i)
+    return stack[-1] if stack else None
+
+
+def _find_unit_end(lines: list[str], unit_start: int) -> int:
+    depth = 0
+    for i in range(unit_start, len(lines)):
+        code = lines[i].split("!", 1)[0].strip()
+        if not code:
+            continue
+        if UNIT_START_RE.match(code):
+            depth += 1
+            continue
+        if UNIT_END_RE.match(code):
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(lines) - 1
+
+
+def _find_unit_decl_insert_idx(lines: list[str], unit_start: int, unit_end: int) -> int:
+    insert_idx = unit_start + 1
+    i = unit_start + 1
+    while i <= unit_end:
+        raw = lines[i]
+        stripped = raw.strip()
+        code = raw.split("!", 1)[0]
+        low = code.strip().lower()
+        if not stripped:
+            if insert_idx == i:
+                insert_idx = i + 1
+            i += 1
+            continue
+        if raw.lstrip().startswith("!"):
+            if insert_idx == i:
+                insert_idx = i + 1
+            i += 1
+            continue
+        if low == "contains" or UNIT_END_RE.match(code):
+            return insert_idx
+        if "::" in code or SPEC_STMT_RE.match(code):
+            insert_idx = i + 1
+            i += 1
+            continue
+        return insert_idx
+    return insert_idx
+
+
+def _decl_indent_for_insert(lines: list[str], unit_start: int, insert_idx: int, unit_end: int) -> str:
+    for i in range(insert_idx - 1, unit_start, -1):
+        code = lines[i].split("!", 1)[0]
+        if ("::" in code or SPEC_STMT_RE.match(code)) and code.strip():
+            return re.match(r"^\s*", lines[i]).group(0)
+    for i in range(insert_idx, unit_end + 1):
+        code = lines[i].split("!", 1)[0]
+        if ("::" in code or SPEC_STMT_RE.match(code)) and code.strip():
+            return re.match(r"^\s*", lines[i]).group(0)
+    return re.match(r"^\s*", lines[unit_start]).group(0)
+
+
+def _find_enclosing_proc_start(lines: list[str], line_idx0: int) -> int | None:
+    stack: list[int] = []
+    for i in range(0, min(line_idx0, len(lines) - 1) + 1):
+        code = lines[i].split("!", 1)[0].strip()
+        if not code:
+            continue
+        if PROC_END_RE.match(code):
+            if stack:
+                stack.pop()
+            continue
+        if PROC_START_RE.match(code):
+            stack.append(i)
+    return stack[-1] if stack else None
+
+
+def _find_proc_end(lines: list[str], proc_start: int) -> int:
+    depth = 0
+    for i in range(proc_start, len(lines)):
+        code = lines[i].split("!", 1)[0].strip()
+        if not code:
+            continue
+        if PROC_START_RE.match(code):
+            depth += 1
+            continue
+        if PROC_END_RE.match(code):
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(lines) - 1
+
+
+def _find_proc_decl_insert_idx(lines: list[str], proc_start: int, proc_end: int) -> int:
+    insert_idx = proc_start + 1
+    i = proc_start + 1
+    while i <= proc_end:
+        raw = lines[i]
+        stripped = raw.strip()
+        code = raw.split("!", 1)[0]
+        low = code.strip().lower()
+        if not stripped:
+            if insert_idx == i:
+                insert_idx = i + 1
+            i += 1
+            continue
+        if raw.lstrip().startswith("!"):
+            if insert_idx == i:
+                insert_idx = i + 1
+            i += 1
+            continue
+        if low == "contains" or PROC_END_RE.match(code):
+            return insert_idx
+        if "::" in code or SPEC_STMT_RE.match(code):
+            insert_idx = i + 1
+            i += 1
+            continue
+        return insert_idx
+    return insert_idx
+
+
+def _fresh_name(lines: list[str], seed: str) -> str:
+    text = "\n".join(lines)
+    base = f"{seed}_xautofix"
+    candidate = base
+    suffix = 1
+    while re.search(rf"\b{re.escape(candidate)}\b", text, re.IGNORECASE):
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _has_top_level_implied_do_control(text: str, name: str) -> bool:
+    depth = 0
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth > 0:
+                depth -= 1
+            elif ch == "," and depth == 0:
+                tail = text[i + 1 :]
+                if re.match(rf"\s*{re.escape(name)}\s*=", tail, re.IGNORECASE):
+                    return True
+        i += 1
+    return False
+
+
+def _rewrite_implied_do_group(code: str, old_name: str, new_name: str) -> str | None:
+    stack: list[int] = []
+    in_single = False
+    in_double = False
+    target: tuple[int, int] | None = None
+
+    for i, ch in enumerate(code):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                stack.append(i)
+            elif ch == ")" and stack:
+                start = stack.pop()
+                inner = code[start + 1 : i]
+                if _has_top_level_implied_do_control(inner, old_name):
+                    target = (start, i)
+
+    if target is None:
+        return None
+
+    start, end = target
+    inner = code[start + 1 : end]
+    new_inner = re.sub(rf"\b{re.escape(old_name)}\b", new_name, inner, flags=re.IGNORECASE)
+    if new_inner == inner:
+        return None
+    return code[: start + 1] + new_inner + code[end:]
+
+
+def _fix_implied_do_index_redefinition(path: Path, line_no_1: int, old_name: str) -> str | None:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if line_no_1 < 1 or line_no_1 > len(lines):
+        return None
+
+    line_idx = line_no_1 - 1
+    unit_start = _find_enclosing_unit_start(lines, line_idx)
+    if unit_start is None:
+        return None
+    unit_end = _find_unit_end(lines, unit_start)
+
+    old_line = lines[line_idx]
+    code, bang, comment = old_line.partition("!")
+    new_name = _fresh_name(lines[unit_start : unit_end + 1], old_name)
+    new_code = _rewrite_implied_do_group(code, old_name, new_name)
+    if new_code is None:
+        return None
+
+    if not _already_declared_in_range(lines, new_name, unit_start, unit_end):
+        insert_idx = _find_unit_decl_insert_idx(lines, unit_start, unit_end)
+        indent = _decl_indent_for_insert(lines, unit_start, insert_idx, unit_end)
+        lines.insert(insert_idx, f"{indent}integer :: {new_name}")
+        if insert_idx <= line_idx:
+            line_idx += 1
+
+    lines[line_idx] = new_code + (bang + comment if bang else "")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return new_name
+
+
 def _fix_if_missing_paren(path: Path, line_no_1: int) -> bool:
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     if line_no_1 < 1 or line_no_1 > len(lines):
@@ -1618,6 +1873,15 @@ def _first_error_loc(stderr: str, default_src: Path) -> tuple[Path, int]:
 
 
 def _try_general_compile_fix(path: Path, line_no: int, err_text: str) -> tuple[bool, str | None]:
+    m_idx = INDEX_VAR_REDEF_RE.search(err_text) or LOOP_VAR_REDEF_RE.search(err_text)
+    if m_idx:
+        old_name = m_idx.group(1)
+        new_name = _fix_implied_do_index_redefinition(path, line_no, old_name)
+        if new_name is not None:
+            return True, (
+                f"Fix: renamed implied-DO index from {old_name} to {new_name} "
+                "to avoid redefining an active DO variable."
+            )
     changed, msg = _fix_mixed_type_array_constructor(path, line_no)
     if changed:
         return True, msg
@@ -1687,6 +1951,11 @@ def main() -> int:
         help="Print unified diff for each applied edit.",
     )
     ap.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print extra detail about applied fixes, including changed lines.",
+    )
+    ap.add_argument(
         "--tee-orig",
         action="store_true",
         help="Print original source of the target Fortran file.",
@@ -1719,6 +1988,7 @@ def main() -> int:
     args = ap.parse_args()
     tee_orig = args.tee_orig or args.tee_both
     tee_src = args.tee or args.tee_both
+    show_change_detail = args.diff or args.verbose
 
     def _emit_source(label: str, p: Path) -> None:
         print(f"{label} ({p}):")
@@ -1728,6 +1998,32 @@ def main() -> int:
             print(f"<unable to read source: {ex}>")
             return
         print(txt.rstrip("\n"))
+
+    def _report_change(path: Path, before: list[str]) -> None:
+        after = _read_lines(path)
+        if args.diff:
+            _print_unified_diff(path, before, after)
+            return
+        if not args.verbose:
+            return
+        diff = list(
+            difflib.unified_diff(
+                before,
+                after,
+                fromfile=str(path),
+                tofile=str(path),
+                lineterm="",
+                n=1,
+            )
+        )
+        if not diff:
+            return
+        print(f"Verbose change ({path}):")
+        for ln in diff:
+            if ln.startswith(("---", "+++", "@@")):
+                print(ln)
+            elif ln.startswith("-") or ln.startswith("+"):
+                print(ln)
 
     # Runtime mode is primarily intended to patch the target source directly.
     # Keep --out available when explicitly requested, but default to in-place.
@@ -1790,29 +2086,29 @@ def main() -> int:
         return code
 
     edits = 0
-    before_guard = _read_lines(work_target) if args.diff else []
+    before_guard = _read_lines(work_target) if show_change_detail else []
     guard_edits = _fix_unallocated_deallocate_guards(work_target, drop_deallocate=args.drop_deallocate)
     if guard_edits:
-        if args.diff:
-            _print_unified_diff(work_target, before_guard, _read_lines(work_target))
+        if show_change_detail:
+            _report_change(work_target, before_guard)
         edits += guard_edits
         if args.drop_deallocate:
             print(f"Fix: dropped {guard_edits} unsafe/redundant DEALLOCATE line(s) via static analysis.")
         else:
             print(f"Fix: added {guard_edits} allocatable DEALLOCATE guard(s) via static analysis.")
     if args.hoist_loop_allocate:
-        before_hoist = _read_lines(work_target) if args.diff else []
+        before_hoist = _read_lines(work_target) if show_change_detail else []
         hoist_edits = _hoist_loop_allocate(work_target, drop_deallocate=args.drop_deallocate)
         if hoist_edits:
-            if args.diff:
-                _print_unified_diff(work_target, before_hoist, _read_lines(work_target))
+            if show_change_detail:
+                _report_change(work_target, before_hoist)
             edits += hoist_edits
             print(f"Fix: hoisted {hoist_edits} loop-local ALLOCATE pattern(s).")
-    before_loop_guard = _read_lines(work_target) if args.diff else []
+    before_loop_guard = _read_lines(work_target) if show_change_detail else []
     loop_guard_edits = _fix_allocate_inside_loop_with_guard(work_target)
     if loop_guard_edits:
-        if args.diff:
-            _print_unified_diff(work_target, before_loop_guard, _read_lines(work_target))
+        if show_change_detail:
+            _report_change(work_target, before_loop_guard)
         edits += loop_guard_edits
         print(
             f"Fix: inserted {loop_guard_edits} guarded DEALLOCATE line(s) before ALLOCATE in loop context."
@@ -1821,11 +2117,11 @@ def main() -> int:
     for it in range(1, args.max_iter + 1):
         src = work_target
         srcs_str = " ".join(_q(s) for s in build_inputs)
-        before_shared = _read_lines(src) if args.diff else []
+        before_shared = _read_lines(src) if show_change_detail else []
         shared_edits = _apply_shared_source_fixes(src)
         if shared_edits:
-            if args.diff:
-                _print_unified_diff(src, before_shared, _read_lines(src))
+            if show_change_detail:
+                _report_change(src, before_shared)
             edits += shared_edits
             print(f"Fix: reconciled allocatable declaration/usage rank mismatch in {src}.")
 
@@ -1847,11 +2143,11 @@ def main() -> int:
                         af0, ln0 = _first_error_loc(err, src)
                     if not af0.exists():
                         af0 = src
-                    before0 = _read_lines(af0) if args.diff else []
+                    before0 = _read_lines(af0) if show_change_detail else []
                     changed0, msg0 = _try_general_compile_fix(af0, ln0, err)
                     if changed0:
-                        if args.diff:
-                            _print_unified_diff(af0, before0, _read_lines(af0))
+                        if show_change_detail:
+                            _report_change(af0, before0)
                         edits += 1
                         print(msg0 or f"Fix: applied compile-fix rewrite in {af0}:{ln0}.")
                         continue
@@ -1867,11 +2163,11 @@ def main() -> int:
                         afile = src
                     if action["kind"] == "unclassifiable":
                         line_no = int(action["line"])
-                        before = _read_lines(afile) if args.diff else []
+                        before = _read_lines(afile) if show_change_detail else []
                         changed = _fix_subscripted_array_constructor(afile, line_no)
                         if changed:
-                            if args.diff:
-                                _print_unified_diff(afile, before, _read_lines(afile))
+                            if show_change_detail:
+                                _report_change(afile, before)
                             edits += 1
                             print(f"Fix: rewrote subscripted array constructor in {afile}:{line_no}.")
                             continue
@@ -1884,61 +2180,61 @@ def main() -> int:
                     lines = afile.read_text(encoding="utf-8", errors="replace").splitlines()
                     dtype = _guess_decl_type(lines, line_no, name)
                     decl = f"{dtype} :: {name}"
-                    before = _read_lines(afile) if args.diff else []
+                    before = _read_lines(afile) if show_change_detail else []
                     changed = _insert_decl_near_implicit_none(afile, line_no, decl)
                     if changed:
-                        if args.diff:
-                            _print_unified_diff(afile, before, _read_lines(afile))
+                        if show_change_detail:
+                            _report_change(afile, before)
                         edits += 1
                         print(f"Fix: declared `{name}` in {afile}.")
                         continue
                 elif action["kind"] == "if_paren":
                     line_no = int(action["line"])
-                    before = _read_lines(afile) if args.diff else []
+                    before = _read_lines(afile) if show_change_detail else []
                     changed = _fix_if_missing_paren(afile, line_no)
                     if changed:
-                        if args.diff:
-                            _print_unified_diff(afile, before, _read_lines(afile))
+                        if show_change_detail:
+                            _report_change(afile, before)
                         edits += 1
                         print(f"Fix: parenthesized IF condition in {afile}:{line_no}.")
                         continue
                 elif action["kind"] == "func_implicit":
                     line_no = int(action["line"])
                     name = str(action["name"])
-                    before = _read_lines(afile) if args.diff else []
+                    before = _read_lines(afile) if show_change_detail else []
                     changed = _fix_bare_call_stmt(afile, line_no, name)
                     if changed:
-                        if args.diff:
-                            _print_unified_diff(afile, before, _read_lines(afile))
+                        if show_change_detail:
+                            _report_change(afile, before)
                         edits += 1
                         print(f"Fix: rewrote bare call to `call {name}(...)` in {afile}:{line_no}.")
                         continue
                 elif action["kind"] == "percent_mod":
                     line_no = int(action["line"])
-                    before = _read_lines(afile) if args.diff else []
+                    before = _read_lines(afile) if show_change_detail else []
                     changed = _fix_percent_mod(afile, line_no)
                     if changed:
-                        if args.diff:
-                            _print_unified_diff(afile, before, _read_lines(afile))
+                        if show_change_detail:
+                            _report_change(afile, before)
                         edits += 1
                         print(f"Fix: rewrote `%%` to `mod(...)` in {afile}:{line_no}.")
                         continue
                 elif action["kind"] == "unclassifiable":
                     line_no = int(action["line"])
-                    before = _read_lines(afile) if args.diff else []
+                    before = _read_lines(afile) if show_change_detail else []
                     changed = _fix_do_while_paren(afile, line_no)
                     if changed:
-                        if args.diff:
-                            _print_unified_diff(afile, before, _read_lines(afile))
+                        if show_change_detail:
+                            _report_change(afile, before)
                         edits += 1
                         print(f"Fix: parenthesized DO WHILE condition in {afile}:{line_no}.")
                         continue
                 elif action["kind"] == "unexpected_eof":
-                    before = _read_lines(afile) if args.diff else []
+                    before = _read_lines(afile) if show_change_detail else []
                     changed = _fix_unexpected_eof(afile)
                     if changed:
-                        if args.diff:
-                            _print_unified_diff(afile, before, _read_lines(afile))
+                        if show_change_detail:
+                            _report_change(afile, before)
                         edits += 1
                         print(f"Fix: appended missing closing `end` in {afile}.")
                         continue
@@ -1958,19 +2254,19 @@ def main() -> int:
                 _emit_cp_output(cpr, prefix=f"[{it}] Run ")
             if cpr.returncode == 0:
                 if args.normalize_format_style:
-                    before_norm = _read_lines(work_target) if args.diff else []
+                    before_norm = _read_lines(work_target) if show_change_detail else []
                     norm_changed = _normalize_format_spacing(work_target)
                     if norm_changed:
-                        if args.diff:
-                            _print_unified_diff(work_target, before_norm, _read_lines(work_target))
+                        if show_change_detail:
+                            _report_change(work_target, before_norm)
                         edits += 1
                         print(f"Fix: normalized explicit format spacing in {work_target}.")
                         continue
-                    before_par = _read_lines(work_target) if args.diff else []
+                    before_par = _read_lines(work_target) if show_change_detail else []
                     par_changed = _normalize_redundant_format_parens(work_target)
                     if par_changed:
-                        if args.diff:
-                            _print_unified_diff(work_target, before_par, _read_lines(work_target))
+                        if show_change_detail:
+                            _report_change(work_target, before_par)
                         edits += 1
                         print(f"Fix: normalized redundant format parentheses in {work_target}.")
                         continue
@@ -1992,15 +2288,15 @@ def main() -> int:
             else:
                 afile = work_target
             rline = int(action["line"])
-            before_rebuild = _read_lines(afile) if args.diff else []
+            before_rebuild = _read_lines(afile) if show_change_detail else []
             rebuilt = _fix_runtime_rebuild_print_format(afile, rline)
             if rebuilt:
-                if args.diff:
-                    _print_unified_diff(afile, before_rebuild, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before_rebuild)
                 edits += 1
                 print(f"Fix: rebuilt format string from declarations in {afile}:{rline}.")
                 continue
-            before = _read_lines(afile) if args.diff else []
+            before = _read_lines(afile) if show_change_detail else []
             changed = _fix_runtime_format_mismatch(
                 afile,
                 rline,
@@ -2009,8 +2305,8 @@ def main() -> int:
                 int(action["item"]),
             )
             if changed:
-                if args.diff:
-                    _print_unified_diff(afile, before, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before)
                 edits += 1
                 print(
                     "Fix: runtime formatted-transfer mismatch "
@@ -2031,7 +2327,7 @@ def main() -> int:
             if static_mismatches:
                 fixed_one = False
                 for line_no, detail, item_no, got_type in static_mismatches:
-                    before_static = _read_lines(src) if args.diff else []
+                    before_static = _read_lines(src) if show_change_detail else []
                     changed = _fix_static_format_mismatch_with_xfmm(src, line_no)
                     if not changed:
                         changed = _fix_runtime_rebuild_print_format(src, line_no)
@@ -2042,28 +2338,28 @@ def main() -> int:
                             if exp is not None:
                                 changed = _fix_runtime_format_mismatch(src, line_no, exp, got_type, item_no)
                     if changed:
-                        if args.diff:
-                            _print_unified_diff(src, before_static, _read_lines(src))
+                        if show_change_detail:
+                            _report_change(src, before_static)
                         edits += 1
                         print(f"Fix: static format/type mismatch at {src}:{line_no} ({detail}).")
                         fixed_one = True
                         break
                 if fixed_one:
                     continue
-            before_expr = _read_lines(src) if args.diff else []
+            before_expr = _read_lines(src) if show_change_detail else []
             expr_changed = _fix_scalar_i_format_for_real_expr(src)
             if expr_changed:
-                if args.diff:
-                    _print_unified_diff(src, before_expr, _read_lines(src))
+                if show_change_detail:
+                    _report_change(src, before_expr)
                 edits += 1
                 print(f"Fix: corrected integer format descriptor for real-valued expression in {src}.")
                 continue
             if args.normalize_format_style:
-                before_par = _read_lines(src) if args.diff else []
+                before_par = _read_lines(src) if show_change_detail else []
                 par_changed = _normalize_redundant_format_parens(src)
                 if par_changed:
-                    if args.diff:
-                        _print_unified_diff(src, before_par, _read_lines(src))
+                    if show_change_detail:
+                        _report_change(src, before_par)
                     edits += 1
                     print(f"Fix: normalized redundant format parentheses in {src}.")
                     continue
@@ -2083,11 +2379,11 @@ def main() -> int:
                 af0, ln0 = _first_error_loc(err, src)
             if not af0.exists():
                 af0 = src
-            before0 = _read_lines(af0) if args.diff else []
+            before0 = _read_lines(af0) if show_change_detail else []
             changed0, msg0 = _try_general_compile_fix(af0, ln0, err)
             if changed0:
-                if args.diff:
-                    _print_unified_diff(af0, before0, _read_lines(af0))
+                if show_change_detail:
+                    _report_change(af0, before0)
                 edits += 1
                 print(msg0 or f"Fix: applied compile-fix rewrite in {af0}:{ln0}.")
                 continue
@@ -2103,11 +2399,11 @@ def main() -> int:
                 afile = src
             if action["kind"] == "unclassifiable":
                 line_no = int(action["line"])
-                before = _read_lines(afile) if args.diff else []
+                before = _read_lines(afile) if show_change_detail else []
                 changed = _fix_subscripted_array_constructor(afile, line_no)
                 if changed:
-                    if args.diff:
-                        _print_unified_diff(afile, before, _read_lines(afile))
+                    if show_change_detail:
+                        _report_change(afile, before)
                     edits += 1
                     print(f"Fix: rewrote subscripted array constructor in {afile}:{line_no}.")
                     continue
@@ -2121,61 +2417,61 @@ def main() -> int:
             lines = afile.read_text(encoding="utf-8", errors="replace").splitlines()
             dtype = _guess_decl_type(lines, line_no, name)
             decl = f"{dtype} :: {name}"
-            before = _read_lines(afile) if args.diff else []
+            before = _read_lines(afile) if show_change_detail else []
             changed = _insert_decl_near_implicit_none(afile, line_no, decl)
             if changed:
-                if args.diff:
-                    _print_unified_diff(afile, before, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before)
                 edits += 1
                 print(f"Fix: declared `{name}` in {afile}.")
                 continue
         elif action["kind"] == "if_paren":
             line_no = int(action["line"])
-            before = _read_lines(afile) if args.diff else []
+            before = _read_lines(afile) if show_change_detail else []
             changed = _fix_if_missing_paren(afile, line_no)
             if changed:
-                if args.diff:
-                    _print_unified_diff(afile, before, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before)
                 edits += 1
                 print(f"Fix: parenthesized IF condition in {afile}:{line_no}.")
                 continue
         elif action["kind"] == "func_implicit":
             line_no = int(action["line"])
             name = str(action["name"])
-            before = _read_lines(afile) if args.diff else []
+            before = _read_lines(afile) if show_change_detail else []
             changed = _fix_bare_call_stmt(afile, line_no, name)
             if changed:
-                if args.diff:
-                    _print_unified_diff(afile, before, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before)
                 edits += 1
                 print(f"Fix: rewrote bare call to `call {name}(...)` in {afile}:{line_no}.")
                 continue
         elif action["kind"] == "percent_mod":
             line_no = int(action["line"])
-            before = _read_lines(afile) if args.diff else []
+            before = _read_lines(afile) if show_change_detail else []
             changed = _fix_percent_mod(afile, line_no)
             if changed:
-                if args.diff:
-                    _print_unified_diff(afile, before, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before)
                 edits += 1
                 print(f"Fix: rewrote `%%` to `mod(...)` in {afile}:{line_no}.")
                 continue
         elif action["kind"] == "unclassifiable":
             line_no = int(action["line"])
-            before = _read_lines(afile) if args.diff else []
+            before = _read_lines(afile) if show_change_detail else []
             changed = _fix_do_while_paren(afile, line_no)
             if changed:
-                if args.diff:
-                    _print_unified_diff(afile, before, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before)
                 edits += 1
                 print(f"Fix: parenthesized DO WHILE condition in {afile}:{line_no}.")
                 continue
         elif action["kind"] == "unexpected_eof":
-            before = _read_lines(afile) if args.diff else []
+            before = _read_lines(afile) if show_change_detail else []
             changed = _fix_unexpected_eof(afile)
             if changed:
-                if args.diff:
-                    _print_unified_diff(afile, before, _read_lines(afile))
+                if show_change_detail:
+                    _report_change(afile, before)
                 edits += 1
                 print(f"Fix: appended missing closing `end` in {afile}.")
                 continue
