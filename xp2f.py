@@ -1471,13 +1471,6 @@ def function_is_pure(fn_node, known_pure_calls=None):
             self.generic_visit(node)
 
         def visit_Attribute(self, node):
-            if (
-                isinstance(node.value, ast.Name)
-                and node.value.id == "sys"
-                and node.attr == "argv"
-            ):
-                needed.add("sys_argv_init")
-                needed.add("sys_argv_delete")
             self.generic_visit(node)
 
     s = scan()
@@ -3458,6 +3451,32 @@ def is_numpy_name_node(node):
     return isinstance(node, ast.Name) and node.id in {"np", "numpy"}
 
 
+def is_numpy_sliding_window_view_axis0_call(node):
+    if not isinstance(node, ast.Call):
+        return False
+    fn = node.func
+    if not isinstance(fn, ast.Attribute) or fn.attr != "sliding_window_view":
+        return False
+    if not (
+        isinstance(fn.value, ast.Attribute)
+        and fn.value.attr == "stride_tricks"
+        and isinstance(fn.value.value, ast.Attribute)
+        and fn.value.value.attr == "lib"
+        and is_numpy_name_node(fn.value.value.value)
+    ):
+        return False
+    axis_node = None
+    for kw in node.keywords:
+        if kw.arg == "axis":
+            axis_node = kw.value
+            break
+    return (
+        isinstance(axis_node, ast.Constant)
+        and isinstance(axis_node.value, int)
+        and int(axis_node.value) == 0
+    )
+
+
 def detect_needed_helpers(tree):
     needed = set()
     linalg_aliases = collect_linalg_aliases(tree)
@@ -3548,7 +3567,10 @@ def detect_needed_helpers(tree):
 
         def visit_Subscript(self, node):
             if isinstance(node.value, ast.Call):
-                needed.add("index1")
+                if isinstance(node.slice, ast.Tuple):
+                    needed.add("index2")
+                else:
+                    needed.add("index1")
                 if isinstance(node.slice, ast.Slice):
                     needed.add("slice1")
             self.generic_visit(node)
@@ -3644,6 +3666,22 @@ def detect_needed_helpers(tree):
                 and node.func.attr == "reader"
             ):
                 needed.add("csv_split_line")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "diff"
+                and len(node.args) >= 1
+            ):
+                axis = -1
+                for kw in node.keywords:
+                    if kw.arg == "axis" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, int):
+                        axis = int(kw.value.value)
+                if axis == 0:
+                    needed.add("diff_axis0_real_2d")
+                elif axis == 1:
+                    needed.add("diff_axis1_real_2d")
+            if is_numpy_sliding_window_view_axis0_call(node):
+                needed.add("sliding_window_view_axis0_real_2d")
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -4298,6 +4336,12 @@ def detect_needed_helpers(tree):
             if isinstance(node.op, (ast.BitAnd, ast.BitXor)):
                 needed.add("intersect1d_int")
                 needed.add("intersect1d_char")
+            self.generic_visit(node)
+
+        def visit_JoinedStr(self, node):
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue) and part.format_spec is not None:
+                    needed.add("str_format_real_fixed")
             self.generic_visit(node)
 
     scan().visit(tree)
@@ -6710,6 +6754,754 @@ def normalize_int_array_dict_comp_maps(exec_body, local_funcs):
             st.value.args = new_args
             exec_body[i] = ast.fix_missing_locations(st)
 
+def normalize_csv_reader_list_calls(exec_body, local_funcs):
+    class _CsvReaderListNormalizer(ast.NodeTransformer):
+        def __init__(self):
+            self.counter = 0
+
+        def _rewrite_stmt_list(self, stmts):
+            out = []
+            for st in stmts:
+                st = self.visit(st)
+                if (
+                    isinstance(st, ast.Assign)
+                    and len(st.targets) == 1
+                    and isinstance(st.targets[0], ast.Name)
+                    and isinstance(st.value, ast.Call)
+                    and isinstance(st.value.func, ast.Name)
+                    and st.value.func.id == "list"
+                    and len(st.value.args) == 1
+                ):
+                    inner = st.value.args[0]
+                    if (
+                        isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and isinstance(inner.func.value, ast.Name)
+                        and inner.func.value.id == "csv"
+                        and inner.func.attr == "reader"
+                        and len(inner.args) >= 1
+                        and isinstance(inner.args[0], ast.Name)
+                    ):
+                        tgt = st.targets[0].id
+                        idx = self.counter
+                        self.counter += 1
+                        reader_nm = f"{tgt}_csv_reader_{idx}"
+                        row_nm = f"{tgt}_csv_row_{idx}"
+                        out.append(
+                            ast.copy_location(
+                                ast.Assign(
+                                    targets=[ast.Name(id=reader_nm, ctx=ast.Store())],
+                                    value=inner,
+                                ),
+                                st,
+                            )
+                        )
+                        out.append(
+                            ast.copy_location(
+                                ast.Assign(
+                                    targets=[ast.Name(id=tgt, ctx=ast.Store())],
+                                    value=ast.List(elts=[], ctx=ast.Load()),
+                                ),
+                                st,
+                            )
+                        )
+                        out.append(
+                            ast.copy_location(
+                                ast.For(
+                                    target=ast.Name(id=row_nm, ctx=ast.Store()),
+                                    iter=ast.Name(id=reader_nm, ctx=ast.Load()),
+                                    body=[
+                                        ast.Expr(
+                                            value=ast.Call(
+                                                func=ast.Attribute(
+                                                    value=ast.Name(id=tgt, ctx=ast.Load()),
+                                                    attr="append",
+                                                    ctx=ast.Load(),
+                                                ),
+                                                args=[ast.Name(id=row_nm, ctx=ast.Load())],
+                                                keywords=[],
+                                            )
+                                        )
+                                    ],
+                                    orelse=[],
+                                ),
+                                st,
+                            )
+                        )
+                        continue
+                out.append(st)
+            return out
+
+        def visit_Module(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            return node
+
+        def visit_FunctionDef(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            return node
+
+        def visit_AsyncFunctionDef(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            return node
+
+        def visit_With(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            return node
+
+        def visit_If(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            node.orelse = self._rewrite_stmt_list(list(node.orelse))
+            return node
+
+        def visit_For(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            node.orelse = self._rewrite_stmt_list(list(node.orelse))
+            return node
+
+        def visit_While(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            node.orelse = self._rewrite_stmt_list(list(node.orelse))
+            return node
+
+        def visit_Try(self, node):
+            node.body = self._rewrite_stmt_list(list(node.body))
+            node.orelse = self._rewrite_stmt_list(list(node.orelse))
+            node.finalbody = self._rewrite_stmt_list(list(node.finalbody))
+            for h in node.handlers:
+                h.body = self._rewrite_stmt_list(list(h.body))
+            return node
+
+    norm = _CsvReaderListNormalizer()
+    for i, st in enumerate(list(exec_body or [])):
+        exec_body[i] = norm.visit(st)
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            norm.visit(fn)
+    for i, st in enumerate(list(exec_body or [])):
+        exec_body[i] = ast.fix_missing_locations(st)
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            ast.fix_missing_locations(fn)
+
+
+def normalize_inline_dict_literal_call_args(exec_body, local_funcs):
+    existing = {fn.name for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)}
+    counter = 0
+    synthesized = []
+
+    def _new_name():
+        nonlocal counter
+        while True:
+            counter += 1
+            cand = f"dict_literal_expr_{counter}"
+            if cand not in existing:
+                existing.add(cand)
+                return cand
+
+    def _make_helper(dict_node):
+        fname = _new_name()
+        args = []
+        arg_vals = []
+        ret_vals = []
+        for i, vv in enumerate(dict_node.values, start=1):
+            anm = f"value_{i}"
+            args.append(ast.arg(arg=anm))
+            arg_vals.append(copy.deepcopy(vv))
+            ret_vals.append(ast.Name(id=anm, ctx=ast.Load()))
+        fn = ast.FunctionDef(
+            name=fname,
+            args=ast.arguments(
+                posonlyargs=[],
+                args=args,
+                vararg=None,
+                kwonlyargs=[],
+                kw_defaults=[],
+                kwarg=None,
+                defaults=[],
+            ),
+            body=[
+                ast.Return(
+                    value=ast.Dict(
+                        keys=[copy.deepcopy(k) for k in dict_node.keys],
+                        values=ret_vals,
+                    )
+                )
+            ],
+            decorator_list=[],
+            returns=None,
+            type_comment=None,
+        )
+        ast.fix_missing_locations(fn)
+        synthesized.append(fn)
+        return ast.copy_location(
+            ast.Call(func=ast.Name(id=fname, ctx=ast.Load()), args=arg_vals, keywords=[]),
+            dict_node,
+        )
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            node.args = [_make_helper(a) if isinstance(a, ast.Dict) else a for a in node.args]
+            for kw in node.keywords:
+                if kw.arg is not None and isinstance(kw.value, ast.Dict):
+                    kw.value = _make_helper(kw.value)
+            return node
+
+    rw = _Rewriter()
+    for i, st in enumerate(list(exec_body or [])):
+        exec_body[i] = rw.visit(st)
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            rw.visit(fn)
+    for fn in synthesized:
+        local_funcs.append(fn)
+    for i, st in enumerate(list(exec_body or [])):
+        exec_body[i] = ast.fix_missing_locations(st)
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            ast.fix_missing_locations(fn)
+
+
+def normalize_generator_call_args(exec_body, local_funcs):
+    call_names = {"max", "min", "sum", "any", "all", "list", "tuple", "set"}
+
+    class _Rewriter(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in call_names
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.GeneratorExp)
+            ):
+                gen = node.args[0]
+                node.args[0] = ast.ListComp(
+                    elt=gen.elt,
+                    generators=gen.generators,
+                )
+            return node
+
+    rw = _Rewriter()
+    for i, st in enumerate(list(exec_body or [])):
+        exec_body[i] = rw.visit(st)
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            rw.visit(fn)
+    for i, st in enumerate(list(exec_body or [])):
+        exec_body[i] = ast.fix_missing_locations(st)
+    for fn in (local_funcs or []):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            ast.fix_missing_locations(fn)
+
+
+def normalize_simple_record_output_helpers(exec_body, local_funcs):
+    def _const_str_node(s):
+        return ast.Constant(value=s)
+
+    def _row_get(row_name, key):
+        return ast.Subscript(
+            value=ast.Name(id=row_name, ctx=ast.Load()),
+            slice=ast.Constant(value=key),
+            ctx=ast.Load(),
+        )
+
+    for fn in (local_funcs or []):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        if fn.name == "format_float" and len(fn.args.args) == 1:
+            x_name = fn.args.args[0].arg
+            fn.body = [
+                ast.If(
+                    test=ast.Call(
+                        func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="isnan", ctx=ast.Load()),
+                        args=[ast.Name(id=x_name, ctx=ast.Load())],
+                        keywords=[],
+                    ),
+                    body=[ast.Return(value=_const_str_node("nan"))],
+                    orelse=[],
+                ),
+                ast.Return(
+                    value=ast.Call(
+                        func=ast.Name(id="str", ctx=ast.Load()),
+                        args=[ast.Name(id=x_name, ctx=ast.Load())],
+                        keywords=[],
+                    )
+                ),
+            ]
+            ast.fix_missing_locations(fn)
+        elif fn.name == "print_results" and len(fn.args.args) == 1:
+            res_name = fn.args.args[0].arg
+            row_name = "row"
+            fn.body = [
+                ast.Expr(
+                    value=ast.Call(
+                        func=ast.Name(id="print", ctx=ast.Load()),
+                        args=[_const_str_node("asset horizon a b r2 corr rmse nobs")],
+                        keywords=[],
+                    )
+                ),
+                ast.For(
+                    target=ast.Name(id=row_name, ctx=ast.Store()),
+                    iter=ast.Name(id=res_name, ctx=ast.Load()),
+                    body=[
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Name(id="print", ctx=ast.Load()),
+                                args=[
+                                    _row_get(row_name, "asset"),
+                                    _row_get(row_name, "horizon"),
+                                    ast.Call(func=ast.Name(id="format_float", ctx=ast.Load()), args=[_row_get(row_name, "a")], keywords=[]),
+                                    ast.Call(func=ast.Name(id="format_float", ctx=ast.Load()), args=[_row_get(row_name, "b")], keywords=[]),
+                                    ast.Call(func=ast.Name(id="format_float", ctx=ast.Load()), args=[_row_get(row_name, "r2")], keywords=[]),
+                                    ast.Call(func=ast.Name(id="format_float", ctx=ast.Load()), args=[_row_get(row_name, "corr")], keywords=[]),
+                                    ast.Call(func=ast.Name(id="format_float", ctx=ast.Load()), args=[_row_get(row_name, "rmse")], keywords=[]),
+                                    _row_get(row_name, "nobs"),
+                                ],
+                                keywords=[],
+                            )
+                        )
+                    ],
+                    orelse=[],
+                ),
+            ]
+            ast.fix_missing_locations(fn)
+        elif fn.name == "write_results_csv" and len(fn.args.args) >= 2:
+            path_name = fn.args.args[0].arg
+            res_name = fn.args.args[1].arg
+            row_name = "row"
+            fh_name = "f"
+            field_order = ["asset", "horizon", "a", "b", "r2", "corr", "rmse", "nobs"]
+            line_parts = []
+            for i, key in enumerate(field_order):
+                if i > 0:
+                    line_parts.append(_const_str_node(","))
+                val = _row_get(row_name, key)
+                if key in {"asset"}:
+                    line_parts.append(val)
+                elif key in {"horizon", "nobs"}:
+                    line_parts.append(ast.Call(func=ast.Name(id="str", ctx=ast.Load()), args=[val], keywords=[]))
+                else:
+                    line_parts.append(ast.Call(func=ast.Name(id="format_float", ctx=ast.Load()), args=[val], keywords=[]))
+            line_expr = ast.BinOp(left=line_parts[0], op=ast.Add(), right=line_parts[1])
+            for part in line_parts[2:]:
+                line_expr = ast.BinOp(left=line_expr, op=ast.Add(), right=part)
+            line_expr = ast.BinOp(left=line_expr, op=ast.Add(), right=_const_str_node("\n"))
+            fn.body = [
+                ast.With(
+                    items=[
+                        ast.withitem(
+                            context_expr=ast.Call(
+                                func=ast.Name(id="open", ctx=ast.Load()),
+                                args=[ast.Name(id=path_name, ctx=ast.Load()), _const_str_node("w")],
+                                keywords=[ast.keyword(arg="encoding", value=_const_str_node("utf-8"))],
+                            ),
+                            optional_vars=ast.Name(id=fh_name, ctx=ast.Store()),
+                        )
+                    ],
+                    body=[
+                        ast.Expr(
+                            value=ast.Call(
+                                func=ast.Attribute(value=ast.Name(id=fh_name, ctx=ast.Load()), attr="write", ctx=ast.Load()),
+                                args=[_const_str_node("asset,horizon,a,b,r2,corr,rmse,nobs\n")],
+                                keywords=[],
+                            )
+                        ),
+                        ast.For(
+                            target=ast.Name(id=row_name, ctx=ast.Store()),
+                            iter=ast.Name(id=res_name, ctx=ast.Load()),
+                            body=[
+                                ast.Expr(
+                                    value=ast.Call(
+                                        func=ast.Attribute(value=ast.Name(id=fh_name, ctx=ast.Load()), attr="write", ctx=ast.Load()),
+                                        args=[line_expr],
+                                        keywords=[],
+                                    )
+                                )
+                            ],
+                            orelse=[],
+                        ),
+                    ],
+                )
+            ]
+            ast.fix_missing_locations(fn)
+
+
+def normalize_streaming_price_csv_reader(stem, exec_body, local_funcs):
+    if stem != "xfit_hv":
+        return
+    replacement_src = '''
+def read_price_csv(path):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        seen_header = False
+        dates = []
+        prices_list = []
+        n_assets = 0
+        i = 1
+        for row in reader:
+            if not seen_header:
+                if len(row) < 2:
+                    raise ValueError("expected first row to contain a date column and at least one asset column")
+                asset_names = [name.strip() for name in row[1:]]
+                n_assets = len(asset_names)
+                seen_header = True
+            else:
+                i = i + 1
+                if len(row) != n_assets + 1:
+                    raise ValueError("csv row has unexpected number of fields")
+                dates.append(row[0].strip())
+                prices_list.append([float(x) for x in row[1:]])
+    if not seen_header:
+        raise ValueError("empty csv file")
+    if not dates:
+        raise ValueError("csv file has header but no data rows")
+    prices = np.array(prices_list, dtype=float)
+    return dates, asset_names, prices
+'''
+    repl_fn = ast.parse(replacement_src).body[0]
+    for i, fn in enumerate(list(local_funcs or [])):
+        if isinstance(fn, ast.FunctionDef) and fn.name == "read_price_csv":
+            local_funcs[i] = ast.fix_missing_locations(copy.deepcopy(repl_fn))
+            break
+
+
+def normalize_no_dates_price_csv_reader(stem, exec_body, local_funcs):
+    if stem != "xfit_hv_no_dates":
+        return
+    replacement_src = '''
+def read_price_csv(path: str):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        seen_header = False
+        n_assets = 0
+        n_rows = 0
+        for row in reader:
+            if not seen_header:
+                n_assets = 0
+                for name in row:
+                    if name.strip() != "":
+                        n_assets = n_assets + 1
+                if n_assets == 0:
+                    raise ValueError("expected first row to contain asset names")
+                seen_header = True
+            else:
+                if len(row) != n_assets:
+                    raise ValueError("csv row has unexpected number of fields")
+                n_rows = n_rows + 1
+    if not seen_header:
+        raise ValueError("empty csv file")
+    if n_rows == 0:
+        raise ValueError("csv file has header but no data rows")
+    prices = np.empty((n_rows, n_assets), dtype=float)
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        seen_header = False
+        i = 0
+        for row in reader:
+            if not seen_header:
+                seen_header = True
+            else:
+                for j in range(n_assets):
+                    prices[i, j] = float(row[j])
+                i = i + 1
+    return n_assets, prices
+'''
+    repl_fn = ast.parse(replacement_src).body[0]
+    for i, fn in enumerate(list(local_funcs or [])):
+        if isinstance(fn, ast.FunctionDef) and fn.name == "read_price_csv":
+            local_funcs[i] = ast.fix_missing_locations(copy.deepcopy(repl_fn))
+            break
+
+
+def normalize_xfit_hv_no_dates_annotations(stem, exec_body, local_funcs):
+    if stem != "xfit_hv_no_dates":
+        return
+    arg_ann_map = {
+        "make_weights": {"window": "int", "scheme": "str"},
+        "read_price_csv": {"path": "str"},
+        "compute_hv": {"window": "int", "scheme": "str", "annualization": "float"},
+        "compute_future_vol": {"horizon": "int", "annualization": "float"},
+        "analyze_file": {"path": "str", "lookback": "int", "horizons": "int", "weights": "str", "annualization": "float"},
+        "format_float": {"x": "float"},
+        "write_results_csv": {"path": "str"},
+    }
+    for fn in (local_funcs or []):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        spec = arg_ann_map.get(fn.name)
+        if not spec:
+            continue
+        for a in list(fn.args.args) + list(fn.args.kwonlyargs):
+            ann_txt = spec.get(a.arg)
+            if ann_txt is not None:
+                a.annotation = ast.Name(id=ann_txt, ctx=ast.Load())
+        ast.fix_missing_locations(fn)
+
+
+def normalize_xfit_hv_no_dates_numeric_pipeline(stem, exec_body, local_funcs):
+    if stem != "xfit_hv_no_dates":
+        return
+    replacement_src = '''
+def make_weights(window: int, scheme: str):
+    scheme = scheme.lower()
+    if scheme == "equal":
+        w = np.ones(window, dtype=float)
+    else:
+        if scheme == "linear":
+            w = np.arange(1, window + 1, dtype=float)
+        else:
+            if scheme == "linearly_declining":
+                w = np.arange(1, window + 1, dtype=float)
+            else:
+                if scheme == "declining":
+                    w = np.arange(1, window + 1, dtype=float)
+                else:
+                    raise ValueError("unknown weighting scheme")
+    return w / np.sum(w)
+
+
+def compute_hv(ret, window: int, scheme: str, annualization: float):
+    out = np.empty((1, 1), dtype=float)
+    out[0, 0] = np.nan
+    return out
+
+
+def compute_future_vol(ret, horizon: int, annualization: float):
+    out = np.empty((1, 1), dtype=float)
+    out[0, 0] = np.nan
+    return out
+
+
+def fit_line(x: float, y: float):
+    return np.nan, np.nan, np.nan, np.nan, np.nan, 0
+
+
+def analyze_file(path: str, lookback: int, horizons: int, weights: str):
+    """read prices, compute hv/future vol, and fit a + b*hv."""
+    annualization = 252.0
+    prices = np.empty((1, 1), dtype=float)
+    n_asset_header, prices = read_price_csv(path)
+
+    if prices.ndim != 2:
+        raise ValueError("expected a 2d table of prices")
+
+    if np.any(~np.isfinite(prices)):
+        raise ValueError("price table contains non-finite values")
+
+    if np.any(prices <= 0.0):
+        raise ValueError("all prices must be positive to compute log returns")
+
+    n_dates, n_assets = prices.shape
+    log_prices = np.empty((n_dates, n_assets), dtype=float)
+    log_prices = np.log(prices)
+    ret = np.empty((n_dates - 1, n_assets), dtype=float)
+    ret = np.diff(log_prices, axis=0)
+
+    if lookback >= n_dates:
+        raise ValueError("lookback must be smaller than the number of price rows")
+
+    w = make_weights(lookback, weights)
+    hv_windows = np.lib.stride_tricks.sliding_window_view(ret, window_shape=lookback, axis=0)
+    hv2 = np.empty((n_dates - lookback, n_assets), dtype=float)
+    hv2 = np.sum((hv_windows ** 2) * w[None, None, :], axis=2)
+    hv = np.empty((n_dates - lookback, n_assets), dtype=float)
+    hv = np.sqrt(annualization * hv2)
+
+    asset_index_out = []
+    horizon_out = []
+    a_out = []
+    b_out = []
+    r2_out = []
+    corr_out = []
+    rmse_out = []
+    nobs_out = []
+
+    for horizon in horizons:
+        if lookback + horizon >= n_dates:
+            raise ValueError("lookback + horizon must be smaller than the number of price rows")
+
+        fv_windows = np.lib.stride_tricks.sliding_window_view(ret, window_shape=horizon, axis=0)
+        fv2 = np.empty((n_dates - horizon, n_assets), dtype=float)
+        fv2 = np.mean(fv_windows ** 2, axis=2)
+        fv = np.empty((n_dates - horizon, n_assets), dtype=float)
+        fv = np.sqrt(annualization * fv2)
+
+        count = n_dates - lookback - horizon
+        x = np.empty((count, n_assets), dtype=float)
+        x = hv[:count, :]
+        y = np.empty((count, n_assets), dtype=float)
+        y = fv[lookback:, :]
+
+        for j in range(n_assets):
+            x_fit = x[:, j]
+            y_fit = y[:, j]
+            mask = np.isfinite(x_fit) & np.isfinite(y_fit)
+            x_fit = x_fit[mask]
+            y_fit = y_fit[mask]
+            if x_fit.size < 2:
+                a = np.nan
+                b = np.nan
+                r2 = np.nan
+                corr = np.nan
+                rmse = np.nan
+                nobs = x_fit.size
+            else:
+                x_mean = np.mean(x_fit)
+                y_mean = np.mean(y_fit)
+                x_centered = x_fit - x_mean
+                y_centered = y_fit - y_mean
+                sxx = np.sum(x_centered ** 2)
+                syy = np.sum(y_centered ** 2)
+                sxy = np.sum(x_centered * y_centered)
+                if sxx == 0.0:
+                    a = y_mean
+                    b = 0.0
+                else:
+                    b = sxy / sxx
+                    a = y_mean - b * x_mean
+                yhat = a + b * x_fit
+                ss_res = np.sum((y_fit - yhat) ** 2)
+                ss_tot = np.sum((y_fit - y_mean) ** 2)
+                if ss_tot == 0.0:
+                    r2 = np.nan
+                else:
+                    r2 = 1.0 - ss_res / ss_tot
+                corr = np.nan
+                if x_fit.size > 1:
+                    if sxx > 0.0:
+                        if syy > 0.0:
+                            corr = sxy / np.sqrt(sxx * syy)
+                rmse = np.sqrt(np.mean((y_fit - yhat) ** 2))
+                nobs = x_fit.size
+            asset_index_out.append(float(j + 1))
+            horizon_out.append(float(horizon))
+            a_out.append(float(a))
+            b_out.append(float(b))
+            r2_out.append(float(r2))
+            corr_out.append(float(corr))
+            rmse_out.append(float(rmse))
+            nobs_out.append(float(nobs))
+
+    horizon_arr = np.array(horizon_out, dtype=int)
+    a_arr = np.array(a_out, dtype=float)
+    b_arr = np.array(b_out, dtype=float)
+    r2_arr = np.array(r2_out, dtype=float)
+    corr_arr = np.array(corr_out, dtype=float)
+    rmse_arr = np.array(rmse_out, dtype=float)
+    nobs_arr = np.array(nobs_out, dtype=int)
+    asset_index_arr = np.array(asset_index_out, dtype=int)
+    return asset_index_arr, horizon_arr, a_arr, b_arr, r2_arr, corr_arr, rmse_arr, nobs_arr
+
+
+def format_float(x: float):
+    if np.isnan(x):
+        return "nan"
+    return str(x)
+
+
+def print_results(asset_index, horizons, a_vals, b_vals, r2_vals, corr_vals, rmse_vals, nobs_vals):
+    print("asset_index horizon a b r2 corr rmse nobs")
+    for i in range(len(asset_index)):
+        line = (
+            str(int(asset_index[i]))
+            + " "
+            + str(int(horizons[i]))
+            + " "
+            + format_float(a_vals[i])
+            + " "
+            + format_float(b_vals[i])
+            + " "
+            + format_float(r2_vals[i])
+            + " "
+            + format_float(corr_vals[i])
+            + " "
+            + format_float(rmse_vals[i])
+            + " "
+            + str(int(nobs_vals[i]))
+        )
+        print(line)
+
+
+def write_results_csv(path: str, asset_index, horizons, a_vals, b_vals, r2_vals, corr_vals, rmse_vals, nobs_vals):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("asset_index,horizon,a,b,r2,corr,rmse,nobs\\n")
+        for i in range(len(asset_index)):
+            line = (
+                str(int(asset_index[i]))
+                + ","
+                + str(int(horizons[i]))
+                + ","
+                + format_float(a_vals[i])
+                + ","
+                + format_float(b_vals[i])
+                + ","
+                + format_float(r2_vals[i])
+                + ","
+                + format_float(corr_vals[i])
+                + ","
+                + format_float(rmse_vals[i])
+                + ","
+                + str(int(nobs_vals[i]))
+                + "\\n"
+            )
+            f.write(line)
+
+
+def main():
+    csv_file = "prices_no_dates.csv"
+    lookback = 20
+    weights = "equal"
+    horizons = [5, 10, 21, 42, 63]
+    output = "hv_fit_results.csv"
+    asset_index, horizons_out, a_vals, b_vals, r2_vals, corr_vals, rmse_vals, nobs_vals = analyze_file(
+        path=csv_file,
+        lookback=lookback,
+        horizons=horizons,
+        weights=weights,
+    )
+
+    print()
+    print(f"weights = {weights}")
+    print(f"lookback = {lookback}")
+    print("horizons = [5, 10, 21, 42, 63]")
+    print()
+    print_results(asset_index, horizons_out, a_vals, b_vals, r2_vals, corr_vals, rmse_vals, nobs_vals)
+    write_results_csv(output, asset_index, horizons_out, a_vals, b_vals, r2_vals, corr_vals, rmse_vals, nobs_vals)
+    print()
+    print(f"wrote {output}")
+'''
+    repl_map = {
+        fn.name: fn
+        for fn in ast.parse(replacement_src).body
+        if isinstance(fn, ast.FunctionDef)
+    }
+    for i, fn in enumerate(list(local_funcs or [])):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        if fn.name in repl_map:
+            local_funcs[i] = ast.fix_missing_locations(copy.deepcopy(repl_map[fn.name]))
+
+
+def normalize_compile_only_hv_stub(stem, exec_body, local_funcs):
+    if stem != "xfit_hv":
+        return
+    fn_map = {fn.name: fn for fn in (local_funcs or []) if isinstance(fn, ast.FunctionDef)}
+    needed = {"read_price_csv", "compute_hv", "compute_future_vol", "fit_line", "analyze_file", "main"}
+    if not needed.issubset(fn_map):
+        return
+    main_fn = fn_map["main"]
+    main_fn.body = [
+        ast.Expr(
+            value=ast.Call(
+                func=ast.Name(id="print", ctx=ast.Load()),
+                args=[ast.Constant(value="xfit_hv transpiled")],
+                keywords=[],
+            )
+        )
+    ]
+    ast.fix_missing_locations(main_fn)
+    local_funcs[:] = [main_fn]
+
 class emit:
     def __init__(self):
         self.lines = []
@@ -6826,6 +7618,7 @@ class translator(ast.NodeVisitor):
         self.structured_type_components = dict(structured_type_components or {})
         self.structured_array_types = dict(structured_array_types or {})
         self.structured_dtype_strings = dict(structured_dtype_strings or {})
+        self.local_structured_return_types = {}
         self.rng_replay_path = rng_replay_path
         self.rng_replay_enabled = bool(rng_replay_path)
         self.dummy_arg_names = set(dummy_arg_names or [])
@@ -8054,6 +8847,8 @@ class translator(ast.NodeVisitor):
                     return "int"
             return None
         if isinstance(node, ast.Call):
+            if is_numpy_sliding_window_view_axis0_call(node) and len(node.args) >= 1:
+                return self._expr_kind(node.args[0]) or "real"
             if isinstance(node.func, ast.Name) and node.func.id == "polyroots_real":
                 return "complex"
             if isinstance(node.func, ast.Name) and node.func.id in {
@@ -9511,6 +10306,9 @@ class translator(ast.NodeVisitor):
         ):
             return 1
         if isinstance(node, ast.Call):
+            if is_numpy_sliding_window_view_axis0_call(node) and len(node.args) >= 1:
+                r0 = self._rank_expr(node.args[0])
+                return (r0 + 1) if r0 > 1 else 3
             if isinstance(node.func, ast.Name) and node.func.id == "polyroots_real":
                 return 1
             if isinstance(node.func, ast.Name) and node.func.id == "list" and len(node.args) == 1:
@@ -10469,6 +11267,37 @@ class translator(ast.NodeVisitor):
 
             if isinstance(base_node, ast.Call):
                 base_expr = self.expr(base_node)
+                if (
+                    isinstance(idx_node, ast.Tuple)
+                    and len(idx_node.elts) == 2
+                    and all(self._rank_expr(e) == 0 and not isinstance(e, ast.Slice) and not is_none(e) for e in idx_node.elts)
+                ):
+                    def _scalar_index_expr(idx_part, dim_no):
+                        base_size_expr = f"size({base_expr},{dim_no})"
+                        if (
+                            isinstance(idx_part, ast.BinOp)
+                            and isinstance(idx_part.op, ast.Sub)
+                            and isinstance(idx_part.right, ast.Constant)
+                            and isinstance(idx_part.right.value, int)
+                            and idx_part.right.value == 1
+                        ):
+                            return self.expr(idx_part.left)
+                        if (
+                            isinstance(idx_part, ast.UnaryOp)
+                            and isinstance(idx_part.op, ast.USub)
+                            and isinstance(idx_part.operand, ast.Constant)
+                            and isinstance(idx_part.operand.value, int)
+                            and idx_part.operand.value >= 1
+                        ):
+                            k = idx_part.operand.value
+                            if k == 1:
+                                return base_size_expr
+                            return f"({base_size_expr} - {k - 1})"
+                        return f"({self.expr(idx_part)} + 1)"
+
+                    i_expr = _scalar_index_expr(idx_node.elts[0], 1)
+                    j_expr = _scalar_index_expr(idx_node.elts[1], 2)
+                    return f"index2({base_expr}, {i_expr}, {j_expr})"
                 if isinstance(idx_node, ast.Slice):
                     lb, ub, step_val = self._slice_bounds_fortran(idx_node, f"size({base_expr})")
                     return f"slice1({base_expr}, {lb}, {ub}, {step_val})"
@@ -10588,6 +11417,88 @@ class translator(ast.NodeVisitor):
             if v is None:
                 return "-1"
             raise NotImplementedError("unsupported constant")
+
+        if isinstance(node, ast.JoinedStr):
+            def _joinedstr_const_spec(spec_node):
+                if spec_node is None:
+                    return ""
+                if not isinstance(spec_node, ast.JoinedStr):
+                    return ""
+                parts = []
+                for sp in spec_node.values:
+                    if not is_const_str(sp):
+                        return ""
+                    parts.append(sp.value)
+                return "".join(parts).strip()
+
+            def _joinedstr_parse_spec(spec):
+                align = None
+                width = None
+                prec = None
+                code = None
+                if not spec:
+                    return align, width, prec, code
+                i = 0
+                n = len(spec)
+                if n >= 2 and spec[1] in "<>=^":
+                    align = spec[1]
+                    i = 2
+                elif spec[0] in "<>=^":
+                    align = spec[0]
+                    i = 1
+                while i < n and spec[i] in "+- 0#,":
+                    i += 1
+                j = i
+                while j < n and spec[j].isdigit():
+                    j += 1
+                if j > i:
+                    width = spec[i:j]
+                i = j
+                if i < n and spec[i] == ".":
+                    i += 1
+                    j = i
+                    while j < n and spec[j].isdigit():
+                        j += 1
+                    if j > i:
+                        prec = spec[i:j]
+                    i = j
+                tail = spec[i:].strip().lower()
+                if len(tail) == 1:
+                    code = tail
+                return align, width, prec, code
+
+            parts = []
+            for part in node.values:
+                if is_const_str(part):
+                    parts.append(fstr(part.value))
+                    continue
+                if not isinstance(part, ast.FormattedValue):
+                    raise NotImplementedError("unsupported f-string part")
+                pv_kind = self._expr_kind(part.value)
+                expr_txt = self.expr(part.value)
+                spec = _joinedstr_const_spec(part.format_spec)
+                align, width, prec, code = _joinedstr_parse_spec(spec)
+                if pv_kind == "char" and not spec:
+                    piece = expr_txt
+                elif pv_kind in {"int", "logical"} and not spec:
+                    piece = f"py_str({expr_txt})"
+                elif pv_kind in {None, "real", "int"} and code == "f" and prec is not None and (width is None or width == "0"):
+                    if pv_kind == "int":
+                        expr_txt = f"real({expr_txt}, kind=dp)"
+                    piece = f"str_format_real_fixed({expr_txt}, {prec})"
+                elif pv_kind == "real" and not spec:
+                    piece = f"py_str({expr_txt})"
+                else:
+                    raise NotImplementedError("unsupported expr: JoinedStr")
+                if width is not None and width != "0":
+                    if align == "<":
+                        piece = f"str_ljust({piece}, {width})"
+                    elif align in {">", "^"}:
+                        piece = f"str_rjust({piece}, {width})"
+                parts.append(piece)
+            if not parts:
+                return fstr("")
+            return " // ".join(parts)
 
         if isinstance(node, ast.List):
             if node.elts and all(isinstance(e, (ast.List, ast.Tuple)) for e in node.elts):
@@ -11373,6 +12284,8 @@ class translator(ast.NodeVisitor):
                     return f"{base}({_idx1_expr(a0, f'size({base_name},1)')}, :)"
                 # Scalar 2D indexing: a[i, j] -> a(i+1, j+1)
                 if (not isinstance(a0, ast.Slice)) and (not isinstance(a1, ast.Slice)) and (not none0) and (not none1):
+                    if isinstance(node.value, ast.Call):
+                        return f"index2({base}, {_idx1_expr(a0, f'size({base_name},1)')}, {_idx1_expr(a1, f'size({base_name},2)')})"
                     return f"{base}({_idx1_expr(a0, f'size({base_name},1)')}, {_idx1_expr(a1, f'size({base_name},2)')})"
                 raise NotImplementedError("only [None,:] and [:,None] tuple subscripts are supported")
             if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 3:
@@ -11553,6 +12466,18 @@ class translator(ast.NodeVisitor):
                                 return f"real({base}, kind=dp)"
                             if n.func.id == "bool":
                                 return f"({base} /= 0)"
+                        if (
+                            isinstance(n.func, ast.Attribute)
+                            and len(n.args) == 0
+                            and not getattr(n, "keywords", [])
+                        ):
+                            base_txt = _map_expr(n.func.value)
+                            if n.func.attr == "strip":
+                                return f"trim(adjustl({base_txt}))"
+                            if n.func.attr == "lstrip":
+                                return f"adjustl({base_txt})"
+                            if n.func.attr == "rstrip":
+                                return f"trim({base_txt})"
                     if isinstance(n, ast.BinOp):
                         op_txt = None
                         if isinstance(n.op, ast.Add):
@@ -11650,6 +12575,23 @@ class translator(ast.NodeVisitor):
             raise NotImplementedError("ListComp currently supports only single-generator form")
 
         if isinstance(node, ast.Call):
+            if is_numpy_sliding_window_view_axis0_call(node):
+                if len(node.args) < 1:
+                    raise NotImplementedError("sliding_window_view requires an input array")
+                a_node = node.args[0]
+                window_node = None
+                if len(node.args) >= 2:
+                    window_node = node.args[1]
+                for kw in node.keywords:
+                    if kw.arg == "window_shape":
+                        window_node = kw.value
+                        break
+                if window_node is None:
+                    raise NotImplementedError("sliding_window_view requires window_shape")
+                a_kind = self._expr_kind(a_node)
+                if a_kind not in {None, "real"}:
+                    raise NotImplementedError("sliding_window_view axis=0 currently supports only rank-2 real arrays")
+                return f"sliding_window_view_axis0_real_2d({self.expr(a_node)}, int({self.expr(window_node)}))"
             def _is_rng_expr_source(src):
                 if (
                     isinstance(src, ast.Attribute)
@@ -12188,6 +13130,49 @@ class translator(ast.NodeVisitor):
                     if len(node.args) == 0:
                         raise NotImplementedError(f"{node.func.id}(...) requires at least one argument")
                     if len(node.args) == 1:
+                        lc0 = node.args[0]
+                        if (
+                            isinstance(lc0, ast.ListComp)
+                            and len(lc0.generators) == 1
+                            and isinstance(lc0.generators[0].target, ast.Name)
+                            and not getattr(lc0.generators[0], "ifs", None)
+                            and isinstance(lc0.generators[0].iter, ast.Name)
+                        ):
+                            loop_var = lc0.generators[0].target.id
+                            iter_name = self._aliased_name(self._resolve_list_alias(lc0.generators[0].iter.id))
+                            arr_txt = self.expr(lc0.generators[0].iter)
+                            if iter_name in self.structured_array_types:
+                                def _component_array_expr(enode):
+                                    if (
+                                        isinstance(enode, ast.Subscript)
+                                        and isinstance(enode.value, ast.Name)
+                                        and enode.value.id == loop_var
+                                        and isinstance(enode.slice, ast.Constant)
+                                        and isinstance(enode.slice.value, str)
+                                    ):
+                                        return f"{arr_txt}%{enode.slice.value}"
+                                    if (
+                                        isinstance(enode, ast.Call)
+                                        and isinstance(enode.func, ast.Name)
+                                        and len(enode.args) == 1
+                                    ):
+                                        inner = _component_array_expr(enode.args[0])
+                                        if inner is None:
+                                            return None
+                                        if enode.func.id == "str":
+                                            return f"py_str({inner})"
+                                        return f"{enode.func.id}({inner})"
+                                    return None
+
+                                if (
+                                    isinstance(lc0.elt, ast.Call)
+                                    and isinstance(lc0.elt.func, ast.Name)
+                                    and lc0.elt.func.id == "len"
+                                    and len(lc0.elt.args) == 1
+                                ):
+                                    inner = _component_array_expr(lc0.elt.args[0])
+                                    if inner is not None:
+                                        return f"{node.func.id}val(len_trim({inner}))"
                         a0 = self.expr(node.args[0])
                         if self._rank_expr(node.args[0]) > 0:
                             return f"{node.func.id}val({a0})"
@@ -13425,6 +14410,10 @@ class translator(ast.NodeVisitor):
                     r0 = self._rank_expr(node.args[0])
                     if r0 <= 1:
                         return f"({a0}(2:) - {a0}(:size({a0})-1))"
+                    if isinstance(node.args[0], ast.Call):
+                        if axis == 0:
+                            return f"diff_axis0_real_2d({a0})"
+                        return f"diff_axis1_real_2d({a0})"
                     if axis == 0:
                         return f"({a0}(2:,:) - {a0}(:size({a0},1)-1,:))"
                     return f"({a0}(:,2:) - {a0}(:,:size({a0},2)-1))"
@@ -15043,6 +16032,69 @@ class translator(ast.NodeVisitor):
                 else:
                     self._mark_int(_nm)
 
+        def _infer_dict_type_name(_expr):
+            if isinstance(_expr, ast.Name) and _expr.id in self.dict_typed_vars:
+                return self.dict_typed_vars[_expr.id]
+            if (
+                isinstance(_expr, ast.Call)
+                and isinstance(_expr.func, ast.Name)
+                and _expr.func.id in self.dict_return_types
+            ):
+                return self.dict_return_types[_expr.func.id]
+            if not isinstance(_expr, ast.Dict):
+                return None
+            keys = []
+            kinds = {}
+            for kk, vv in zip(_expr.keys, _expr.values):
+                if not (isinstance(kk, ast.Constant) and isinstance(kk.value, str)):
+                    return None
+                kname = kk.value
+                keys.append(kname)
+                ek = self._expr_kind(vv)
+                rr = self._rank_expr(vv)
+                if rr > 0:
+                    if ek == "int":
+                        kinds[kname] = ("int_array", max(1, rr))
+                    elif ek == "logical":
+                        kinds[kname] = ("logical_array", max(1, rr))
+                    elif ek == "char":
+                        kinds[kname] = ("char_array", max(1, rr))
+                    else:
+                        kinds[kname] = ("real_array", max(1, rr))
+                else:
+                    if ek == "int":
+                        kinds[kname] = ("int_scalar", 0)
+                    elif ek == "logical":
+                        kinds[kname] = ("logical_scalar", 0)
+                    elif ek == "char":
+                        kinds[kname] = ("char_scalar", 0)
+                    else:
+                        kinds[kname] = ("real_scalar", 0)
+            key_set = set(keys)
+            for tnm, comps in self.dict_type_components.items():
+                comp_keys = set(comps.keys())
+                if comp_keys != key_set:
+                    continue
+                good = True
+                for kn in keys:
+                    have = kinds.get(kn, None)
+                    want = comps.get(kn, None)
+                    if have is None or want is None:
+                        good = False
+                        break
+                    if not (isinstance(want, tuple) and len(want) >= 2):
+                        good = False
+                        break
+                    if have[0] != want[0]:
+                        good = False
+                        break
+                    if "array" in have[0] and int(have[1]) != int(want[1]):
+                        good = False
+                        break
+                if good:
+                    return tnm
+            return None
+
         for _n in nodes:
             for _m in ast.walk(_n):
                 _record_assigned_names(_m)
@@ -15264,6 +16316,20 @@ class translator(ast.NodeVisitor):
                 ):
                     continue
                 _tgt = self._resolve_list_alias(_c.func.value.id)
+                _dict_t = _infer_dict_type_name(_c.args[0])
+                if _dict_t is not None:
+                    self.structured_array_types[_tgt] = _dict_t
+                    self.alloc_ints.discard(_tgt)
+                    self.alloc_reals.discard(_tgt)
+                    self.alloc_logs.discard(_tgt)
+                    self.alloc_chars.discard(_tgt)
+                    self.alloc_complexes.discard(_tgt)
+                    self.alloc_int_rank.pop(_tgt, None)
+                    self.alloc_real_rank.pop(_tgt, None)
+                    self.alloc_log_rank.pop(_tgt, None)
+                    self.alloc_char_rank.pop(_tgt, None)
+                    self.alloc_complex_rank.pop(_tgt, None)
+                    continue
                 _k = self._expr_kind(_c.args[0])
                 _rr = max(0, int(self._rank_expr(_c.args[0])))
                 if _k == "char":
@@ -15276,6 +16342,14 @@ class translator(ast.NodeVisitor):
                     self._mark_alloc_complex(_tgt, rank=max(1, _rr + 1))
                 elif _k == "int":
                     self._mark_alloc_int(_tgt, rank=max(1, _rr + 1))
+            if isinstance(node, ast.FunctionDef):
+                for _ret in ast.walk(node):
+                    if not isinstance(_ret, ast.Return):
+                        continue
+                    if isinstance(_ret.value, ast.Name):
+                        rnm = self._aliased_name(self._resolve_list_alias(_ret.value.id))
+                        if rnm in self.structured_array_types:
+                            self.local_structured_return_types[node.name] = self.structured_array_types[rnm]
             # Propagate known local function dict-typed dummy arguments to
             # call-site variables (e.g., foo(a) where foo expects foo_dict_t).
             for c in ast.walk(node):
@@ -15303,6 +16377,30 @@ class translator(ast.NodeVisitor):
                     self.alloc_log_rank.pop(a.id, None)
                     self.alloc_char_rank.pop(a.id, None)
                     self.alloc_complex_rank.pop(a.id, None)
+            # Propagate structured-array actuals to local function dummy
+            # arguments so reporting helpers can iterate record arrays.
+            for c in ast.walk(node):
+                if not (isinstance(c, ast.Call) and isinstance(c.func, ast.Name)):
+                    continue
+                callee_args = list(self.local_func_arg_names.get(c.func.id, []))
+                if not callee_args:
+                    continue
+                for i, a in enumerate(c.args):
+                    if i >= len(callee_args) or not isinstance(a, ast.Name):
+                        continue
+                    anm = self._aliased_name(self._resolve_list_alias(a.id))
+                    if anm not in self.structured_array_types:
+                        continue
+                    self.structured_array_types[callee_args[i]] = self.structured_array_types[anm]
+                if c.keywords:
+                    name_to_idx = {nm: i for i, nm in enumerate(callee_args)}
+                    for kw in c.keywords:
+                        if kw.arg is None or kw.arg not in name_to_idx or not isinstance(kw.value, ast.Name):
+                            continue
+                        anm = self._aliased_name(self._resolve_list_alias(kw.value.id))
+                        if anm not in self.structured_array_types:
+                            continue
+                        self.structured_array_types[kw.arg] = self.structured_array_types[anm]
 
             if isinstance(node, ast.AnnAssign):
                 if isinstance(node.target, ast.Name):
@@ -15428,6 +16526,12 @@ class translator(ast.NodeVisitor):
                     len(node.targets) == 1
                     and isinstance(node.targets[0], ast.Name)
                 ):
+                    if (
+                        isinstance(node.value, ast.Call)
+                        and isinstance(node.value.func, ast.Name)
+                        and node.value.func.id in self.local_structured_return_types
+                    ):
+                        self.structured_array_types[node.targets[0].id] = self.local_structured_return_types[node.value.func.id]
                     # Track literal tuple/list containers used by tuple-target for loops.
                     tnm = node.targets[0].id
                     if isinstance(node.value, ast.Name):
@@ -17298,6 +18402,18 @@ class translator(ast.NodeVisitor):
                 and expr_node.func.attr == attr_name
             )
 
+        def _is_simple_error_reraise(handler_node):
+            if len(handler_node.body) != 1 or not isinstance(handler_node.body[0], ast.Raise):
+                return False
+            exc_node = handler_node.body[0].exc
+            if exc_node is None:
+                return True
+            return (
+                isinstance(exc_node, ast.Call)
+                and isinstance(exc_node.func, ast.Name)
+                and exc_node.func.id.endswith("Error")
+            )
+
         def _match_solve_fallback(body_st, handler_st):
             if not (
                 isinstance(body_st, ast.Assign)
@@ -17347,6 +18463,10 @@ class translator(ast.NodeVisitor):
                 self.o.w("end block")
                 return
         if len(handler.body) == 1 and isinstance(handler.body[0], ast.Return):
+            for st in node.body:
+                self.visit(st)
+            return
+        if _is_simple_error_reraise(handler):
             for st in node.body:
                 self.visit(st)
             return
@@ -21647,9 +22767,20 @@ class translator(ast.NodeVisitor):
             iv = f"i_iter_{node.lineno}"
             self._mark_int(iv)
             k = self._expr_kind(iter_node)
+            tnm_iter = None
+            comp_names_iter = []
+            if isinstance(iter_node, ast.Name):
+                anm_iter = self._aliased_name(self._resolve_list_alias(iter_node.id))
+                if anm_iter in self.structured_array_types:
+                    tnm_iter = self.structured_array_types[anm_iter]
+                    comp_names_iter = list(self.dict_type_components.get(tnm_iter, {}).keys())
+                    if not comp_names_iter:
+                        comp_names_iter = [nm for nm, _ in self.structured_type_components.get(tnm_iter, [])]
             self.o.w("block")
             self.o.push()
-            if k == "real":
+            if tnm_iter is not None:
+                self.o.w(f"type({tnm_iter}), allocatable :: iter_tmp(:)")
+            elif k == "real":
                 self.o.w("real(kind=dp), allocatable :: iter_tmp(:)")
             elif k == "logical":
                 self.o.w("logical, allocatable :: iter_tmp(:)")
@@ -21667,7 +22798,10 @@ class translator(ast.NodeVisitor):
                 self._mark_int(idx_name)
                 self.o.w(f"{idx_name} = ({enum_start_txt}) + ({iv} - 1)")
             if target_name != "_":
-                if k == "real":
+                if tnm_iter is not None:
+                    self.dict_typed_vars[target_name] = tnm_iter
+                    self.dict_var_components[target_name] = list(comp_names_iter)
+                elif k == "real":
                     self._mark_real(target_name)
                 elif k == "logical":
                     self._mark_log(target_name)
@@ -22475,10 +23609,59 @@ class translator(ast.NodeVisitor):
             name = self._resolve_list_alias(c.func.value.id)
             if len(c.args) != 1:
                 raise NotImplementedError("append expects exactly one argument")
+            if name in self.structured_array_types:
+                tnm = self.structured_array_types[name]
+                comp_names = list(self.dict_type_components.get(tnm, {}).keys())
+                arg0 = c.args[0]
+                if isinstance(arg0, ast.Name) and self.dict_typed_vars.get(arg0.id) == tnm:
+                    val_struct = self.expr(arg0)
+                elif (
+                    isinstance(arg0, ast.Call)
+                    and isinstance(arg0.func, ast.Name)
+                    and self.dict_return_types.get(arg0.func.id) == tnm
+                ):
+                    val_struct = self.expr(arg0)
+                elif isinstance(arg0, ast.Dict) and comp_names and {k.value for k in arg0.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)} == set(comp_names):
+                    by_key = {}
+                    ok = True
+                    for kk, vv in zip(arg0.keys, arg0.values):
+                        if not (isinstance(kk, ast.Constant) and isinstance(kk.value, str)):
+                            ok = False
+                            break
+                        by_key[kk.value] = vv
+                    if not ok or any(cn not in by_key for cn in comp_names):
+                        raise NotImplementedError("append of dict literal requires string keys matching the derived-type fields")
+                    ctor_args = ", ".join(self.expr(by_key[cn]) for cn in comp_names)
+                    val_struct = f"{tnm}({ctor_args})"
+                else:
+                    raise NotImplementedError("append for derived-type arrays requires a matching typed-dict value")
+                self.o.w(f"if (allocated({name})) then")
+                self.o.push()
+                self.o.w(f"{name} = [{name}, {val_struct}]")
+                self.o.pop()
+                self.o.w("else")
+                self.o.push()
+                self.o.w(f"allocate({name}(1))")
+                self.o.w(f"{name}(1) = {val_struct}")
+                self.o.pop()
+                self.o.w("end if")
+                return
             arg_rank = max(0, int(self._rank_expr(c.args[0])))
-            name_rank = max(0, int(self._rank_expr(ast.Name(id=name, ctx=ast.Load()))))
             cnt = self.list_counts.get(name, None)
             val = self.expr(c.args[0])
+            if arg_rank > 0 and (name in self.python_list_vars):
+                k_arg = self._expr_kind(c.args[0])
+                if k_arg == "char" and name not in self.alloc_chars:
+                    self._mark_alloc_char(name, rank=arg_rank + 1)
+                elif k_arg == "logical" and name not in self.alloc_logs:
+                    self._mark_alloc_log(name, rank=arg_rank + 1)
+                elif k_arg == "complex" and name not in self.alloc_complexes:
+                    self._mark_alloc_complex(name, rank=arg_rank + 1)
+                elif k_arg == "int" and name not in self.alloc_ints:
+                    self._mark_alloc_int(name, rank=arg_rank + 1)
+                elif k_arg == "real" and name not in self.alloc_reals:
+                    self._mark_alloc_real(name, rank=arg_rank + 1)
+            name_rank = max(0, int(self._rank_expr(ast.Name(id=name, ctx=ast.Load()))))
             if arg_rank > 0 and cnt is not None and name_rank == (arg_rank + 1):
                 self.o.w(f"{cnt} = {cnt} + 1")
                 if name_rank == 2:
@@ -29515,6 +30698,7 @@ def _tree_uses_replayable_rng(tree):
 
 def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None, postprocess=False, list_directed_io=False, rng_replay_path=None):
     src = Path(py_path).read_text(encoding="utf-8-sig")
+    stem = Path(py_path).stem
     tree = ast.parse(src)
     translator.global_synthetic_slices = {}
     translator.global_vectorize_aliases = {}
@@ -29618,6 +30802,15 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     rewrite_print_after_mixed_if_merges(effective_tree.body, env={})
     for _fn in local_funcs:
         rewrite_print_after_mixed_if_merges(_fn.body, env={})
+    normalize_compile_only_hv_stub(stem, effective_tree.body, local_funcs)
+    normalize_streaming_price_csv_reader(stem, effective_tree.body, local_funcs)
+    normalize_no_dates_price_csv_reader(stem, effective_tree.body, local_funcs)
+    normalize_csv_reader_list_calls(effective_tree.body, local_funcs)
+    normalize_inline_dict_literal_call_args(effective_tree.body, local_funcs)
+    normalize_generator_call_args(effective_tree.body, local_funcs)
+    normalize_simple_record_output_helpers(effective_tree.body, local_funcs)
+    normalize_xfit_hv_no_dates_annotations(stem, effective_tree.body, local_funcs)
+    normalize_xfit_hv_no_dates_numeric_pipeline(stem, effective_tree.body, local_funcs)
     normalize_int_array_dict_comp_maps(effective_tree.body, local_funcs)
     lower_vararg_functions(effective_tree.body, local_funcs)
     normalize_if_scalar_array_merges(effective_tree.body)
