@@ -72,6 +72,8 @@ DEFAULT_GFORTRAN_FLAGS = [
     "-fmodule-private",
 ]
 
+PRELUDE_LINE_COUNT = len(PRELUDE.splitlines())
+
 
 def _xc2f_added_comment(text: str) -> str:
     """Return a machine-detectable xc2f-generated comment line."""
@@ -138,6 +140,26 @@ def strip_preprocessor_only(text: str) -> str:
             continue
         out.append(line)
     return "\n".join(out)
+
+
+def normalize_fortran_d_exponents(text: str) -> str:
+    """Accept Fortran-style D exponents in C-like numeric literals.
+
+    This keeps line and column positions stable by rewriting only the single
+    exponent marker character.
+    """
+
+    def repl(m: re.Match[str]) -> str:
+        token = m.group(0)
+        if "d" in token:
+            return token.replace("d", "e", 1)
+        return token.replace("D", "E", 1)
+
+    return re.sub(
+        r"(?<![A-Za-z0-9_])(?:\d+\.\d*|\.\d+|\d+)[dD][+\-]?\d+(?![A-Za-z0-9_])",
+        repl,
+        text,
+    )
 
 
 def is_language_specific_comment(s: str) -> bool:
@@ -1642,12 +1664,19 @@ def _dummy_first_read_write_line(
     return first_read, first_write
 
 
-def transpile_c_to_fortran(text: str, *, refactor: bool = False, raw: bool = False) -> str:
+def transpile_c_to_fortran(
+    text: str,
+    *,
+    refactor: bool = False,
+    raw: bool = False,
+    pure: bool = False,
+    elemental: bool = False,
+) -> str:
     no_pp = strip_preprocessor_only(text)
     comments = extract_preserved_comments(no_pp)
     c_arg_comments_by_func = extract_c_function_arg_comments(no_pp)
     c_header_comments_by_func = extract_c_function_header_comments(no_pp)
-    src = strip_preprocessor_and_comments(text)
+    src = normalize_fortran_d_exponents(strip_preprocessor_and_comments(text))
     parser = c_parser.CParser()
     ast = parser.parse(PRELUDE + "\n" + src)
     real_prec = _detect_c_real_precision(src)
@@ -1777,8 +1806,10 @@ def transpile_c_to_fortran(text: str, *, refactor: bool = False, raw: bool = Fal
     lines = fscan.collapse_random_number_element_loops(lines)
     lines = fscan.coalesce_contiguous_scalar_assignments_to_constructor(lines)
     lines = _remove_arg_style_doc_comments(lines)
-    lines = add_pure_when_possible(lines)
-    lines = fpost.promote_pure_scalar_subroutines_to_elemental(lines)
+    if pure or elemental:
+        lines = add_pure_when_possible(lines)
+    if elemental:
+        lines = fpost.promote_pure_scalar_subroutines_to_elemental(lines)
     out_text = "".join(lines).rstrip() + "\n"
     if array_result_funcs:
         out_text = out_text.replace(
@@ -2014,7 +2045,7 @@ def _time_executable(exe_path: Path, *, label: str, reps: int = 3) -> Optional[f
 
 
 def apply_shared_kind_module_dp(text: str, *, dp_init: str = "kind(1.0d0)") -> str:
-    """Use a shared kind_mod(sp,dp) when both module and main are present.
+    """Use a shared kind_mod(sp,dp) when generated code needs kind constants.
 
     Rewrites generated code to:
     - add module kind_mod with dp parameter
@@ -2031,7 +2062,7 @@ def apply_shared_kind_module_dp(text: str, *, dp_init: str = "kind(1.0d0)") -> s
 
     mod_idx = next((i for i, ln in enumerate(lines) if re.match(r"^\s*module\s+xc2f_mod\b", ln, re.IGNORECASE)), None)
     main_idx = next((i for i, ln in enumerate(lines) if re.match(r"^\s*program\s+main\b", ln, re.IGNORECASE)), None)
-    if mod_idx is None or main_idx is None:
+    if mod_idx is None and main_idx is None:
         return text
     wants_sp = bool(re.search(r"\bkind\s*=\s*sp\b|_sp\b", text, re.IGNORECASE))
     wants_dp = bool(re.search(r"\bkind\s*=\s*dp\b|_dp\b|\breal64\b", text, re.IGNORECASE))
@@ -2157,10 +2188,18 @@ def _normalize_kind_intrinsic_literals(text: str) -> str:
     return re.sub(r"(?i)\bkind\s*\(\s*([0-9]+(?:\.[0-9]*)?(?:[ed][+\-]?[0-9]+)?)_(?:dp|sp)\s*\)", r"kind(\1)", text)
 
 
-def _format_transpile_error(exc: Exception) -> str:
+def _format_transpile_error(exc: Exception, *, source_name: Optional[str] = None) -> str:
     """Return a concise one-line transpile failure description."""
     msg = str(exc).strip()
     name = exc.__class__.__name__
+    m = re.match(r"^:(\d+):(\d+):(.*)$", msg)
+    if m:
+        line_no = int(m.group(1))
+        col_no = int(m.group(2))
+        rest = m.group(3).strip()
+        src_line_no = max(1, line_no - PRELUDE_LINE_COUNT)
+        prefix = f"{source_name}:" if source_name else ""
+        return f"{name}: {prefix}{src_line_no}:{col_no}: {rest}"
     if not msg:
         return name
     if msg.startswith(f"{name}:"):
@@ -2760,6 +2799,8 @@ def main() -> int:
     ap.add_argument("--tee-both", action="store_true", help="Print original C source and generated Fortran")
     ap.add_argument("--raw", action="store_true", help="Emit raw transpilation output (skip optional post-processing)")
     ap.add_argument("--refactor", action="store_true", help="Extract long main-program blocks into module procedures")
+    ap.add_argument("--pure", action="store_true", help="Allow promotion of eligible procedures to pure")
+    ap.add_argument("--elemental", action="store_true", help="Allow promotion of eligible pure scalar subroutines to elemental")
     ap.add_argument("--array", action="store_true", help="Post-process generated Fortran with xarray.py")
     ap.add_argument("--array-inline", action="store_true", help="With --array, enable xarray inline post-pass")
     ap.add_argument("--inline-temp", action="store_true", help="Post-process generated Fortran with xno_variable.py")
@@ -2801,13 +2842,21 @@ def main() -> int:
     if args.tee_both:
         args.tee_orig = True
         args.tee = True
+    if args.elemental:
+        args.pure = True
     if args.run_diff or args.time_both:
         args.run_both = True
     if args.run_both:
         args.run = True
 
     def _transpile_text(text: str) -> str:
-        fsrc_loc = transpile_c_to_fortran(text, refactor=args.refactor, raw=args.raw)
+        fsrc_loc = transpile_c_to_fortran(
+            text,
+            refactor=args.refactor,
+            raw=args.raw,
+            pure=args.pure,
+            elemental=args.elemental,
+        )
         if args.array:
             fsrc_loc = apply_xarray_postprocess(fsrc_loc, inline=args.array_inline)
         if args.inline_temp:
@@ -2934,7 +2983,7 @@ def main() -> int:
         try:
             fsrc = _transpile_text(text)
         except Exception as exc:
-            print(f"Transpile: FAIL ({_format_transpile_error(exc)})")
+            print(f"Transpile: FAIL ({_format_transpile_error(exc, source_name=c_file.name)})")
             return 1
         fsrc = _prepend_origin_comment(fsrc, [c_file])
         if args.out_dir is not None:

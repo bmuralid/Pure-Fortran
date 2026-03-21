@@ -7524,6 +7524,17 @@ def _reinvoke_for_input(args: argparse.Namespace, input_r: str) -> int:
     return int(cp.returncode)
 
 
+def _maybe_adopt_positional_out(args: argparse.Namespace) -> None:
+    if args.out or not args.helpers:
+        return
+    first = Path(args.helpers[0])
+    if first.name.lower() == "r.f90" or (
+        first.suffix.lower() in {".f90", ".f95", ".f03", ".f08", ".f", ".for"} and not first.exists()
+    ):
+        args.out = args.helpers[0]
+        args.helpers = args.helpers[1:]
+
+
 def _print_summary_table(rows: list[dict[str, object]]) -> None:
     if not rows:
         print("No files processed.")
@@ -7638,7 +7649,11 @@ def _print_summary_table(rows: list[dict[str, object]]) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Partial R-to-Fortran transpiler")
     ap.add_argument("input_r", help="input .R/.r source file")
-    ap.add_argument("helpers", nargs="*", help="optional helper Fortran source files (modules)")
+    ap.add_argument(
+        "helpers",
+        nargs="*",
+        help="optional helper Fortran source files (modules); a leading non-existent .f90 path is treated as positional output",
+    )
     ap.add_argument("--out", help="output .f90 path (default: <input>_r.f90)")
     ap.add_argument("--out-dir", help="directory for transpiled .f90, executable, and runtime-generated files")
     ap.add_argument("--compile", action="store_true", help="compile transpiled Fortran")
@@ -7714,6 +7729,7 @@ def main() -> int:
     )
     ap.add_argument("--summary", action="store_true", help="Print tabular per-file status summary.")
     args = ap.parse_args()
+    _maybe_adopt_positional_out(args)
     if args.no_recycle and (args.recycle_warn or args.recycle_stop):
         print("Options conflict: --no-recycle cannot be used with --recycle-warn or --recycle-stop.")
         return 1
@@ -7913,12 +7929,18 @@ def main() -> int:
     f90_lines = fscan.propagate_array_size_aliases(f90_lines)
     f90_lines = fscan.propagate_cached_size_values(f90_lines)
     f90_lines = fpost.simplify_redundant_parentheses(f90_lines)
+    f90_lines = fpost.tighten_unary_minus_literal_spacing(f90_lines)
+    f90_lines = fpost.normalize_delimiter_inner_spacing(f90_lines)
+    f90_lines = fpost.simplify_norm2_patterns(f90_lines)
+    f90_lines = fpost.simplify_bfgs_rank1_update(f90_lines)
+    f90_lines = fpost.remove_redundant_self_assignments(f90_lines)
     f90_lines = fscan.simplify_do_bounds_parens(f90_lines)
     f90_lines = fscan.simplify_negated_relational_conditions_in_lines(f90_lines)
     f90_lines = fscan.simplify_constant_if_blocks(f90_lines, aggressive=args.if_const_aggressive)
     f90_lines = mark_pure_with_xpure(f90_lines)
     f90_lines = fpost.collapse_single_stmt_if_blocks(f90_lines)
     f90_lines = fpost.simplify_do_while_true(f90_lines)
+    f90_lines = fpost.hoist_module_use_only_imports(f90_lines)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
     # NOTE: keep named-argument rewriting disabled here; the generic pass
     # can mis-handle array constructors in helper calls (e.g., r_rep_*).
@@ -7937,7 +7959,11 @@ def main() -> int:
     f90_lines = fscan.wrap_long_fortran_lines(f90_lines, max_len=80)
     f90_lines = fix_split_power_operator(f90_lines)
     f90_lines = fix_wrapped_closing_delims(f90_lines)
+    f90_lines = fpost.rewrite_named_arguments(f90_lines)
+    f90_lines = fpost.wrap_long_lines(f90_lines, max_len=80)
+    f90_lines = fpost.apply_xindent_defaults(f90_lines, max_len=80)
     f90_lines = fpost.ensure_blank_line_between_module_procedures(f90_lines)
+    f90_lines = fpost.ensure_blank_line_between_program_units(f90_lines)
     f90 = "\n".join(f90_lines) + ("\n" if f90.endswith("\n") else "")
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     r_comments = extract_r_top_comments(src)

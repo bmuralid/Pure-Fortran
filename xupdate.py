@@ -18,6 +18,12 @@ def list_py_files(path: Path) -> Dict[str, Path]:
     return out
 
 
+def is_tempish_name(name: str) -> bool:
+    """Return True if filename should be suppressed by --notemp."""
+    n = name.lower()
+    return n.startswith("_") or ("dbg" in n) or ("tmp" in n) or ("temp" in n)
+
+
 def find_readme(repo_dir: Path, explicit: Path | None) -> Path:
     """Return README path, preferring explicit path if provided."""
     if explicit is not None:
@@ -71,6 +77,14 @@ def files_differ(local_path: Path, repo_path: Path, *, mode: str) -> bool:
     if mode == "bytes":
         return sha256_file(local_path) != sha256_file(repo_path)
     return normalized_text(local_path) != normalized_text(repo_path)
+
+
+def file_contains_all(path: Path, needles: List[str]) -> bool:
+    """Return True when file text contains all needles (case-insensitive)."""
+    if not needles:
+        return True
+    text = normalized_text(path).lower()
+    return all(n.lower() in text for n in needles)
 
 
 def print_list(title: str, items: Iterable[str], *, flat: bool = False) -> None:
@@ -159,6 +173,17 @@ def main() -> int:
         action="store_true",
         help="Print each output group on one line",
     )
+    parser.add_argument(
+        "--notemp",
+        action="store_true",
+        help="Suppress files starting with '_' or containing dbg/tmp/temp (case-insensitive)",
+    )
+    parser.add_argument(
+        "--contains",
+        action="append",
+        default=[],
+        help="Keep only local source files containing this substring (case-insensitive). Repeatable.",
+    )
     args = parser.parse_args()
 
     local_dir = args.local_dir.resolve()
@@ -176,11 +201,19 @@ def main() -> int:
         return 2
 
     local_files = list_py_files(local_dir)
+    if args.contains:
+        local_files = {
+            name: path for name, path in local_files.items() if file_contains_all(path, args.contains)
+        }
     repo_files = list_py_files(repo_dir)
     readme_names = mentioned_py_names(readme_path)
 
     local_names = set(local_files.keys())
     repo_names = set(repo_files.keys())
+    if args.notemp:
+        local_names = {n for n in local_names if not is_tempish_name(n)}
+        repo_names = {n for n in repo_names if not is_tempish_name(n)}
+        readme_names = {n for n in readme_names if not is_tempish_name(n)}
 
     not_in_readme = sorted(local_names - readme_names)
     not_in_repo = sorted(local_names - repo_names)
@@ -220,6 +253,8 @@ def main() -> int:
     print(f"Local directory: {local_dir}")
     print(f"Repo directory:  {repo_dir}")
     print(f"README:          {readme_path}")
+    if args.contains:
+        print(f"Contains filter: {args.contains}")
     print("")
     print_list("Local *.py files not mentioned in README:", not_in_readme, flat=args.flat)
     print("")

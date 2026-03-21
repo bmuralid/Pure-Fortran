@@ -48,6 +48,47 @@ BLOCK_END_RE = re.compile(
     r"^\s*end\s*(if|do|select|where|forall|associate|block|critical)\b",
     re.IGNORECASE,
 )
+NUMBER_LITERAL_RE = re.compile(
+    r"(?<![a-z0-9_])(?:[+-]?(?:(?:\d+\.\d*|\.\d+|\d+)(?:[deq][+-]?\d+)?(?:_[a-z][a-z0-9_]*)?))(?![a-z0-9_])",
+    re.IGNORECASE,
+)
+KIND_SUFFIX_RE = re.compile(r"_([a-z][a-z0-9_]*)\b", re.IGNORECASE)
+KIND_INTRINSIC_RE = re.compile(r"^\s*kind\s*\(\s*(1\.0d0|1\.0)\s*\)\s*$", re.IGNORECASE)
+REAL_INTRINSIC_NAMES = {
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "atan2",
+    "cos",
+    "cosh",
+    "erf",
+    "erfc",
+    "exp",
+    "log",
+    "log10",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+}
+SPEC_STMT_PREFIXES = (
+    "use ",
+    "implicit ",
+    "import ",
+    "parameter ",
+    "data ",
+    "save ",
+    "dimension ",
+    "common ",
+    "equivalence ",
+    "external ",
+    "intrinsic ",
+    "namelist ",
+    "format ",
+    "entry ",
+)
 
 
 @dataclass
@@ -98,6 +139,21 @@ class FixSkip:
     unit_name: str
     name: str
     reason: str
+
+
+@dataclass
+class IntrinsicConstantCandidate:
+    """Intrinsic constant expression to extract into a local PARAMETER."""
+
+    path: Path
+    unit_kind: str
+    unit_name: str
+    insert_line: int
+    line: int
+    expr: str
+    name: str
+    type_spec: str
+    occurrences: List[Tuple[int, int, int]]
 
 
 def choose_files(args_files: List[Path], exclude: Iterable[str]) -> List[Path]:
@@ -223,6 +279,212 @@ def expr_refs(expr: str) -> Set[str]:
         if n not in LITERAL_WORDS and n not in implied_do_vars:
             refs.add(n)
     return refs
+
+
+def is_specification_stmt(stmt: str) -> bool:
+    """Return True when stmt is a declaration/specification statement."""
+    low = stmt.strip().lower()
+    if not low:
+        return True
+    if TYPE_DECL_RE.match(low):
+        return True
+    return low.startswith(SPEC_STMT_PREFIXES)
+
+
+def find_matching_paren(text: str, open_idx: int) -> Optional[int]:
+    """Return matching ')' index for '(' at open_idx."""
+    if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "(":
+        return None
+    depth = 0
+    in_single = False
+    in_double = False
+    for idx in range(open_idx, len(text)):
+        ch = text[idx]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return idx
+    return None
+
+
+def collect_intrinsic_call_spans(text: str, offset: int = 0) -> List[Tuple[int, int, str, str, str]]:
+    """Collect intrinsic-call spans as (start, end, name, expr, args), inner-first."""
+    out: List[Tuple[int, int, str, str, str]] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if not (ch.isalpha() or ch == "_"):
+            i += 1
+            continue
+        start = i
+        i += 1
+        while i < len(text) and (text[i].isalnum() or text[i] == "_"):
+            i += 1
+        name = text[start:i].lower()
+        j = i
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text) or text[j] != "(":
+            continue
+        if start > 0 and text[start - 1] == "%":
+            continue
+        end = find_matching_paren(text, j)
+        if end is None:
+            continue
+        args = text[j + 1 : end]
+        out.extend(collect_intrinsic_call_spans(args, offset + j + 1))
+        out.append((offset + start, offset + end + 1, name, text[start : end + 1], args))
+        i = end + 1
+    return out
+
+
+def is_intrinsic_constant_expr(
+    expr: str,
+    known_params: Set[str],
+    blocked_intrinsics: Optional[Set[str]] = None,
+) -> bool:
+    """Conservative check for constant expressions containing whitelisted intrinsics."""
+    text = strip_quoted_text((expr or "").strip().lower())
+    if not text:
+        return False
+    call_names = [m.group(1).lower() for m in CALL_LIKE_RE.finditer(text)]
+    if not call_names:
+        return False
+    blocked = blocked_intrinsics or set()
+    if any(name in blocked for name in call_names):
+        return False
+    if any(name not in REAL_INTRINSIC_NAMES for name in call_names):
+        return False
+
+    scrubbed = NUMBER_LITERAL_RE.sub(" ", text)
+    for name in REAL_INTRINSIC_NAMES:
+        scrubbed = re.sub(rf"\b{name}\s*(?=\()", " ", scrubbed, flags=re.IGNORECASE)
+    for pname in known_params:
+        scrubbed = re.sub(rf"\b{re.escape(pname)}\b", " ", scrubbed, flags=re.IGNORECASE)
+    for lit in LITERAL_WORDS:
+        scrubbed = re.sub(rf"\b{lit}\b", " ", scrubbed, flags=re.IGNORECASE)
+    leftovers = [m.group(1).lower() for m in IDENT_RE.finditer(scrubbed)]
+    return not leftovers
+
+
+def collect_file_parameter_names(finfo: fscan.SourceFileInfo) -> Set[str]:
+    """Collect PARAMETER names declared anywhere in the file."""
+    out: Set[str] = set()
+    for _ln, stmt in fscan.iter_fortran_statements(finfo.parsed_lines):
+        low = stmt.strip().lower()
+        if not TYPE_DECL_RE.match(low) or "::" not in low:
+            continue
+        if "parameter" not in parse_decl_attrs(low):
+            continue
+        for name, _has_init, _has_shape, _init_expr, _shape_text in parse_decl_entities(low):
+            out.add(name)
+    return out
+
+
+def collect_real_kind_parameters(finfo: fscan.SourceFileInfo) -> Dict[str, str]:
+    """Collect real kind-parameter names like dp => kind(1.0d0)."""
+    out: Dict[str, str] = {}
+    for _ln, stmt in fscan.iter_fortran_statements(finfo.parsed_lines):
+        low = stmt.strip().lower()
+        if not TYPE_DECL_RE.match(low) or "::" not in low:
+            continue
+        if "parameter" not in parse_decl_attrs(low):
+            continue
+        for name, has_init, _has_shape, init_expr, _shape_text in parse_decl_entities(low):
+            if not has_init:
+                continue
+            m_kind = KIND_INTRINSIC_RE.match(init_expr.strip().lower())
+            if not m_kind:
+                continue
+            out[name] = "double" if "d0" in m_kind.group(1).lower() else "single"
+    return out
+
+
+def infer_intrinsic_type_spec(expr: str, real_kind_params: Dict[str, str]) -> Optional[str]:
+    """Infer declaration type for a real-valued intrinsic constant expression."""
+    low = (expr or "").strip().lower()
+    suffixes = [m.group(1).lower() for m in KIND_SUFFIX_RE.finditer(low)]
+    for suffix in suffixes:
+        if suffix in real_kind_params:
+            return f"real({suffix})"
+    if re.search(r"(?:\d+\.\d*|\.\d+|\d+)d[+-]?\d+", low):
+        if "dp" in real_kind_params:
+            return "real(dp)"
+        for name, tag in real_kind_params.items():
+            if tag == "double":
+                return f"real({name})"
+        return "real(kind(1.0d0))"
+    if suffixes:
+        return "real"
+    return "real"
+
+
+def normalize_name_fragment(text: str) -> str:
+    """Normalize one expression fragment into a valid identifier suffix."""
+    raw = (text or "").strip().lower()
+    raw = re.sub(r"_[a-z][a-z0-9_]*\b", "", raw)
+    raw = re.sub(r"^[+]\s*", "", raw)
+    raw = re.sub(r"^-\s*", "neg_", raw)
+    m_num = re.match(r"^(\d+)(?:\.(\d*))?(?:[deq][+-]?\d+)?$", raw, re.IGNORECASE)
+    if m_num:
+        whole = m_num.group(1).lstrip("0") or "0"
+        frac = (m_num.group(2) or "").rstrip("0")
+        return f"{whole}_{frac}" if frac else whole
+    raw = re.sub(r"[^a-z0-9]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    if not raw:
+        return "const"
+    if raw[0].isdigit():
+        raw = f"v_{raw}"
+    return raw[:40]
+
+
+def choose_intrinsic_constant_name(expr: str, existing_names: Set[str]) -> str:
+    """Choose a non-conflicting identifier name for one intrinsic expression."""
+    spans = collect_intrinsic_call_spans(expr)
+    if not spans:
+        base = "intrinsic_const"
+    else:
+        _start, _end, func_name, _call_expr, args = spans[-1]
+        arg_parts = [normalize_name_fragment(part) for part in split_top_level_commas(args)]
+        arg_parts = [p for p in arg_parts if p]
+        base = "_".join([func_name] + arg_parts) if arg_parts else f"{func_name}_const"
+    candidate = base
+    while candidate.lower() in existing_names:
+        candidate = f"{candidate}_"
+    return candidate.lower()
+
+
+def collect_unit_declared_names(unit: xunset.Unit) -> Set[str]:
+    """Collect declared names local to one unit."""
+    out: Set[str] = {unit.name.lower()} | set(unit.dummy_names)
+    for _ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if TYPE_DECL_RE.match(low) and "::" in low:
+            for name, _has_init, _has_shape, _init_expr, _shape_text in parse_decl_entities(low):
+                out.add(name)
+    return out
+
+
+def find_intrinsic_insert_line(unit: xunset.Unit) -> int:
+    """Return the line before which intrinsic constants should be declared."""
+    for ln, stmt in unit.body:
+        low = stmt.strip().lower()
+        if not low:
+            continue
+        if low.startswith("contains"):
+            return ln
+        if is_specification_stmt(low):
+            continue
+        return ln
+    return unit.end
 
 
 def is_parameter_safe_expr(
@@ -1130,6 +1392,128 @@ def analyze_file(path: Path, allow_alloc_promotion: bool) -> Tuple[List[Candidat
     return candidates, exclusions
 
 
+def analyze_intrinsic_constants_in_file(path: Path) -> List[IntrinsicConstantCandidate]:
+    """Find intrinsic constant expressions that can be extracted into PARAMETER declarations."""
+    infos, any_missing = fscan.load_source_files([path])
+    if not infos or any_missing:
+        return []
+    finfo = infos[0]
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    file_params = collect_file_parameter_names(finfo)
+    real_kind_params = collect_real_kind_parameters(finfo)
+    proc_names = {p.name.lower() for p in finfo.procedures}
+    out: List[IntrinsicConstantCandidate] = []
+
+    for unit in xunset.collect_units(finfo):
+        existing_names = collect_unit_declared_names(unit) | file_params | proc_names
+        blocked_intrinsics = existing_names - file_params
+        insert_line = find_intrinsic_insert_line(unit)
+        per_expr: Dict[str, IntrinsicConstantCandidate] = {}
+
+        for ln, stmt in unit.body:
+            low = stmt.strip().lower()
+            if not low or is_specification_stmt(low):
+                continue
+            if low.startswith("contains"):
+                break
+            if ln < 1 or ln > len(lines):
+                continue
+            raw_line = lines[ln - 1]
+            code, _comment = split_code_comment(raw_line)
+            if ";" in code or "&" in code:
+                continue
+            spans = collect_intrinsic_call_spans(code)
+            for start, end, call_name, call_expr, args in spans:
+                if call_name not in REAL_INTRINSIC_NAMES:
+                    continue
+                if not is_intrinsic_constant_expr(call_expr, file_params, blocked_intrinsics=blocked_intrinsics):
+                    continue
+                type_spec = infer_intrinsic_type_spec(call_expr, real_kind_params)
+                if not type_spec:
+                    continue
+                expr_norm = normalize_expr_for_equality(call_expr)
+                candidate = per_expr.get(expr_norm)
+                if candidate is None:
+                    new_name = choose_intrinsic_constant_name(call_expr, existing_names)
+                    existing_names.add(new_name)
+                    candidate = IntrinsicConstantCandidate(
+                        path=path,
+                        unit_kind=unit.kind,
+                        unit_name=unit.name,
+                        insert_line=insert_line,
+                        line=ln,
+                        expr=call_expr.strip(),
+                        name=new_name,
+                        type_spec=type_spec,
+                        occurrences=[],
+                    )
+                    per_expr[expr_norm] = candidate
+                candidate.occurrences.append((ln, start, end))
+        out.extend(sorted(per_expr.values(), key=lambda c: (c.insert_line, c.line, c.name)))
+    return out
+
+
+def apply_intrinsic_constant_fixes_for_file(
+    path: Path,
+    candidates: List[IntrinsicConstantCandidate],
+    *,
+    out_path: Optional[Path] = None,
+    create_backup: bool = True,
+) -> Tuple[int, Optional[Path]]:
+    """Apply intrinsic constant extractions to one file."""
+    if not candidates:
+        return 0, None
+    target_path = out_path if out_path is not None else path
+    source_path = target_path if target_path.exists() else path
+    original_text = source_path.read_text(encoding="utf-8")
+    lines = original_text.splitlines()
+    backup_path: Optional[Path] = None
+    applied = 0
+
+    grouped: Dict[Tuple[str, str, int], List[IntrinsicConstantCandidate]] = {}
+    for cand in candidates:
+        grouped.setdefault((cand.unit_kind, cand.unit_name, cand.insert_line), []).append(cand)
+
+    ordered_groups = sorted(grouped.items(), key=lambda kv: kv[0][2], reverse=True)
+    for (_kind, _unit_name, insert_line), group in ordered_groups:
+        repls_by_line: Dict[int, List[Tuple[int, int, str]]] = {}
+        for cand in group:
+            for ln, start, end in cand.occurrences:
+                repls_by_line.setdefault(ln, []).append((start, end, cand.name))
+        for ln in sorted(repls_by_line.keys(), reverse=True):
+            idx = ln - 1
+            if idx < 0 or idx >= len(lines):
+                continue
+            code, comment = split_code_comment(lines[idx])
+            for start, end, name in sorted(repls_by_line[ln], key=lambda item: item[0], reverse=True):
+                if start < 0 or end > len(code) or start >= end:
+                    continue
+                code = f"{code[:start]}{name}{code[end:]}"
+            lines[idx] = f"{code}{comment}"
+        insert_idx = max(0, min(len(lines), insert_line - 1))
+        indent = ""
+        if 0 <= insert_idx < len(lines):
+            indent = re.match(r"^\s*", lines[insert_idx]).group(0)
+        elif lines:
+            indent = re.match(r"^\s*", lines[max(0, insert_idx - 1)]).group(0)
+        decl_lines = [
+            f"{indent}{cand.type_spec}, parameter :: {cand.name} = {cand.expr}"
+            for cand in sorted(group, key=lambda c: (c.line, c.name))
+        ]
+        lines[insert_idx:insert_idx] = decl_lines
+        applied += len(group)
+
+    if backup_path is None and out_path is None and create_backup:
+        backup_path = make_backup_path(path)
+        shutil.copy2(path, backup_path)
+
+    new_text = "\n".join(lines)
+    if original_text.endswith("\n"):
+        new_text += "\n"
+    target_path.write_text(new_text, encoding="utf-8")
+    return applied, backup_path
+
+
 def promote_parameter_candidates_in_file(
     path: Path,
     *,
@@ -1187,6 +1571,11 @@ def main() -> int:
         action="store_true",
         help="Allow allocatable rank-1 deferred-shape arrays to be promoted to PARAMETER when safe",
     )
+    parser.add_argument(
+        "--intrinsic-constants",
+        action="store_true",
+        help="Extract safe intrinsic constant expressions into local PARAMETER declarations",
+    )
     parser.add_argument("--out", type=Path, help="With fix modes, write transformed output to this file (single input)")
     parser.add_argument("--backup", dest="backup", action="store_true", default=True)
     parser.add_argument("--no-backup", dest="backup", action="store_false")
@@ -1223,14 +1612,17 @@ def main() -> int:
 
     all_candidates: List[Candidate] = []
     all_exclusions: List[Exclusion] = []
+    all_intrinsic_candidates: List[IntrinsicConstantCandidate] = []
     for finfo in ordered_infos:
         cands, excls = analyze_file(finfo.path, allow_alloc_promotion=args.fix_alloc)
         all_candidates.extend(cands)
         all_exclusions.extend(excls)
+        if args.intrinsic_constants:
+            all_intrinsic_candidates.extend(analyze_intrinsic_constants_in_file(finfo.path))
 
-    if not all_candidates:
+    if not all_candidates and not all_intrinsic_candidates:
         print("No constant candidates found.")
-    else:
+    elif all_candidates:
         all_candidates.sort(key=lambda c: (c.path.name.lower(), c.first_write_line, c.name))
         print(f"{len(all_candidates)} constant candidate(s):")
         for c in all_candidates:
@@ -1238,6 +1630,11 @@ def main() -> int:
                 f"{c.path.name}:{c.first_write_line} {c.unit_kind} {c.unit_name} {c.name} "
                 f"(decl@{c.decl_line}, first set: {c.first_write_detail})"
             )
+    if args.intrinsic_constants and all_intrinsic_candidates:
+        all_intrinsic_candidates.sort(key=lambda c: (c.path.name.lower(), c.line, c.name))
+        print(f"{len(all_intrinsic_candidates)} intrinsic constant candidate(s):")
+        for c in all_intrinsic_candidates:
+            print(f"{c.path.name}:{c.line} {c.unit_kind} {c.unit_name} {c.expr} -> {c.name}")
 
     if args.verbose:
         all_exclusions.sort(key=lambda e: (e.path.name.lower(), e.decl_line, e.name))
@@ -1247,18 +1644,21 @@ def main() -> int:
                 print(f"{e.path.name}:{e.decl_line} {e.unit_kind} {e.unit_name} {e.name} - {e.reason}")
 
     do_fix = args.fix or args.fix_all
-    if do_fix and all_candidates:
+    if do_fix and (all_candidates or (args.intrinsic_constants and all_intrinsic_candidates)):
         by_file: Dict[Path, List[Candidate]] = {}
         for c in all_candidates:
             by_file.setdefault(c.path, []).append(c)
         total_applied = 0
         total_skipped = 0
-        for path in sorted(by_file.keys(), key=lambda p: p.name.lower()):
+        target_files = set(by_file.keys())
+        if args.intrinsic_constants:
+            target_files.update(c.path for c in all_intrinsic_candidates)
+        for path in sorted(target_files, key=lambda p: p.name.lower()):
             original_text = path.read_text(encoding="utf-8")
             file_applied = 0
             file_skipped: List[FixSkip] = []
             backup_name = ""
-            if args.out is not None:
+            if args.out is not None and path in by_file:
                 applied, skipped, _backup = apply_fixes_for_file(
                     path,
                     by_file[path],
@@ -1269,7 +1669,7 @@ def main() -> int:
                 )
                 file_applied += applied
                 file_skipped.extend(skipped)
-            else:
+            elif path in by_file:
                 max_iter = 100
                 for _iter in range(max_iter):
                     iter_candidates, _iter_exclusions = analyze_file(path, allow_alloc_promotion=args.fix_alloc)
@@ -1288,6 +1688,20 @@ def main() -> int:
                         backup_name = backup.name
                     if applied == 0:
                         break
+            intrinsic_target = args.out if args.out is not None else path
+            if args.intrinsic_constants:
+                intrinsic_source = intrinsic_target if intrinsic_target.exists() else path
+                intrinsic_candidates = analyze_intrinsic_constants_in_file(intrinsic_source)
+                if intrinsic_candidates:
+                    applied_intr, backup_intr = apply_intrinsic_constant_fixes_for_file(
+                        intrinsic_source,
+                        intrinsic_candidates,
+                        out_path=(args.out if args.out is not None and intrinsic_source != args.out else None),
+                        create_backup=args.backup,
+                    )
+                    file_applied += applied_intr
+                    if backup_intr is not None and not backup_name:
+                        backup_name = backup_intr.name
             total_applied += file_applied
             total_skipped += len(file_skipped)
             if args.out is not None and file_applied > 0:

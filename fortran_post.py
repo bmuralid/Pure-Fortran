@@ -411,6 +411,7 @@ def hoist_module_use_only_imports(lines: List[str]) -> List[str]:
 
 def apply_xindent_defaults(lines: List[str], *, max_len: int = 80) -> List[str]:
     """Apply xindent.py default indentation/wrapping policy to emitted lines."""
+    eol = "\n" if any(("\n" in ln) or ("\r" in ln) for ln in lines) else ""
     plain_lines = [ln.rstrip("\r\n") for ln in lines]
     src = ("\n".join(plain_lines) + "\n") if plain_lines else ""
     src_lines = src.splitlines()
@@ -463,7 +464,9 @@ def apply_xindent_defaults(lines: List[str], *, max_len: int = 80) -> List[str]:
             wrapped.extend(fscan.wrap_long_fortran_lines([ln], max_len=max_len))
             continue
         wrapped.append(ln)
-    return wrapped
+    if not eol:
+        return wrapped
+    return [ln if ln.endswith(("\n", "\r\n")) else f"{ln}{eol}" for ln in wrapped]
 
 
 def simplify_bfgs_rank1_update(lines: List[str]) -> List[str]:

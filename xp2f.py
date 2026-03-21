@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import argparse
 import glob
+import math
 import traceback
 import shlex
 import subprocess
@@ -2031,11 +2032,44 @@ def simplify_generated_parentheses(lines):
             i += 1
         return False
 
+    def _has_top_level_arith_op(s):
+        depth = 0
+        in_str = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == '"':
+                in_str = not in_str
+                i += 1
+                continue
+            if in_str:
+                i += 1
+                continue
+            if ch == "(":
+                depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth == 0:
+                if ch in "*/":
+                    return True
+                if ch in "+-":
+                    j = i - 1
+                    while j >= 0 and s[j].isspace():
+                        j -= 1
+                    if j >= 0 and (s[j].isalnum() or s[j] in ")]_"):
+                        return True
+            i += 1
+        return False
+
     def _peel_print_arg_parens(expr):
         cur = expr.strip()
         while cur.startswith("(") and cur.endswith(")"):
             inner = cur[1:-1].strip()
-            if not inner or _has_top_level_comma(inner):
+            if not inner or _has_top_level_comma(inner) or _has_top_level_arith_op(inner):
                 break
             if strip_redundant_outer_parens_expr(cur) == cur:
                 cur = inner
@@ -2073,9 +2107,11 @@ def simplify_generated_parentheses(lines):
             else:
                 code = f"{head}{lb}{tail_ws}"
 
-        # Collapse one redundant nested paren layer in subscripts/conditionals:
+        # Collapse one redundant nested paren layer in simple subscripts/conditions:
         # x((i+1)) -> x(i+1)
-        code = re.sub(r"\(\(([^()]+)\)\)", r"(\1)", code)
+        # Keep double parens around complex literals like ((0.0_dp, 1.0_dp)),
+        # which are required when passed as a single function argument.
+        code = re.sub(r"\(\(([^(),]+)\)\)", r"(\1)", code)
 
         # Intrinsic single-argument form cleanup:
         # abs((expr)) -> abs(expr), robust to nested calls inside expr.
@@ -3275,6 +3311,136 @@ def combine_allocate_mold_with_scalar_source(lines):
     return out
 
 
+def mark_recursive_procedures(lines):
+    """Add `recursive` to procedure headers when the body calls itself."""
+    start_re = re.compile(
+        r"^(\s*)(?P<prefix>(?:(?:pure|impure|elemental|recursive|module)\s+)*)"
+        r"(?P<kind>subroutine|function)\s+(?P<name>[A-Za-z_]\w*)\s*\(",
+        re.IGNORECASE,
+    )
+    end_re = re.compile(r"^\s*end\s+(?:subroutine|function)\b", re.IGNORECASE)
+
+    def _line_code_only(txt):
+        return txt.split("!", 1)[0]
+
+    out = list(lines)
+    i = 0
+    while i < len(out):
+        m = start_re.match(out[i])
+        if not m:
+            i += 1
+            continue
+        prefix = m.group("prefix") or ""
+        if re.search(r"\brecursive\b", prefix, re.IGNORECASE):
+            i += 1
+            continue
+        if re.search(r"\belemental\b", prefix, re.IGNORECASE):
+            i += 1
+            continue
+        name = m.group("name")
+        kind = m.group("kind").lower()
+        j = i + 1
+        body_calls_self = False
+        call_re = re.compile(rf"\bcall\s+{re.escape(name)}\s*\(", re.IGNORECASE)
+        func_re = re.compile(rf"(?<![A-Za-z_]){re.escape(name)}\s*\(", re.IGNORECASE)
+        while j < len(out):
+            code = _line_code_only(out[j])
+            if end_re.match(code):
+                break
+            if kind == "subroutine":
+                if call_re.search(code):
+                    body_calls_self = True
+                    break
+            else:
+                if func_re.search(code):
+                    body_calls_self = True
+                    break
+            j += 1
+        if body_calls_self:
+            out[i] = f"{m.group(1)}recursive {out[i].lstrip()}"
+        i = max(i + 1, j)
+    return out
+
+
+def build_numpy_split_mapping(arr_expr, arr_rank, func_attr, split_node=None, axis_node=None):
+    """Build compile-time slice aliases for NumPy split-family helpers."""
+    if arr_rank <= 0:
+        raise NotImplementedError("np.split family requires array input")
+    if func_attr == "hsplit":
+        axis = 1 if arr_rank > 1 else 0
+    elif func_attr == "vsplit":
+        axis = 0
+    elif func_attr == "dsplit":
+        axis = 2
+    else:
+        axis = 0
+    if axis_node is not None:
+        if not is_const_int(axis_node):
+            raise NotImplementedError("np.split family currently requires constant axis")
+        axis = int(axis_node.value)
+    if axis < 0:
+        axis += arr_rank
+    if axis < 0 or axis >= arr_rank:
+        raise NotImplementedError("np.split family axis out of range")
+
+    def _extent_expr():
+        if arr_rank == 1:
+            return f"size({arr_expr})"
+        return f"size({arr_expr}, {axis + 1})"
+
+    def _slice_expr(lo_expr, hi_expr):
+        if arr_rank == 1:
+            return f"{arr_expr}({lo_expr}:{hi_expr})"
+        dims = [":" for _ in range(arr_rank)]
+        dims[axis] = f"{lo_expr}:{hi_expr}"
+        return f"{arr_expr}(" + ", ".join(dims) + ")"
+
+    extent_expr = _extent_expr()
+    mapping = {}
+    if func_attr in {"split", "hsplit", "vsplit", "dsplit"}:
+        if isinstance(split_node, (ast.List, ast.Tuple)) and all(is_const_int(e) for e in split_node.elts):
+            cuts = [int(e.value) for e in split_node.elts]
+            starts = [0] + cuts
+            ends = cuts + [-1]
+            for k, (s0, e0) in enumerate(zip(starts, ends)):
+                lo = f"({s0} + 1)"
+                hi = extent_expr if e0 < 0 else str(e0)
+                mapping[k] = _slice_expr(lo, hi)
+            return mapping, axis
+        if not (
+            isinstance(split_node, ast.Constant)
+            and isinstance(split_node.value, int)
+            and int(split_node.value) > 0
+        ):
+            raise NotImplementedError("np.split family currently requires constant section counts or index lists")
+        m = int(split_node.value)
+        q_expr = f"(({extent_expr}) / {m})"
+        for k in range(m):
+            kk = str(k)
+            lo = f"({kk}*({q_expr}) + 1)"
+            hi = f"({lo} + ({q_expr}) - 1)"
+            mapping[k] = _slice_expr(lo, hi)
+        return mapping, axis
+    if func_attr == "array_split":
+        if not (
+            isinstance(split_node, ast.Constant)
+            and isinstance(split_node.value, int)
+            and int(split_node.value) > 0
+        ):
+            raise NotImplementedError("np.array_split currently requires constant positive section count")
+        m = int(split_node.value)
+        q_expr = f"(({extent_expr}) / {m})"
+        r_expr = f"mod({extent_expr}, {m})"
+        for k in range(m):
+            kk = str(k)
+            lo = f"({kk}*({q_expr}) + min({kk}, {r_expr}) + 1)"
+            sz = f"(({q_expr}) + merge(1, 0, ({kk} < {r_expr})))"
+            hi = f"({lo} + {sz} - 1)"
+            mapping[k] = _slice_expr(lo, hi)
+        return mapping, axis
+    raise NotImplementedError(f"unsupported split-family helper: np.{func_attr}")
+
+
 def inline_shape_comments(lines):
     """
     Move standalone shape comments like '! (n,k)' onto the next executable line.
@@ -3528,6 +3694,9 @@ def detect_needed_helpers(tree):
     linalg_aliases = collect_linalg_aliases(tree)
     scipy_aliases, _ = collect_scipy_special_aliases(tree)
     statistics_aliases, statistics_func_aliases = collect_statistics_aliases(tree)
+    time_aliases, time_func_aliases = collect_time_aliases(tree)
+    sys_aliases, sys_func_aliases = collect_sys_aliases(tree)
+    math_aliases, math_func_aliases = collect_math_aliases(tree)
     np_helper_map = {
         "arange": {"arange_int"},
         "linspace": {"arange_int"},
@@ -3535,6 +3704,16 @@ def detect_needed_helpers(tree):
         "geomspace": {"geomspace"},
         "cumsum": {"cumsum"},
         "cumprod": {"cumprod"},
+        "cumulative_sum": {"cumsum"},
+        "cumulative_prod": {"cumprod"},
+        "unwrap": {"unwrap_1d"},
+        "bitwise_count": {"bitwise_count_int"},
+        "i0": {"i0_scalar"},
+        "sinc": {"sinc_scalar"},
+        "signbit": {"signbit_real"},
+        "gcd": {"gcd_int_scalar"},
+        "lcm": {"lcm_int_scalar"},
+        "interp": {"interp_1d"},
         "gradient": {"gradient_1d"},
         "eye": {"eye"},
         "identity": {"eye"},
@@ -3574,16 +3753,17 @@ def detect_needed_helpers(tree):
         "nanargmin": {"nanargmin"},
         "nanargmax": {"nanargmax"},
         "log2": {"log2"},
-        "zeros": {"zeros_int", "zeros_real", "zeros_logical"},
-        "ones": {"ones_int", "ones_real", "ones_logical"},
-        "zeros_like": {"zeros_int", "zeros_real", "zeros_logical"},
-        "ones_like": {"ones_int", "ones_real", "ones_logical"},
+        "zeros": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
+        "ones": {"ones_int", "ones_real", "ones_logical", "zeros_complex", "ones_complex"},
+        "zeros_like": {"zeros_int", "zeros_real", "zeros_logical", "zeros_complex"},
+        "ones_like": {"ones_int", "ones_real", "ones_logical", "ones_complex"},
         "full": {"arange_int"},
         "nonzero": {"arange_int"},
         "argwhere": {"arange_int"},
         "union1d": {"unique_int"},
         "tri": {"tri_int", "tri_real"},
         "moveaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
+        "rollaxis": {"moveaxis3_int", "moveaxis3_real", "moveaxis3_logical"},
         "cov": {"cov2_real", "cov_matrix_rows_real"},
         "corrcoef": {"corrcoef2_real", "corrcoef_matrix_rows_real"},
         "convolve": {"convolve_real", "convolve_int"},
@@ -3592,6 +3772,9 @@ def detect_needed_helpers(tree):
         "savetxt": {"savetxt_real_2d"},
         "pad": {"pad2d_int", "pad2d_real"},
         "allclose": {"allclose"},
+        "isfinite": {"complex_isfinite"},
+        "isinf": {"complex_isinf"},
+        "isnan": {"complex_isnan"},
         "polyval": {"polyval"},
         "polyder": {"polyder"},
         "roots": {"polyroots_real"},
@@ -3611,6 +3794,9 @@ def detect_needed_helpers(tree):
             self.rng_names = set()
             self.scipy_special_aliases, self.scipy_special_func_aliases = collect_scipy_special_aliases(tree)
             self.statistics_aliases, self.statistics_func_aliases = collect_statistics_aliases(tree)
+            self.time_aliases, self.time_func_aliases = time_aliases, time_func_aliases
+            self.sys_aliases, self.sys_func_aliases = sys_aliases, sys_func_aliases
+            self.math_aliases, self.math_func_aliases = math_aliases, math_func_aliases
 
         def visit_Subscript(self, node):
             if isinstance(node.value, ast.Call):
@@ -3858,12 +4044,52 @@ def detect_needed_helpers(tree):
                 needed.add(node.func.id)
             if isinstance(node.func, ast.Name) and node.func.id in {"py_str", "py_ctime", "py_time"}:
                 needed.add(node.func.id)
+            if isinstance(node.func, ast.Name) and node.func.id in self.math_func_aliases:
+                mf = self.math_func_aliases[node.func.id]
+                if mf == "isqrt":
+                    needed.add("isqrt_int")
+                elif mf == "factorial":
+                    needed.add("factorial_int")
+                elif mf == "comb":
+                    needed.add("comb_int")
+                elif mf == "perm":
+                    needed.add("perm_int")
+                elif mf == "gcd":
+                    needed.add("gcd_int")
+                    needed.add("gcd_int_scalar")
+                elif mf == "lcm":
+                    needed.add("lcm_int")
+                    needed.add("lcm_int_scalar")
+                elif mf == "cmath:isfinite":
+                    needed.add("complex_isfinite")
+                elif mf == "cmath:isinf":
+                    needed.add("complex_isinf")
+                elif mf == "cmath:isnan":
+                    needed.add("complex_isnan")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "cmath"
+                and node.func.attr in {"isfinite", "isinf", "isnan"}
+            ):
+                if node.func.attr == "isfinite":
+                    needed.add("complex_isfinite")
+                elif node.func.attr == "isinf":
+                    needed.add("complex_isinf")
+                else:
+                    needed.add("complex_isnan")
+            if isinstance(node.func, ast.Name) and node.func.id in self.time_func_aliases:
+                tf = self.time_func_aliases[node.func.id]
+                if tf in {"time", "perf_counter"} and len(node.args) == 0:
+                    needed.add("py_time")
+                elif tf == "ctime" and len(node.args) <= 1:
+                    needed.add("py_ctime")
             if isinstance(node.func, ast.Name) and node.func.id in {"eye", "diag"}:
                 needed.add(node.func.id)
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "time"
+                and node.func.value.id in self.time_aliases
                 and node.func.attr in {"time", "perf_counter"}
                 and len(node.args) == 0
             ):
@@ -3871,11 +4097,30 @@ def detect_needed_helpers(tree):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "time"
+                and node.func.value.id in self.time_aliases
                 and node.func.attr == "ctime"
                 and len(node.args) <= 1
             ):
                 needed.add("py_ctime")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+            ):
+                if node.func.attr == "isqrt":
+                    needed.add("isqrt_int")
+                elif node.func.attr == "factorial":
+                    needed.add("factorial_int")
+                elif node.func.attr == "comb":
+                    needed.add("comb_int")
+                elif node.func.attr == "perm":
+                    needed.add("perm_int")
+                elif node.func.attr == "gcd":
+                    needed.add("gcd_int")
+                    needed.add("gcd_int_scalar")
+                elif node.func.attr == "lcm":
+                    needed.add("lcm_int")
+                    needed.add("lcm_int_scalar")
             if isinstance(node.func, ast.Name) and node.func.id == "set":
                 needed.add("unique_char")
                 needed.add("unique_int")
@@ -3936,7 +4181,7 @@ def detect_needed_helpers(tree):
                 and isinstance(node.func.value.value, ast.Name)
                 and node.func.value.value.id == "np"
                 and node.func.value.attr == "random"
-                and node.func.attr in {"rand", "random"}
+                and node.func.attr in {"rand", "random", "uniform"}
             ):
                 needed.add("runif")
             if (
@@ -4327,6 +4572,12 @@ def detect_needed_helpers(tree):
                                     needed.add("str_ljust")
                                     needed.add("str_rjust")
             if isinstance(node.func, ast.Name) and node.func.id == "str" and len(node.args) == 1:
+                needed.add("py_str")
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "write"
+                and len(node.args) == 1
+            ):
                 needed.add("py_str")
             if (
                 isinstance(node.func, ast.Attribute)
@@ -4861,6 +5112,165 @@ def collect_statistics_aliases(tree):
                     if nm in supported:
                         func_aliases[asn or nm] = nm
     return module_aliases, func_aliases
+
+
+def collect_time_aliases(tree):
+    """Collect aliases for time module and directly imported functions."""
+    module_aliases = set()
+    func_aliases = {}
+    supported = {"time", "perf_counter", "ctime"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if mod == "time":
+                    module_aliases.add(asn or "time")
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").strip()
+            if mod == "time":
+                for al in node.names:
+                    nm = (al.name or "").strip()
+                    asn = (al.asname or "").strip()
+                    if nm in supported:
+                        func_aliases[asn or nm] = nm
+    return module_aliases, func_aliases
+
+
+def collect_sys_aliases(tree):
+    """Collect aliases for sys module and directly imported control functions."""
+    module_aliases = set()
+    func_aliases = {}
+    supported = {"exit", "quit"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if mod == "sys":
+                    module_aliases.add(asn or "sys")
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").strip()
+            if mod == "sys":
+                for al in node.names:
+                    nm = (al.name or "").strip()
+                    asn = (al.asname or "").strip()
+                    if nm in supported:
+                        func_aliases[asn or nm] = nm
+    return module_aliases, func_aliases
+
+
+def collect_math_aliases(tree):
+    """Collect aliases for math module and directly imported supported functions."""
+    module_aliases = set()
+    func_aliases = {}
+    supported = {
+        "sqrt", "erf", "erfc",
+        "atan", "asin", "acos", "tan", "sin", "cos",
+        "exp", "log", "atan2", "expm1", "log1p",
+        "floor", "ceil", "trunc", "prod", "isclose",
+        "comb", "perm", "factorial", "gcd", "lcm", "isqrt",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                asn = (al.asname or "").strip()
+                if mod == "math":
+                    module_aliases.add(asn or "math")
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").strip()
+            if mod == "math":
+                for al in node.names:
+                    nm = (al.name or "").strip()
+                    asn = (al.asname or "").strip()
+                    if nm in supported:
+                        func_aliases[asn or nm] = nm
+            elif mod == "cmath":
+                for al in node.names:
+                    nm = (al.name or "").strip()
+                    asn = (al.asname or "").strip()
+                    if nm in {
+                        "sqrt", "exp", "log", "log10",
+                        "sin", "cos", "tan", "asin", "acos", "atan",
+                        "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+                        "phase", "polar", "rect", "isfinite", "isinf", "isnan", "isclose",
+                    }:
+                        func_aliases[asn or nm] = f"cmath:{nm}"
+    return module_aliases, func_aliases
+
+
+SUPPORTED_IMPORT_ROOTS = {
+    "numpy", "scipy", "math", "random", "time", "platform", "sys",
+    "itertools", "statistics", "csv", "pprint", "subprocess", "os",
+    "pathlib", "argparse", "shlex", "difflib", "io", "tokenize",
+    "datetime", "copy", "glob", "traceback", "tempfile", "re",
+}
+
+KNOWN_UNSUPPORTED_IMPORT_PREFIXES = {
+    "PIL", "matplotlib", "pandas", "mpi4py", "graphviz", "tkinter",
+    "cv2", "skimage", "seaborn", "requests", "bs4",
+}
+
+
+def _stdlib_module_names():
+    names = getattr(sys, "stdlib_module_names", None)
+    if names:
+        return set(names)
+    return set(sys.builtin_module_names)
+
+
+def _local_module_exists(base_dir: Path, module_name: str) -> bool:
+    if not module_name:
+        return False
+    parts = [p for p in module_name.split(".") if p]
+    if not parts:
+        return False
+    cur = base_dir
+    for idx, part in enumerate(parts):
+        py_file = cur / f"{part}.py"
+        pkg_dir = cur / part
+        is_last = idx == len(parts) - 1
+        if is_last:
+            return py_file.exists() or (pkg_dir.is_dir() and (pkg_dir / "__init__.py").exists())
+        if pkg_dir.is_dir() and (pkg_dir / "__init__.py").exists():
+            cur = pkg_dir
+            continue
+        return False
+    return False
+
+
+def validate_imports_supported(tree, py_path):
+    """Fail early on clearly unsupported third-party imports."""
+    base_dir = Path(py_path).resolve().parent
+    stdlib = _stdlib_module_names()
+
+    def _classify(mod_name):
+        root = (mod_name or "").split(".", 1)[0]
+        if not root:
+            return None
+        if root in KNOWN_UNSUPPORTED_IMPORT_PREFIXES:
+            return f"unsupported imported module: {mod_name}"
+        if root in SUPPORTED_IMPORT_ROOTS or root in stdlib:
+            return None
+        if _local_module_exists(base_dir, mod_name) or _local_module_exists(base_dir, root):
+            return None
+        return f"unsupported imported module: {mod_name}"
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for al in node.names:
+                mod = (al.name or "").strip()
+                msg = _classify(mod)
+                if msg is not None:
+                    raise NotImplementedError(msg)
+        elif isinstance(node, ast.ImportFrom):
+            mod = (node.module or "").strip()
+            if getattr(node, "level", 0):
+                continue
+            msg = _classify(mod)
+            if msg is not None:
+                raise NotImplementedError(msg)
 
 
 def collect_structured_dtype_info(tree):
@@ -7518,7 +7928,6 @@ def compute_hv(ret, window: int, scheme: str, annualization: float):
     out[0, 0] = np.nan
     return out
 
-
 def compute_future_vol(ret, horizon: int, annualization: float):
     out = np.empty((1, 1), dtype=float)
     out[0, 0] = np.nan
@@ -7785,12 +8194,17 @@ class emit:
 
 class translator(ast.NodeVisitor):
     global_synthetic_slices = {}
+    global_synthetic_slice_meta = {}
     global_vectorize_aliases = {}
     global_linalg_aliases = set()
     global_scipy_special_aliases = set()
     global_scipy_special_func_aliases = {}
     global_statistics_aliases = set()
     global_statistics_func_aliases = {}
+    global_time_aliases = set()
+    global_time_func_aliases = {}
+    global_math_aliases = set()
+    global_math_func_aliases = {}
 
     def __init__(
         self,
@@ -7887,12 +8301,20 @@ class translator(ast.NodeVisitor):
         self.local_assigned_names = set()
         self.dict_var_components = {}
         self.synthetic_slices = dict(translator.global_synthetic_slices)
+        self.synthetic_slice_meta = dict(translator.global_synthetic_slice_meta)
         self.vectorize_aliases = dict(translator.global_vectorize_aliases)
         self.linalg_aliases = set(translator.global_linalg_aliases)
         self.scipy_special_aliases = set(translator.global_scipy_special_aliases)
         self.scipy_special_func_aliases = dict(translator.global_scipy_special_func_aliases)
         self.statistics_aliases = set(translator.global_statistics_aliases)
         self.statistics_func_aliases = dict(translator.global_statistics_func_aliases)
+        self.time_aliases = set(translator.global_time_aliases)
+        self.time_func_aliases = dict(translator.global_time_func_aliases)
+        self.sys_aliases = set(getattr(translator, "global_sys_aliases", set()))
+        self.sys_func_aliases = dict(getattr(translator, "global_sys_func_aliases", {}))
+        self.math_aliases = set(translator.global_math_aliases)
+        self.math_func_aliases = dict(translator.global_math_func_aliases)
+        self.broadcast_object_args = {}
         self.promoted_colvec_results = set()
         self.uses_sys_argv = False
         self.uses_csv_split_line = False
@@ -8173,12 +8595,20 @@ class translator(ast.NodeVisitor):
         return self._coerce_expr_kind(arg_node, arg_expr, want)
 
     def _coerce_expr_kind(self, arg_node, arg_expr, want):
-        if want not in {"real", "int", "logical", "char"}:
+        if want not in {"real", "int", "logical", "char", "complex"}:
             return arg_expr
         have = self._expr_kind(arg_node)
         if have is None or have == want:
             return arg_expr
         if want == "char":
+            return arg_expr
+        if want == "complex":
+            if have == "real":
+                return f"cmplx({arg_expr}, 0.0_dp, kind=dp)"
+            if have == "int":
+                return f"cmplx(real({arg_expr}, kind=dp), 0.0_dp, kind=dp)"
+            if have == "logical":
+                return f"cmplx(merge(1.0_dp, 0.0_dp, {arg_expr}), 0.0_dp, kind=dp)"
             return arg_expr
         if want == "real":
             if have == "int":
@@ -8296,6 +8726,10 @@ class translator(ast.NodeVisitor):
         fam = self._kind_family(k)
         rk = self._rank_expr(value_node)
         rkind = self._expr_real_kind_tag(value_node)
+        self._check_type_stability_explicit(name, k, rk, rkind, assign_node)
+
+    def _check_type_stability_explicit(self, name, k, rk, rkind, assign_node):
+        fam = self._kind_family(k)
         if fam is None:
             return
         prev = self.var_type_first_seen.get(name)
@@ -8363,6 +8797,7 @@ class translator(ast.NodeVisitor):
         return None
 
     def _open_type_rebind_block(self, name, kind, rank=0):
+        name = self._aliased_name(self._resolve_list_alias(name))
         self.o.w("block")
         self.o.push()
         rr = max(0, int(rank))
@@ -8568,6 +9003,28 @@ class translator(ast.NodeVisitor):
         if name in self.alloc_ints or name in self.alloc_logs or name in self.alloc_chars:
             return
         self.ints.add(name)
+
+    def _force_mark_int(self, name):
+        if name == "_":
+            return
+        if name in self.reserved_names:
+            return
+        if name in self.params:
+            return
+        name = self._aliased_name(name)
+        self.ints.add(name)
+        self.reals.discard(name)
+        self.complexes.discard(name)
+        self.logs.discard(name)
+        self.chars.discard(name)
+        self.alloc_logs.discard(name)
+        self.alloc_log_rank.pop(name, None)
+        self.alloc_reals.discard(name)
+        self.alloc_real_rank.pop(name, None)
+        self.alloc_complexes.discard(name)
+        self.alloc_complex_rank.pop(name, None)
+        self.alloc_chars.discard(name)
+        self.alloc_char_rank.pop(name, None)
 
     def _mark_real(self, name):
         if name == "_":
@@ -8983,9 +9440,13 @@ class translator(ast.NodeVisitor):
                     return "logical"
             if node.attr == "T":
                 return self._expr_kind(node.value)
+            if node.attr == "flat":
+                return self._expr_kind(node.value)
             if node.attr in {"real", "imag"}:
                 return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr in {"pi", "nan", "inf", "NINF"}:
+                return "real"
+            if isinstance(node.value, ast.Name) and node.value.id == "cmath" and node.attr in {"pi", "e", "tau"}:
                 return "real"
             if isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "argv":
                 return "char"
@@ -9047,6 +9508,8 @@ class translator(ast.NodeVisitor):
         if isinstance(node, ast.BoolOp):
             return "logical"
         if isinstance(node, ast.Subscript):
+            if self._expr_kind(node.value) == "char" and self._rank_expr(node.value) == 0:
+                return 0
             if (
                 isinstance(node.value, ast.Attribute)
                 and isinstance(node.value.value, ast.Name)
@@ -9150,6 +9613,16 @@ class translator(ast.NodeVisitor):
                 return self._expr_kind(node.args[0]) or "real"
             if isinstance(node.func, ast.Name) and node.func.id == "polyroots_real":
                 return "complex"
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "hasattr"
+                and len(node.args) == 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in {"np", "numpy"}
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                return "logical"
             if isinstance(node.func, ast.Name) and node.func.id in {
                 "py_str", "py_ctime", "str_zfill", "str_ljust", "str_rjust", "to_lower", "to_upper", "str_strip", "str_lstrip", "str_rstrip", "str_replace", "str_join"
             }:
@@ -9157,7 +9630,127 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"}
+                and node.func.attr in {"fix", "trunc", "rint", "round", "around", "floor", "ceil", "nanprod"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "bitwise_count"
+                and len(node.args) >= 1
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "signbit"
+                and len(node.args) >= 1
+            ):
+                return "logical"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"gcd", "lcm"}
+                and len(node.args) >= 2
+            ):
+                return "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "cross"
+                and len(node.args) >= 2
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"trapezoid", "trapz"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"expm1", "log1p", "logaddexp", "logaddexp2", "sinc"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"ldexp", "nextafter", "spacing"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"add", "subtract", "multiply", "divide", "true_divide", "power", "pow", "float_power", "fmod", "remainder"}
+                and len(node.args) >= 2
+            ):
+                k0 = self._expr_kind(node.args[0])
+                k1 = self._expr_kind(node.args[1])
+                if node.func.attr in {"divide", "true_divide", "float_power"}:
+                    return "real"
+                if "real" in {k0, k1}:
+                    return "real"
+                if "complex" in {k0, k1}:
+                    return "complex"
+                return k0 or k1 or "int"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"real", "imag"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"amax", "amin", "fmax", "fmin"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"heaviside", "nan_to_num", "real_if_close"}
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "interp"
+                and len(node.args) >= 3
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "i0"
+                and len(node.args) >= 1
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "ediff1d"
+                and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "hypot"
+                and len(node.args) >= 2
+            ):
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh"}
                 and len(node.args) >= 1
             ):
                 k0 = self._expr_kind(node.args[0])
@@ -9206,7 +9799,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "time"
+                and node.func.value.id in self.time_aliases
                 and node.func.attr in {"time", "perf_counter"}
                 and len(node.args) == 0
             ):
@@ -9214,11 +9807,23 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "time"
+                and node.func.value.id in self.time_aliases
                 and node.func.attr == "ctime"
                 and len(node.args) <= 1
             ):
                 return "char"
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "hasattr"
+                and len(node.args) >= 2
+            ):
+                return "logical"
+            if isinstance(node.func, ast.Name) and node.func.id in self.time_func_aliases:
+                tf = self.time_func_aliases[node.func.id]
+                if tf in {"time", "perf_counter"} and len(node.args) == 0:
+                    return "real"
+                if tf == "ctime" and len(node.args) <= 1:
+                    return "char"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "join"}
@@ -9229,6 +9834,12 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "readline"
+                and len(node.args) == 0
+            ):
+                return "char"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "readlines"
                 and len(node.args) == 0
             ):
                 return "char"
@@ -9430,7 +10041,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"atleast_1d", "atleast_2d"}
+                and node.func.attr in {"atleast_1d", "atleast_2d", "atleast_3d"}
                 and len(node.args) >= 1
             ):
                 return self._expr_kind(node.args[0])
@@ -9473,12 +10084,20 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"ndim", "size"}
+                and node.func.attr in {"ndim", "size", "shape"}
             ):
                 return "int"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
+                and (
+                    isinstance(node.func.value, ast.Name)
+                    or (
+                        isinstance(node.func.value, ast.Attribute)
+                        and isinstance(node.func.value.value, ast.Name)
+                        and node.func.value.value.id in {"np", "numpy"}
+                        and node.func.value.attr == "random"
+                    )
+                )
                 and node.func.attr in {"random", "standard_normal", "normal", "uniform"}
             ):
                 return "real"
@@ -9497,9 +10116,31 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "arctan2"}
+                and node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "atan", "asin", "acos", "arctan2", "atan2"}
                 and len(node.args) >= 1
             ):
+                if node.func.attr not in {"arctan2", "atan2"} and self._expr_kind(node.args[0]) == "complex":
+                    return "complex"
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"exp", "log", "expm1", "log1p", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh"}
+                and len(node.args) >= 1
+            ):
+                if self._expr_kind(node.args[0]) == "complex":
+                    return "complex"
+                return "real"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"degrees", "radians", "deg2rad", "rad2deg", "exp2", "cbrt", "square", "reciprocal", "positive", "negative", "copysign"}
+                and len(node.args) >= 1
+            ):
+                if node.func.attr in {"exp2", "square", "reciprocal", "positive", "negative"} and self._expr_kind(node.args[0]) == "complex":
+                    return "complex"
                 return "real"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -9640,6 +10281,8 @@ class translator(ast.NodeVisitor):
                 dtype_txt = self._np_dtype_text(node)
                 if "int" in dtype_txt:
                     return "int"
+                if "complex" in dtype_txt:
+                    return "complex"
                 if "bool" in dtype_txt:
                     return "logical"
                 if (
@@ -9661,6 +10304,9 @@ class translator(ast.NodeVisitor):
                 and node.func.attr in {"zeros_like", "ones_like"}
                 and len(node.args) >= 1
             ):
+                dtype_txt = self._np_dtype_text(node)
+                if "complex" in dtype_txt:
+                    return "complex"
                 return self._expr_kind(node.args[0])
             if (
                 isinstance(node.func, ast.Attribute)
@@ -10004,7 +10650,14 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"pad", "moveaxis"}
+                and node.func.attr in {"pad", "moveaxis", "rollaxis"}
+                and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.callable_aliases
+                and self.callable_aliases[node.func.id] in {"np.transpose", "np.permute_dims", "np.linalg.matrix_transpose"}
                 and len(node.args) >= 1
             ):
                 return self._expr_kind(node.args[0])
@@ -10031,30 +10684,53 @@ class translator(ast.NodeVisitor):
                 return self._expr_kind(node.func.value)
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
                 return self._expr_kind(node.func.value)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"ravel", "flatten"}
+                and len(node.args) >= 1
+            ):
+                return self._expr_kind(node.args[0])
             if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
                 if node.func.attr == "copy" and len(node.args) == 0:
                     return self._expr_kind(node.func.value)
                 if node.func.attr == "pop" and len(node.args) <= 1:
                     return self._expr_kind(node.func.value)
-                if node.func.value.id in {"math", "np", "numpy"} and node.func.attr == "sqrt":
+                if node.func.value.id in ({"np", "numpy"} | self.math_aliases) and node.func.attr == "sqrt":
                     if len(node.args) >= 1 and self._expr_kind(node.args[0]) == "complex":
                         return "complex"
                     return "real"
-                if node.func.value.id == "math" and node.func.attr in {"floor", "ceil", "trunc"}:
+                if node.func.value.id == "cmath":
+                    if node.func.attr in {"sqrt", "exp", "log", "log10", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "rect"}:
+                        return "complex"
+                    if node.func.attr in {"phase", "polar"}:
+                        return "real"
+                    if node.func.attr in {"isfinite", "isinf", "isnan", "isclose"}:
+                        return "logical"
+                if node.func.value.id in self.math_aliases and node.func.attr in {"floor", "ceil", "trunc"}:
                     return "int"
-                if node.func.value.id == "math" and node.func.attr in {"expm1", "log1p", "exp", "log"}:
+                if node.func.value.id in self.math_aliases and node.func.attr in {"expm1", "log1p", "exp", "log"}:
+                    if len(node.args) >= 1 and self._expr_kind(node.args[0]) == "complex":
+                        return "complex"
                     return "real"
-                if node.func.value.id == "math" and node.func.attr in {"erf", "erfc"}:
+                if node.func.value.id in self.math_aliases and node.func.attr in {"erf", "erfc"}:
                     return "real"
-                if node.func.value.id == "math" and node.func.attr == "isclose":
+                if node.func.value.id in self.math_aliases and node.func.attr == "isclose":
                     return "logical"
-                if node.func.value.id == "math" and node.func.attr == "prod" and len(node.args) >= 1:
+                if node.func.value.id in self.math_aliases and node.func.attr == "prod" and len(node.args) >= 1:
                     k0 = self._expr_kind(node.args[0])
                     if k0 in {"real", "complex"}:
                         return k0
                     return "int"
+                if node.func.value.id in self.math_aliases and node.func.attr in {"comb", "perm", "factorial", "gcd", "lcm", "isqrt"}:
+                    return "int"
                 if node.func.value.id == "random" and node.func.attr == "random":
                     return "real"
+                if node.func.value.id in {"np", "numpy"} and node.func.attr in {"zeros", "ones"}:
+                    dtype_txt = self._np_dtype_text(node)
+                    if "complex" in dtype_txt:
+                        return "complex"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -10075,6 +10751,31 @@ class translator(ast.NodeVisitor):
                 return "int"
             if isinstance(node.func, ast.Name) and node.func.id in {"str", "repr", "py_str", "py_ctime"}:
                 return "char"
+            if isinstance(node.func, ast.Name) and node.func.id in self.math_func_aliases:
+                mf = self.math_func_aliases[node.func.id]
+                if isinstance(mf, str) and mf.startswith("cmath:"):
+                    base = mf.split(":", 1)[1]
+                    if base in {"sqrt", "atan", "asin", "acos", "tan", "sin", "cos", "exp", "log", "log10", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "rect"}:
+                        return "complex"
+                    if base in {"phase"}:
+                        return "real"
+                    if base in {"polar"}:
+                        return "real"
+                    if base in {"isfinite", "isinf", "isnan", "isclose"}:
+                        return "logical"
+                if mf in {"sqrt", "erf", "erfc", "atan", "asin", "acos", "tan", "sin", "cos", "exp", "log", "atan2", "expm1", "log1p"}:
+                    if mf in {"sqrt", "atan", "asin", "acos", "tan", "sin", "cos", "exp", "log", "expm1", "log1p"} and len(node.args) >= 1 and self._expr_kind(node.args[0]) == "complex":
+                        return "complex"
+                    return "real"
+                if mf in {"floor", "ceil", "trunc", "comb", "perm", "factorial", "gcd", "lcm", "isqrt"}:
+                    return "int"
+                if mf == "isclose":
+                    return "logical"
+                if mf == "prod" and len(node.args) >= 1:
+                    k0 = self._expr_kind(node.args[0])
+                    if k0 in {"real", "complex"}:
+                        return k0
+                    return "int"
             stat_fn = None
             if isinstance(node.func, ast.Name) and node.func.id in self.statistics_func_aliases:
                 stat_fn = self.statistics_func_aliases[node.func.id]
@@ -10122,6 +10823,8 @@ class translator(ast.NodeVisitor):
                 return b
             return self._extent_expr(node.orelse)
         if isinstance(node, ast.Subscript):
+            if self._expr_kind(node.value) == "char" and self._rank_expr(node.value) == 0:
+                return "char"
             if (
                 isinstance(node.value, ast.Attribute)
                 and isinstance(node.value.value, ast.Name)
@@ -10208,8 +10911,25 @@ class translator(ast.NodeVisitor):
                 return f"size({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id in {"real", "int", "float"} and len(node.args) >= 1:
                 return self._extent_expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.callable_aliases
+                and self.callable_aliases[node.func.id] in {"np.transpose", "np.permute_dims", "np.linalg.matrix_transpose"}
+                and len(node.args) >= 1
+            ):
+                return self._extent_expr(node.args[0])
             if isinstance(node.func, ast.Attribute) and node.func.attr in {"ravel", "flatten"}:
                 return f"size({self.expr(node.func.value)})"
+            if isinstance(node, ast.Attribute) and node.attr == "flat":
+                return f"size({self.expr(node.value)})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "np"
+                and node.func.attr in {"ravel", "flatten"}
+                and len(node.args) >= 1
+            ):
+                return f"size({self.expr(node.args[0])})"
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id in self.local_return_specs
@@ -10237,7 +10957,7 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "moveaxis", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "nan_to_num", "ascontiguousarray", "asfortranarray", "broadcast_to"}
+                and node.func.attr in {"cumsum", "cumprod", "repeat", "tile", "unique", "stack", "hstack", "vstack", "column_stack", "concatenate", "transpose", "swapaxes", "moveaxis", "rollaxis", "expand_dims", "squeeze", "zeros_like", "ones_like", "full_like", "clip", "diff", "abs", "fabs", "sign", "floor", "ceil", "round", "isfinite", "isinf", "isnan", "nan_to_num", "ascontiguousarray", "asfortranarray", "broadcast_to"}
                 and len(node.args) >= 1
             ):
                 return self._extent_expr(node.args[0])
@@ -10596,6 +11316,15 @@ class translator(ast.NodeVisitor):
             return self._rank_expr(node.operand)
         if isinstance(node, ast.Attribute) and node.attr in {"T", "real", "imag"}:
             return self._rank_expr(node.value)
+        if isinstance(node, ast.Attribute) and node.attr == "flat":
+            return 1
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "shape"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in self.broadcast_object_args
+        ):
+            return 1
         if (
             isinstance(node, ast.Attribute)
             and isinstance(node.value, ast.Name)
@@ -10611,6 +11340,19 @@ class translator(ast.NodeVisitor):
         ):
             return 1
         if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.callable_aliases
+                and self.callable_aliases[node.func.id] in {"np.transpose", "np.permute_dims", "np.linalg.matrix_transpose"}
+                and len(node.args) >= 1
+            ):
+                return self._rank_expr(node.args[0])
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "readlines"
+                and len(node.args) == 0
+            ):
+                return 1
             if is_numpy_sliding_window_view_axis0_call(node) and len(node.args) >= 1:
                 r0 = self._rank_expr(node.args[0])
                 return (r0 + 1) if r0 > 1 else 3
@@ -10787,6 +11529,8 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
             ):
+                if node.func.attr in {"ravel", "flatten"} and len(node.args) >= 1:
+                    return 1
                 if node.func.attr in {"log", "exp", "sqrt", "maximum", "asarray", "array", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr == "polyval" and len(node.args) >= 2:
@@ -10803,6 +11547,8 @@ class translator(ast.NodeVisitor):
                     return 0
                 if node.func.attr == "size" and len(node.args) >= 1:
                     return 0
+                if node.func.attr == "shape" and len(node.args) >= 1:
+                    return 1
                 if node.func.attr == "linspace" and len(node.args) >= 1:
                     return 1
                 if node.func.attr == "logspace" and len(node.args) >= 1:
@@ -10829,6 +11575,8 @@ class translator(ast.NodeVisitor):
                     return max(1, self._rank_expr(node.args[0]))
                 if node.func.attr == "atleast_2d" and len(node.args) >= 1:
                     return max(2, self._rank_expr(node.args[0]))
+                if node.func.attr == "atleast_3d" and len(node.args) >= 1:
+                    return max(3, self._rank_expr(node.args[0]))
                 if node.func.attr in {"log1p", "nan_to_num"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"pad", "roll", "flip", "flipud", "copy", "empty_like"} and len(node.args) >= 1:
@@ -10972,6 +11720,10 @@ class translator(ast.NodeVisitor):
                     return 1
                 if node.func.attr == "union1d" and len(node.args) >= 2:
                     return 1
+                if node.func.attr == "cross" and len(node.args) >= 2:
+                    return 1
+                if node.func.attr in {"trapezoid", "trapz"} and len(node.args) >= 1:
+                    return 0
                 if node.func.attr == "ravel_multi_index" and len(node.args) >= 1:
                     return 0
                 if node.func.attr == "argwhere" and len(node.args) >= 1:
@@ -10979,9 +11731,13 @@ class translator(ast.NodeVisitor):
                     return 2 if r0 <= 1 else r0
                 if node.func.attr == "unravel_index" and len(node.args) >= 2:
                     return 1
-                if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "angle", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor"} and len(node.args) >= 1:
+                if node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "atan", "asin", "acos", "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh", "angle", "real", "imag", "mod", "floor_divide", "bitwise_and", "bitwise_or", "bitwise_xor", "degrees", "radians", "deg2rad", "rad2deg", "exp2", "cbrt", "square", "reciprocal", "positive", "negative", "unwrap", "cumulative_sum", "cumulative_prod", "bitwise_count", "nancumsum", "nancumprod", "ediff1d", "expm1", "log1p", "sinc", "i0", "signbit", "spacing", "amax", "amin", "nan_to_num", "real_if_close", "interp"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
-                if node.func.attr == "arctan2" and len(node.args) >= 2:
+                if node.func.attr in {"logaddexp", "logaddexp2", "ldexp", "nextafter", "gcd", "lcm", "add", "subtract", "multiply", "divide", "true_divide", "power", "pow", "float_power", "fmod", "remainder", "fmax", "fmin", "heaviside"} and len(node.args) >= 2:
+                    return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
+                if node.func.attr == "copysign" and len(node.args) >= 2:
+                    return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
+                if node.func.attr in {"arctan2", "atan2"} and len(node.args) >= 2:
                     return max(self._rank_expr(node.args[0]), self._rank_expr(node.args[1]))
                 if node.func.attr in {"cumsum", "cumprod"} and len(node.args) >= 1:
                     r0 = self._rank_expr(node.args[0])
@@ -11029,7 +11785,7 @@ class translator(ast.NodeVisitor):
                         return 2
                 if node.func.attr == "tri":
                     return 2
-                if node.func.attr == "moveaxis" and len(node.args) >= 1:
+                if node.func.attr in {"moveaxis", "rollaxis"} and len(node.args) >= 1:
                     return self._rank_expr(node.args[0])
                 if node.func.attr in {"cov", "corrcoef"}:
                     return 2
@@ -11385,6 +12141,8 @@ class translator(ast.NodeVisitor):
             return 1
         if isinstance(node, ast.Attribute) and node.attr == "shape":
             return max(0, self._rank_expr(node.value))
+        if isinstance(node, ast.Attribute) and node.attr == "flat":
+            return 1
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "shape" and node.args:
             return max(0, self._rank_expr(node.args[0]))
         return 1
@@ -11433,6 +12191,33 @@ class translator(ast.NodeVisitor):
                 return [f"size({base})"]
             return [f"size({base},{i})" for i in range(1, rr + 1)]
         return [self.expr(node)]
+
+    def _broadcast_shape_dim_exprs(self, left_node, right_node):
+        def _dims(n):
+            rr = max(0, int(self._rank_expr(n)))
+            ee = self.expr(n)
+            if rr <= 0:
+                return []
+            if rr == 1:
+                return [f"size({ee})"]
+            return [f"size({ee},{i})" for i in range(1, rr + 1)]
+
+        ld = _dims(left_node)
+        rd = _dims(right_node)
+        out_rank = max(len(ld), len(rd))
+        ld = (["1"] * (out_rank - len(ld))) + ld
+        rd = (["1"] * (out_rank - len(rd))) + rd
+        out = []
+        for lx, rx in zip(ld, rd):
+            if lx == "1":
+                out.append(rx)
+            elif rx == "1":
+                out.append(lx)
+            elif lx == rx:
+                out.append(lx)
+            else:
+                out.append(f"max({lx}, {rx})")
+        return out
 
     def _decl_rank_expr(self, node):
         """Rank from declarations/allocs only (ignores broadcast row/col markers)."""
@@ -11895,10 +12680,12 @@ class translator(ast.NodeVisitor):
                 raise NotImplementedError("unsupported binop")
             a0 = self.expr(node.left)
             b0 = self.expr(node.right)
+            lk0 = self._expr_kind(node.left)
+            rk0 = self._expr_kind(node.right)
             # Python string repetition semantics: n * "a" or "a" * n.
             if op is ast.Mult:
-                lk = self._expr_kind(node.left)
-                rk = self._expr_kind(node.right)
+                lk = lk0
+                rk = rk0
                 lr = self._rank_expr(node.left)
                 rr = self._rank_expr(node.right)
                 if lk == "char" and lr == 0 and rk == "int" and rr == 0:
@@ -11907,8 +12694,8 @@ class translator(ast.NodeVisitor):
                     return f"repeat({b0}, max(0, {a0}))"
             # Python string concatenation.
             if op is ast.Add:
-                lk = self._expr_kind(node.left)
-                rk = self._expr_kind(node.right)
+                lk = lk0
+                rk = rk0
                 lr = self._rank_expr(node.left)
                 rr = self._rank_expr(node.right)
                 if lk == "char" and rk == "char" and lr == 0 and rr == 0:
@@ -12137,6 +12924,14 @@ class translator(ast.NodeVisitor):
                     a = f"spread({a0}, dim=1, ncopies=size({b0},1))"
                 if self._is_col2_expr(node.right):
                     b = f"spread(reshape({b0}, [size({b0},1)]), dim=2, ncopies=size({a0}))"
+            if op is ast.Div:
+                if lk0 in {"int", "logical"} and rk0 in {"int", "logical"}:
+                    a = f"real({a}, kind=dp)"
+                    b = f"real({b}, kind=dp)"
+                elif lk0 in {"int", "logical"} and rk0 == "real":
+                    a = f"real({a}, kind=dp)"
+                elif lk0 == "real" and rk0 in {"int", "logical"}:
+                    b = f"real({b}, kind=dp)"
             if op is ast.Mod:
                 # Python old-style string formatting: "x=%g" % (v,)
                 if self._expr_kind(node.left) == "char" and self._rank_expr(node.left) == 0 and is_const_str(node.left):
@@ -12307,6 +13102,8 @@ class translator(ast.NodeVisitor):
                             return t if op is ast.Is else f"(.not. {t})"
                     if isinstance(b, ast.Name) and b.id in self.optional_dummy_args:
                         return "(.not. present(" + b.id + "))" if op is ast.Is else "present(" + b.id + ")"
+                    if isinstance(b, ast.Name) and b.id in self.callable_aliases:
+                        return ".false." if op is ast.Is else ".true."
                     left = self.expr(b)
                     return f"({left} == -1)" if op is ast.Is else f"({left} /= -1)"
                 if is_none(b):
@@ -12316,6 +13113,8 @@ class translator(ast.NodeVisitor):
                             return t if op is ast.Is else f"(.not. {t})"
                     if isinstance(a, ast.Name) and a.id in self.optional_dummy_args:
                         return "(.not. present(" + a.id + "))" if op is ast.Is else "present(" + a.id + ")"
+                    if isinstance(a, ast.Name) and a.id in self.callable_aliases:
+                        return ".false." if op is ast.Is else ".true."
                     left = self.expr(a)
                     return f"({left} == -1)" if op is ast.Is else f"({left} /= -1)"
                 raise NotImplementedError("is/is not supported only with None")
@@ -13124,6 +13923,64 @@ class translator(ast.NodeVisitor):
                     base = f"({self.expr(loc_node)}) + ({base})"
                 return base
 
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "hasattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                obj = node.args[0]
+                attr = node.args[1].value
+                if isinstance(obj, ast.Name) and obj.id in {"np", "numpy"}:
+                    if attr in {
+                        "linalg",
+                        "transpose",
+                        "permute_dims",
+                        "cumulative_sum",
+                        "cumulative_prod",
+                        "trapezoid",
+                        "bitwise_count",
+                    }:
+                        return ".true."
+                    return ".false."
+                if (
+                    isinstance(obj, ast.Attribute)
+                    and self._attr_chain_parts(obj) in (["np", "linalg"], ["numpy", "linalg"])
+                    and attr == "matrix_transpose"
+                ):
+                    return ".true."
+                return ".false."
+
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "list"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in self.broadcast_object_args
+                and not getattr(node, "keywords", [])
+            ):
+                left_node, right_node = self.broadcast_object_args[node.args[0].id]
+                left_txt = self.expr(left_node)
+                right_txt = self.expr(right_node)
+                left_rank = self._rank_expr(left_node)
+                right_rank = self._rank_expr(right_node)
+                if left_rank == 1 and right_rank == 2:
+                    left_b = f"spread({left_txt}, dim=1, ncopies=size({right_txt},1))"
+                    right_b = f"spread(reshape({right_txt}, [size({right_txt},1)]), dim=2, ncopies=size({left_txt}))"
+                    return (
+                        f"transpose(reshape([reshape({left_b}, [size({left_b})]), "
+                        f"reshape({right_b}, [size({right_b})])], [size({left_b}), 2]))"
+                    )
+                if left_rank == 2 and right_rank == 1:
+                    left_b = f"spread(reshape({left_txt}, [size({left_txt},1)]), dim=2, ncopies=size({right_txt}))"
+                    right_b = f"spread({right_txt}, dim=1, ncopies=size({left_txt},1))"
+                    return (
+                        f"transpose(reshape([reshape({left_b}, [size({left_b})]), "
+                        f"reshape({right_b}, [size({right_b})])], [size({left_b}), 2]))"
+                    )
+                return "0"
+
             if isinstance(node.func, ast.Name) and node.func.id in self.vectorize_aliases:
                 args_nodes = list(node.args)
                 for kw in getattr(node, "keywords", []):
@@ -13132,6 +13989,34 @@ class translator(ast.NodeVisitor):
                     args_nodes.append(kw.value)
                 args = ", ".join(self.expr(a) for a in args_nodes)
                 return f"{self.vectorize_aliases[node.func.id]}({args})"
+            if isinstance(node.func, ast.Name) and node.func.id in self.callable_aliases:
+                callee = self.callable_aliases[node.func.id]
+                if callee in {"np.transpose", "np.permute_dims"}:
+                    a0 = self.expr(node.args[0]) if len(node.args) >= 1 else ""
+                    if len(node.args) == 1:
+                        return f"transpose({a0})"
+                    axes = node.args[1]
+                    if not isinstance(axes, (ast.Tuple, ast.List)):
+                        raise NotImplementedError(f"{callee} axes must be tuple/list")
+                    if not all(isinstance(a, ast.Constant) and isinstance(a.value, int) for a in axes.elts):
+                        raise NotImplementedError(f"{callee} axes must be integer constants")
+                    perm = [int(a.value) + 1 for a in axes.elts]
+                    shp = ", ".join([f"size({a0},{p})" for p in perm])
+                    ordp = ", ".join(str(p) for p in perm)
+                    return f"reshape({a0}, [{shp}], order=[{ordp}])"
+                if callee == "np.linalg.matrix_transpose":
+                    a0 = self.expr(node.args[0]) if len(node.args) >= 1 else ""
+                    r0 = self._rank_expr(node.args[0]) if len(node.args) >= 1 else 0
+                    if r0 <= 1:
+                        return a0
+                    if r0 == 2:
+                        return f"transpose({a0})"
+                    if r0 == 3:
+                        return (
+                            f"reshape({a0}, [size({a0},1), size({a0},3), size({a0},2)], "
+                            f"order=[1,3,2])"
+                        )
+                    raise NotImplementedError("matrix_transpose currently supports rank up to 3")
             if (
                 isinstance(node.func, ast.Name)
                 and node.func.id == "list"
@@ -13451,6 +14336,110 @@ class translator(ast.NodeVisitor):
 
             if isinstance(node.func, ast.Name) and node.func.id == "isqrt":
                 return f"isqrt_int({self.expr(node.args[0])})"
+            if isinstance(node.func, ast.Name) and node.func.id in self.math_func_aliases:
+                mfn = self.math_func_aliases[node.func.id]
+                if isinstance(mfn, str) and mfn.startswith("cmath:") and len(node.args) == 1:
+                    base = mfn.split(":", 1)[1]
+                    a0 = node.args[0]
+                    a0_expr = self.expr(a0)
+                    k0 = self._expr_kind(a0)
+                    if k0 in {"int", "logical"}:
+                        a0_expr = f"cmplx(real({a0_expr}, kind=dp), 0.0_dp, kind=dp)"
+                    elif k0 == "real":
+                        a0_expr = f"cmplx({a0_expr}, 0.0_dp, kind=dp)"
+                    return f"{base}({a0_expr})"
+                if isinstance(mfn, str) and mfn.startswith("cmath:"):
+                    base = mfn.split(":", 1)[1]
+                    def _cmath_complex_arg(_arg):
+                        _txt = self.expr(_arg)
+                        _kind = self._expr_kind(_arg)
+                        if _kind in {"int", "logical"}:
+                            return f"cmplx(real({_txt}, kind=dp), 0.0_dp, kind=dp)"
+                        if _kind == "real":
+                            return f"cmplx({_txt}, 0.0_dp, kind=dp)"
+                        return _txt
+                    def _cmath_real_arg(_arg):
+                        _txt = self.expr(_arg)
+                        _kind = self._expr_kind(_arg)
+                        if _kind in {"int", "logical"}:
+                            return f"real({_txt}, kind=dp)"
+                        return _txt
+                    if base in {"sqrt", "exp", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"} and len(node.args) == 1:
+                        return f"{base}({_cmath_complex_arg(node.args[0])})"
+                    if base == "log10" and len(node.args) == 1:
+                        return f"(log({_cmath_complex_arg(node.args[0])}) / log(cmplx(10.0_dp, 0.0_dp, kind=dp)))"
+                    if base == "phase" and len(node.args) == 1:
+                        z0 = _cmath_complex_arg(node.args[0])
+                        return f"atan2(aimag({z0}), real({z0}, kind=dp))"
+                    if base == "polar" and len(node.args) == 1:
+                        z0 = _cmath_complex_arg(node.args[0])
+                        return f"[abs({z0}), atan2(aimag({z0}), real({z0}, kind=dp))]"
+                    if base == "rect" and len(node.args) == 2:
+                        r0 = _cmath_real_arg(node.args[0])
+                        p0 = _cmath_real_arg(node.args[1])
+                        return f"cmplx(({r0}) * cos({p0}), ({r0}) * sin({p0}), kind=dp)"
+                    if base == "log":
+                        if len(node.args) == 1:
+                            return f"log({_cmath_complex_arg(node.args[0])})"
+                        if len(node.args) == 2:
+                            return f"(log({_cmath_complex_arg(node.args[0])}) / log({_cmath_complex_arg(node.args[1])}))"
+                    if base == "isfinite" and len(node.args) == 1:
+                        return f"complex_isfinite({_cmath_complex_arg(node.args[0])})"
+                    if base == "isinf" and len(node.args) == 1:
+                        return f"complex_isinf({_cmath_complex_arg(node.args[0])})"
+                    if base == "isnan" and len(node.args) == 1:
+                        return f"complex_isnan({_cmath_complex_arg(node.args[0])})"
+                    if base == "isclose" and len(node.args) >= 2:
+                        a0 = _cmath_complex_arg(node.args[0])
+                        b0 = _cmath_complex_arg(node.args[1])
+                        rel_tol = "1e-9_dp"
+                        abs_tol = "0.0_dp"
+                        if len(node.args) >= 3:
+                            rel_tol = _cmath_real_arg(node.args[2])
+                        if len(node.args) >= 4:
+                            abs_tol = _cmath_real_arg(node.args[3])
+                        for kw in node.keywords:
+                            if kw.arg == "rel_tol":
+                                rel_tol = _cmath_real_arg(kw.value)
+                            elif kw.arg == "abs_tol":
+                                abs_tol = _cmath_real_arg(kw.value)
+                        return f"(abs(({a0}) - ({b0})) <= max(({abs_tol}), ({rel_tol}) * max(abs({a0}), abs({b0}))))"
+                if mfn in {"sqrt", "erf", "erfc", "atan", "asin", "acos", "tan", "sin", "cos", "exp", "log", "atan2", "expm1", "log1p"}:
+                    if len(node.args) == 1:
+                        a0 = node.args[0]
+                        a0_expr = self.expr(a0)
+                        if mfn not in {"erf", "erfc"} and self._expr_kind(a0) in {"int", "logical"}:
+                            a0_expr = f"real({a0_expr}, kind=dp)"
+                        return f"{mfn}({a0_expr})"
+                    if mfn == "atan2" and len(node.args) == 2:
+                        a0 = self.expr(node.args[0])
+                        a1 = self.expr(node.args[1])
+                        if self._expr_kind(node.args[0]) in {"int", "logical"}:
+                            a0 = f"real({a0}, kind=dp)"
+                        if self._expr_kind(node.args[1]) in {"int", "logical"}:
+                            a1 = f"real({a1}, kind=dp)"
+                        return f"atan2({a0}, {a1})"
+                if mfn in {"comb", "perm", "factorial", "gcd", "lcm", "isqrt"}:
+                    if mfn == "isqrt" and len(node.args) == 1:
+                        return f"isqrt_int({self.expr(node.args[0])})"
+                    if mfn == "factorial" and len(node.args) == 1:
+                        return f"factorial_int({self.expr(node.args[0])})"
+                    if mfn == "comb" and len(node.args) == 2:
+                        return f"comb_int({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                    if mfn == "perm" and len(node.args) in {1, 2}:
+                        if len(node.args) == 1:
+                            return f"perm_int({self.expr(node.args[0])})"
+                        return f"perm_int({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                    if mfn in {"gcd", "lcm"}:
+                        fn = "gcd_int" if mfn == "gcd" else "lcm_int"
+                        if len(node.args) == 0:
+                            return "0" if mfn == "gcd" else "1"
+                        if len(node.args) == 1:
+                            return f"abs({self.expr(node.args[0])})"
+                        if len(node.args) == 2:
+                            scalar_fn = "gcd_int_scalar" if mfn == "gcd" else "lcm_int_scalar"
+                            return f"{scalar_fn}({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                        return f"{fn}([{', '.join(self.expr(a) for a in node.args)}])"
             if isinstance(node.func, ast.Name) and node.func.id == "ord" and len(node.args) == 1:
                 return f"iachar({self.expr(node.args[0])})"
             if isinstance(node.func, ast.Name) and node.func.id == "chr" and len(node.args) == 1:
@@ -13765,19 +14754,20 @@ class translator(ast.NodeVisitor):
                                     f"unsupported call shape for local function '{callee}': missing non-trailing argument '{names[i] if i < len(names) else i}'"
                                 )
                         ae = self.expr(a)
-                        ae = self._coerce_local_actual_kind(node.func.id, i, a, ae)
-                        er = ranks[i] if i < len(ranks) else 0
-                        ar = self._rank_expr(a)
-                        if er == 2 and ar == 1:
-                            ae = f"reshape({ae}, [size({ae}), 1])"
-                        elif er == 1 and ar == 2:
-                            ae = f"reshape({ae}, [size({ae})])"
+                        if node.func.id not in self.local_generic_overloads:
+                            ae = self._coerce_local_actual_kind(node.func.id, i, a, ae)
+                            er = ranks[i] if i < len(ranks) else 0
+                            ar = self._rank_expr(a)
+                            if er == 2 and ar == 1:
+                                ae = f"reshape({ae}, [size({ae}), 1])"
+                            elif er == 1 and ar == 2:
+                                ae = f"reshape({ae}, [size({ae})])"
                         if names and getattr(node, "keywords", []):
                             parts.append(f"{names[i]}={ae}")
                         else:
                             parts.append(ae)
                     args = ", ".join(parts)
-                    disp_name = self._aliased_name(node.func.id)
+                    disp_name = node.func.id if node.func.id in self.local_generic_overloads else self._aliased_name(node.func.id)
                     dmap = self.local_overload_dispatch.get(node.func.id, None)
                     if dmap:
                         iv = int(dmap.get("arg_index", 0))
@@ -13788,6 +14778,25 @@ class translator(ast.NodeVisitor):
                                 if key in dmap:
                                     disp_name = dmap[key]
                     return f"{disp_name}({args})"
+                if (
+                    node.func.id in self.dummy_arg_names
+                    and node.func.id not in self.reals
+                    and node.func.id not in self.ints
+                    and node.func.id not in self.logs
+                    and node.func.id not in self.chars
+                    and node.func.id not in self.complexes
+                    and node.func.id not in self.alloc_reals
+                    and node.func.id not in self.alloc_ints
+                    and node.func.id not in self.alloc_logs
+                    and node.func.id not in self.alloc_chars
+                    and node.func.id not in self.alloc_complexes
+                ):
+                    parts = [self.expr(a) for a in node.args]
+                    for kw in getattr(node, "keywords", []):
+                        if kw.arg is None:
+                            raise NotImplementedError("**kwargs not supported")
+                        parts.append(f"{kw.arg}={self.expr(kw.value)}")
+                    return f"{self._aliased_name(node.func.id)}(" + ", ".join(parts) + ")"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
@@ -13850,8 +14859,16 @@ class translator(ast.NodeVisitor):
                     flat_nodes = []
                     for r in elts:
                         flat_nodes.extend(r.elts)
-                    vals = ", ".join(self.expr(e) for e in flat_nodes)
-                    if "complex" in dtype_txt:
+                    force_complex = ("complex" in dtype_txt) or any(self._expr_kind(e) == "complex" for e in flat_nodes)
+                    vals = ", ".join(
+                        (
+                            self.expr(e)
+                            if not force_complex or self._expr_kind(e) == "complex"
+                            else f"cmplx({self.expr(e)}, kind=dp)"
+                        )
+                        for e in flat_nodes
+                    )
+                    if force_complex:
                         vals = f"cmplx([{vals}], kind=dp)"
                     else:
                         vals = f"[{vals}]"
@@ -13874,8 +14891,16 @@ class translator(ast.NodeVisitor):
                     if "str" in dtype_txt or "char" in dtype_txt or "unicode" in dtype_txt:
                         return "[character(len=1) ::]"
                     return "[integer ::]"
-                vals = ", ".join(self.expr(e) for e in elts)
-                if "complex" in dtype_txt:
+                force_complex = ("complex" in dtype_txt) or any(self._expr_kind(e) == "complex" for e in elts)
+                vals = ", ".join(
+                    (
+                        self.expr(e)
+                        if not force_complex or self._expr_kind(e) == "complex"
+                        else f"cmplx({self.expr(e)}, kind=dp)"
+                    )
+                    for e in elts
+                )
+                if force_complex:
                     return f"cmplx([{vals}], kind=dp)"
                 return f"[{vals}]"
             if (
@@ -14188,6 +15213,8 @@ class translator(ast.NodeVisitor):
                 dtype_txt = self._np_dtype_text(node)
                 if "int" in dtype_txt:
                     fn = "zeros_int" if node.func.attr == "zeros" else "ones_int"
+                elif "complex" in dtype_txt:
+                    fn = "zeros_complex" if node.func.attr == "zeros" else "ones_complex"
                 elif "bool" in dtype_txt:
                     fn = "zeros_logical" if node.func.attr == "zeros" else "ones_logical"
                 else:
@@ -14203,6 +15230,8 @@ class translator(ast.NodeVisitor):
                 k0 = self._expr_kind(node.args[0])
                 if k0 == "int":
                     fn = "zeros_int" if node.func.attr == "zeros_like" else "ones_int"
+                elif k0 == "complex":
+                    fn = "zeros_complex" if node.func.attr == "zeros_like" else "ones_complex"
                 elif k0 == "logical":
                     fn = "zeros_logical" if node.func.attr == "zeros_like" else "ones_logical"
                 else:
@@ -14802,6 +15831,13 @@ class translator(ast.NodeVisitor):
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 == "complex":
+                    if node.func.attr == "isfinite":
+                        return f"complex_isfinite({a0})"
+                    if node.func.attr == "isinf":
+                        return f"complex_isinf({a0})"
+                    return f"complex_isnan({a0})"
                 if node.func.attr == "isfinite":
                     return f"ieee_is_finite({a0})"
                 if node.func.attr == "isinf":
@@ -14834,18 +15870,25 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr in {"abs", "fabs", "sign", "floor", "ceil", "round"}
+                and node.func.attr in {"abs", "fabs", "sign", "floor", "ceil", "round", "around", "fix", "trunc", "rint"}
                 and len(node.args) >= 1
             ):
                 a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"} and node.func.attr not in {"abs", "fabs", "sign"}:
+                    a0 = f"real({a0}, kind=dp)"
                 if node.func.attr in {"abs", "fabs"}:
                     return f"abs({a0})"
                 if node.func.attr == "sign":
                     return f"sign(1.0_dp, {a0})"
+                if node.func.attr in {"fix", "trunc"}:
+                    return f"aint({a0})"
+                if node.func.attr == "rint":
+                    return f"anint({a0})"
                 if node.func.attr == "floor":
-                    return f"floor({a0})"
+                    return f"real(floor({a0}), kind=dp)"
                 if node.func.attr == "ceil":
-                    return f"ceiling({a0})"
+                    return f"real(ceiling({a0}), kind=dp)"
                 if len(node.args) >= 2:
                     d = self.expr(node.args[1])
                     return f"(anint({a0} * (10.0_dp**{d})) / (10.0_dp**{d}))"
@@ -14917,7 +15960,7 @@ class translator(ast.NodeVisitor):
                         elif kw.arg == "endpoint":
                             endpoint = self.expr(kw.value)
                     return f"geomspace({start}, {stop}, int({num}), {endpoint})"
-                if node.func.attr == "diff":
+                if node.func.attr in {"diff", "ediff1d"}:
                     a0 = self.expr(node.args[0])
                     axis = -1
                     for kw in node.keywords:
@@ -15366,12 +16409,12 @@ class translator(ast.NodeVisitor):
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr == "moveaxis"
-                and len(node.args) >= 3
+                and node.func.attr in {"moveaxis", "rollaxis"}
+                and len(node.args) >= 2
             ):
                 a0 = self.expr(node.args[0])
                 src = self.expr(node.args[1])
-                dst = self.expr(node.args[2])
+                dst = self.expr(node.args[2]) if len(node.args) >= 3 else "0"
                 k0 = self._expr_kind(node.args[0])
                 if k0 == "int":
                     return f"moveaxis3_int({a0}, int({src}), int({dst}))"
@@ -15847,6 +16890,22 @@ class translator(ast.NodeVisitor):
                 return f"reshape([{e0}], [1, 1])"
             if (
                 isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "atleast_3d"
+                and len(node.args) >= 1
+            ):
+                a0 = node.args[0]
+                e0 = self.expr(a0)
+                r0 = self._rank_expr(a0)
+                if r0 >= 3:
+                    return e0
+                if r0 == 2:
+                    return f"reshape({e0}, [size({e0},1), size({e0},2), 1])"
+                if r0 == 1:
+                    return f"reshape({e0}, [1, size({e0}), 1])"
+                return f"reshape([{e0}], [1, 1, 1])"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
                 and node.func.attr == "where"
@@ -15892,8 +16951,23 @@ class translator(ast.NodeVisitor):
                 return f"size({self.expr(a0)}, dim=({axis_val}) + 1)"
             if (
                 isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "shape"
+                and len(node.args) >= 1
+            ):
+                return f"shape({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"ravel", "flatten"}
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                return f"reshape({a0}, [size({a0})])"
+            if (
+                isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr in {"sqrt", "erf", "erfc"}
                 and len(node.args) == 1
             ):
@@ -15909,7 +16983,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr in {"atan", "asin", "acos", "tan", "sin", "cos"}
                 and len(node.args) == 1
             ):
@@ -15922,7 +16996,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr in {"exp", "log"}
                 and len(node.args) == 1
             ):
@@ -15934,7 +17008,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr == "atan2"
                 and len(node.args) == 2
             ):
@@ -15950,7 +17024,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr in {"expm1", "log1p"}
                 and len(node.args) == 1
             ):
@@ -15964,7 +17038,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr in {"floor", "ceil", "trunc"}
                 and len(node.args) == 1
             ):
@@ -15980,7 +17054,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr == "prod"
                 and len(node.args) >= 1
             ):
@@ -15999,7 +17073,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "math"
+                and node.func.value.id in self.math_aliases
                 and node.func.attr == "isclose"
                 and len(node.args) >= 2
             ):
@@ -16025,6 +17099,93 @@ class translator(ast.NodeVisitor):
                 return (
                     f"(abs(({a0}) - ({b0})) <= max(({abs_tol}), ({rel_tol}) * max(abs({a0}), abs({b0}))))"
                 )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in self.math_aliases
+                and node.func.attr in {"comb", "perm", "factorial", "gcd", "lcm", "isqrt"}
+            ):
+                mfn = node.func.attr
+                if mfn == "isqrt" and len(node.args) == 1:
+                    return f"isqrt_int({self.expr(node.args[0])})"
+                if mfn == "factorial" and len(node.args) == 1:
+                    return f"factorial_int({self.expr(node.args[0])})"
+                if mfn == "comb" and len(node.args) == 2:
+                    return f"comb_int({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                if mfn == "perm" and len(node.args) in {1, 2}:
+                    if len(node.args) == 1:
+                        return f"perm_int({self.expr(node.args[0])})"
+                    return f"perm_int({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                if mfn in {"gcd", "lcm"}:
+                    fn = "gcd_int" if mfn == "gcd" else "lcm_int"
+                    if len(node.args) == 0:
+                        return "0" if mfn == "gcd" else "1"
+                    if len(node.args) == 1:
+                        return f"abs({self.expr(node.args[0])})"
+                    if len(node.args) == 2:
+                        scalar_fn = "gcd_int_scalar" if mfn == "gcd" else "lcm_int_scalar"
+                        return f"{scalar_fn}({self.expr(node.args[0])}, {self.expr(node.args[1])})"
+                    return f"{fn}([{', '.join(self.expr(a) for a in node.args)}])"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "cmath"
+            ):
+                cfn = node.func.attr
+                def _cmath_complex_arg(_arg):
+                    _txt = self.expr(_arg)
+                    _kind = self._expr_kind(_arg)
+                    if _kind in {"int", "logical"}:
+                        return f"cmplx(real({_txt}, kind=dp), 0.0_dp, kind=dp)"
+                    if _kind == "real":
+                        return f"cmplx({_txt}, 0.0_dp, kind=dp)"
+                    return _txt
+                def _cmath_real_arg(_arg):
+                    _txt = self.expr(_arg)
+                    _kind = self._expr_kind(_arg)
+                    if _kind in {"int", "logical"}:
+                        return f"real({_txt}, kind=dp)"
+                    return _txt
+                if cfn in {"sqrt", "exp", "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh"} and len(node.args) == 1:
+                    return f"{cfn}({_cmath_complex_arg(node.args[0])})"
+                if cfn == "log10" and len(node.args) == 1:
+                    return f"(log({_cmath_complex_arg(node.args[0])}) / log(cmplx(10.0_dp, 0.0_dp, kind=dp)))"
+                if cfn == "phase" and len(node.args) == 1:
+                    z0 = _cmath_complex_arg(node.args[0])
+                    return f"atan2(aimag({z0}), real({z0}, kind=dp))"
+                if cfn == "polar" and len(node.args) == 1:
+                    z0 = _cmath_complex_arg(node.args[0])
+                    return f"[abs({z0}), atan2(aimag({z0}), real({z0}, kind=dp))]"
+                if cfn == "rect" and len(node.args) == 2:
+                    r0 = _cmath_real_arg(node.args[0])
+                    p0 = _cmath_real_arg(node.args[1])
+                    return f"cmplx(({r0}) * cos({p0}), ({r0}) * sin({p0}), kind=dp)"
+                if cfn == "log":
+                    if len(node.args) == 1:
+                        return f"log({_cmath_complex_arg(node.args[0])})"
+                    if len(node.args) == 2:
+                        return f"(log({_cmath_complex_arg(node.args[0])}) / log({_cmath_complex_arg(node.args[1])}))"
+                if cfn == "isfinite" and len(node.args) == 1:
+                    return f"complex_isfinite({_cmath_complex_arg(node.args[0])})"
+                if cfn == "isinf" and len(node.args) == 1:
+                    return f"complex_isinf({_cmath_complex_arg(node.args[0])})"
+                if cfn == "isnan" and len(node.args) == 1:
+                    return f"complex_isnan({_cmath_complex_arg(node.args[0])})"
+                if cfn == "isclose" and len(node.args) >= 2:
+                    a0 = _cmath_complex_arg(node.args[0])
+                    b0 = _cmath_complex_arg(node.args[1])
+                    rel_tol = "1e-9_dp"
+                    abs_tol = "0.0_dp"
+                    if len(node.args) >= 3:
+                        rel_tol = _cmath_real_arg(node.args[2])
+                    if len(node.args) >= 4:
+                        abs_tol = _cmath_real_arg(node.args[3])
+                    for kw in node.keywords:
+                        if kw.arg == "rel_tol":
+                            rel_tol = _cmath_real_arg(kw.value)
+                        elif kw.arg == "abs_tol":
+                            abs_tol = _cmath_real_arg(kw.value)
+                    return f"(abs(({a0}) - ({b0})) <= max(({abs_tol}), ({rel_tol}) * max(abs({a0}), abs({b0}))))"
             if (
                 isinstance(node.func, ast.Attribute)
                 and self._is_scipy_special_call_attr(node.func)
@@ -16083,7 +17244,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "time"
+                and node.func.value.id in self.time_aliases
                 and node.func.attr in {"time", "perf_counter"}
                 and len(node.args) == 0
             ):
@@ -16091,13 +17252,21 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "time"
+                and node.func.value.id in self.time_aliases
                 and node.func.attr == "ctime"
                 and len(node.args) <= 1
             ):
                 if len(node.args) == 1:
                     return f"py_ctime(real({self.expr(node.args[0])}, kind=dp))"
                 return "py_ctime()"
+            if isinstance(node.func, ast.Name) and node.func.id in self.time_func_aliases:
+                tf = self.time_func_aliases[node.func.id]
+                if tf in {"time", "perf_counter"} and len(node.args) == 0:
+                    return "py_time()"
+                if tf == "ctime" and len(node.args) <= 1:
+                    if len(node.args) == 1:
+                        return f"py_ctime(real({self.expr(node.args[0])}, kind=dp))"
+                    return "py_ctime()"
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in {"strip", "lstrip", "rstrip", "lower", "upper", "replace", "zfill", "ljust", "rjust", "split", "join"}
@@ -16142,7 +17311,15 @@ class translator(ast.NodeVisitor):
                 return "runif()"
             if (
                 isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
+                and (
+                    isinstance(node.func.value, ast.Name)
+                    or (
+                        isinstance(node.func.value, ast.Attribute)
+                        and isinstance(node.func.value.value, ast.Name)
+                        and node.func.value.value.id in {"np", "numpy"}
+                        and node.func.value.attr == "random"
+                    )
+                )
                 and node.func.attr in {"random", "standard_normal", "normal", "uniform"}
             ):
                 # RNG object method calls (e.g. rng = default_rng(); rng.random(...)).
@@ -16242,6 +17419,196 @@ class translator(ast.NodeVisitor):
                     f"(int({low_expr}) + int(runif() * real(max(1, int({high_expr}) - int({low_expr})), kind=dp)))"
                 )
             if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "hasattr"
+                and len(node.args) == 2
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id in {"np", "numpy"}
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                supported = {
+                    "cumsum", "cumprod", "cumulative_sum", "cumulative_prod", "unwrap", "gradient", "degrees", "radians", "deg2rad", "rad2deg",
+                    "exp2", "cbrt", "square", "reciprocal", "positive", "negative", "copysign",
+                    "sin", "cos", "tan", "arcsin", "asin", "arccos", "acos", "arctan", "atan",
+                    "arctan2", "atan2", "sinh", "cosh", "tanh", "arcsinh", "asinh", "arccosh",
+                    "acosh", "arctanh", "atanh", "round", "around", "rint", "fix", "floor", "ceil", "trunc",
+                    "bitwise_count",
+                }
+                return ".true." if node.args[1].value in supported else ".false."
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "nanprod"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                return f"product(merge({a0}, 1.0_dp, (.not. ieee_is_nan({a0}))))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "nancumsum"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                return f"cumsum(merge({a0}, 0.0_dp, (.not. ieee_is_nan({a0}))))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "nancumprod"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                return f"cumprod(merge({a0}, 1.0_dp, (.not. ieee_is_nan({a0}))))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "unwrap"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"unwrap_1d({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"cumulative_sum", "cumulative_prod"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                fn = "cumsum" if node.func.attr == "cumulative_sum" else "cumprod"
+                return f"{fn}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "bitwise_count"
+                and len(node.args) == 1
+            ):
+                return f"bitwise_count_int({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"degrees", "rad2deg"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"(({a0}) * (180.0_dp / acos(-1.0_dp)))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"radians", "deg2rad"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"(({a0}) * (acos(-1.0_dp) / 180.0_dp))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "exp2"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"((2.0_dp ** ({a0})))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "cbrt"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"(sign(abs({a0}) ** (1.0_dp / 3.0_dp), {a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "square"
+                and len(node.args) == 1
+            ):
+                return f"(({self.expr(node.args[0])}) ** 2)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "reciprocal"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                return f"((1.0_dp / ({a0})))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "positive"
+                and len(node.args) == 1
+            ):
+                return f"((+({self.expr(node.args[0])})))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "negative"
+                and len(node.args) == 1
+            ):
+                return f"((-({self.expr(node.args[0])})))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "copysign"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                k0 = self._expr_kind(node.args[0])
+                k1 = self._expr_kind(node.args[1])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if k1 in {"int", "logical"}:
+                    b0 = f"real({b0}, kind=dp)"
+                return f"(sign(abs({a0}), {b0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"fix", "trunc", "rint", "round", "around", "floor", "ceil"}
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                k0 = self._expr_kind(node.args[0])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if node.func.attr in {"fix", "trunc"}:
+                    return f"aint({a0})"
+                if node.func.attr == "rint":
+                    return f"anint({a0})"
+                if node.func.attr in {"floor", "ceil"}:
+                    op = "floor" if node.func.attr == "floor" else "ceiling"
+                    return f"real({op}({a0}), kind=dp)"
+                decimals = None
+                if len(node.args) >= 2:
+                    decimals = self.expr(node.args[1])
+                for kw in node.keywords:
+                    if kw.arg == "decimals":
+                        decimals = self.expr(kw.value)
+                        break
+                if decimals is None:
+                    return f"anint({a0})"
+                return (
+                    f"(anint(({a0}) * (10.0_dp ** int({decimals}))) / "
+                    f"(10.0_dp ** int({decimals})))"
+                )
+            if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
                 and node.func.attr == "sqrt"
@@ -16255,14 +17622,39 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos"}
+                and node.func.attr == "hypot"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                k0 = self._expr_kind(node.args[0])
+                k1 = self._expr_kind(node.args[1])
+                if k0 in {"int", "logical"}:
+                    a0 = f"real({a0}, kind=dp)"
+                if k1 in {"int", "logical"}:
+                    b0 = f"real({b0}, kind=dp)"
+                return f"sqrt(({a0})**2 + ({b0})**2)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"sin", "cos", "tan", "arctan", "arcsin", "arccos", "atan", "asin", "acos"}
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
                 k0 = self._expr_kind(node.args[0])
                 if k0 in {"int", "logical"}:
                     a0 = f"real({a0}, kind=dp)"
-                fmap = {"sin": "sin", "cos": "cos", "tan": "tan", "arctan": "atan", "arcsin": "asin", "arccos": "acos"}
+                fmap = {
+                    "sin": "sin",
+                    "cos": "cos",
+                    "tan": "tan",
+                    "arctan": "atan",
+                    "atan": "atan",
+                    "arcsin": "asin",
+                    "asin": "asin",
+                    "arccos": "acos",
+                    "acos": "acos",
+                }
                 return f"{fmap[node.func.attr]}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
@@ -16281,7 +17673,7 @@ class translator(ast.NodeVisitor):
             if (
                 isinstance(node.func, ast.Attribute)
                 and is_numpy_name_node(node.func.value)
-                and node.func.attr in {"sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh"}
+                and node.func.attr in {"sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh", "asinh", "acosh", "atanh"}
                 and len(node.args) == 1
             ):
                 a0 = self.expr(node.args[0])
@@ -16293,15 +17685,18 @@ class translator(ast.NodeVisitor):
                     "cosh": "cosh",
                     "tanh": "tanh",
                     "arcsinh": "asinh",
+                    "asinh": "asinh",
                     "arccosh": "acosh",
+                    "acosh": "acosh",
                     "arctanh": "atanh",
+                    "atanh": "atanh",
                 }
                 return f"{fmap[node.func.attr]}({a0})"
             if (
                 isinstance(node.func, ast.Attribute)
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "np"
-                and node.func.attr == "arctan2"
+                and node.func.attr in {"arctan2", "atan2"}
                 and len(node.args) == 2
             ):
                 y0 = self.expr(node.args[0])
@@ -16352,6 +17747,209 @@ class translator(ast.NodeVisitor):
             if isinstance(node.func, ast.Name) and node.func.id == "norm" and len(node.args) >= 1:
                 a0 = self.expr(node.args[0])
                 return f"sqrt(sum(({a0})**2))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "interp"
+                and len(node.args) >= 3
+            ):
+                return f"interp_1d({self.expr(node.args[0])}, {self.expr(node.args[1])}, {self.expr(node.args[2])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "heaviside"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                return f"merge(1.0_dp, merge({b0}, 0.0_dp, ({a0}) == 0.0_dp), ({a0}) > 0.0_dp)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "nan_to_num"
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                return (
+                    f"merge(merge(merge({a0}, 0.0_dp, ieee_is_nan({a0})), huge(0.0_dp), "
+                    f"(.not. ieee_is_finite({a0})) .and. ({a0} > 0.0_dp)), "
+                    f"-huge(0.0_dp), (.not. ieee_is_finite({a0})) .and. ({a0} < 0.0_dp))"
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "real_if_close"
+                and len(node.args) == 1
+            ):
+                return f"real({self.expr(node.args[0])}, kind=dp)"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"amax", "amin"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                fn = "maxval" if node.func.attr == "amax" else "minval"
+                return f"{fn}({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"fmax", "fmin"}
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                fn = "max" if node.func.attr == "fmax" else "min"
+                return (
+                    f"merge(merge({fn}({a0}, {b0}), {b0}, ieee_is_nan({a0})), "
+                    f"{a0}, ieee_is_nan({b0}))"
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"real", "imag"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if node.func.attr == "real":
+                    return f"real({a0}, kind=dp)"
+                return f"aimag({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"add", "subtract", "multiply", "divide", "true_divide", "power", "pow", "float_power", "fmod", "remainder"}
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                if node.func.attr == "add":
+                    return f"(({a0}) + ({b0}))"
+                if node.func.attr == "subtract":
+                    return f"(({a0}) - ({b0}))"
+                if node.func.attr == "multiply":
+                    return f"(({a0}) * ({b0}))"
+                if node.func.attr in {"divide", "true_divide"}:
+                    return f"(({a0}) / ({b0}))"
+                if node.func.attr in {"power", "pow", "float_power"}:
+                    return f"(({a0}) ** ({b0}))"
+                if node.func.attr == "fmod":
+                    return f"mod({a0}, {b0})"
+                return f"modulo({a0}, {b0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "spacing"
+                and len(node.args) == 1
+            ):
+                return f"spacing({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "ldexp"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                return f"(({a0}) * (2.0_dp ** ({b0})))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "nextafter"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                return f"nearest({a0}, ({b0}) - ({a0}))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"gcd", "lcm"}
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                fn = "gcd_int_scalar" if node.func.attr == "gcd" else "lcm_int_scalar"
+                return f"{fn}({a0}, {b0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "signbit"
+                and len(node.args) == 1
+            ):
+                return f"signbit_real({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "i0"
+                and len(node.args) == 1
+            ):
+                return f"i0_scalar({self.expr(node.args[0])})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"expm1", "log1p", "sinc"}
+                and len(node.args) == 1
+            ):
+                a0 = self.expr(node.args[0])
+                if node.func.attr == "expm1":
+                    return f"(exp({a0}) - 1.0_dp)"
+                if node.func.attr == "log1p":
+                    return f"log(1.0_dp + ({a0}))"
+                return f"sinc_scalar({a0})"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"logaddexp", "logaddexp2"}
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                if node.func.attr == "logaddexp":
+                    return f"log(exp({a0}) + exp({b0}))"
+                return f"log2((2.0_dp ** ({a0})) + (2.0_dp ** ({b0})))"
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"trapezoid", "trapz"}
+                and len(node.args) >= 1
+            ):
+                y0 = self.expr(node.args[0])
+                x0 = self.expr(node.args[1]) if len(node.args) >= 2 else None
+                if x0 is None:
+                    return f"sum(0.5_dp * ({y0}(2:) + {y0}(:size({y0})-1)))"
+                return (
+                    f"sum(0.5_dp * ({y0}(2:) + {y0}(:size({y0})-1)) * "
+                    f"({x0}(2:) - {x0}(:size({x0})-1)))"
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr == "cross"
+                and len(node.args) == 2
+            ):
+                a0 = self.expr(node.args[0])
+                b0 = self.expr(node.args[1])
+                return (
+                    f"[({a0}(2) * {b0}(3)) - ({a0}(3) * {b0}(2)), "
+                    f"({a0}(3) * {b0}(1)) - ({a0}(1) * {b0}(3)), "
+                    f"({a0}(1) * {b0}(2)) - ({a0}(2) * {b0}(1))]"
+                )
+            if (
+                isinstance(node.func, ast.Attribute)
+                and is_numpy_name_node(node.func.value)
+                and node.func.attr in {"ediff1d", "cumulative_sum", "cumulative_prod", "bitwise_count", "unwrap"}
+                and len(node.args) >= 1
+            ):
+                a0 = self.expr(node.args[0])
+                if node.func.attr == "ediff1d":
+                    return f"({a0}(2:) - {a0}(:size({a0})-1))"
+                if node.func.attr == "cumulative_sum":
+                    return f"cumsum({a0})"
+                if node.func.attr == "cumulative_prod":
+                    return f"cumprod({a0})"
+                if node.func.attr == "bitwise_count":
+                    return f"bitwise_count_int({a0})"
+                return f"unwrap_1d({a0})"
             if isinstance(node.func, ast.Attribute):
                 def _root_name_of_attr(a):
                     cur = a
@@ -16411,12 +18009,23 @@ class translator(ast.NodeVisitor):
                     return ".true."
             if node.attr == "size":
                 return f"size({self.expr(node.value)})"
+            if (
+                node.attr == "shape"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in self.broadcast_object_args
+            ):
+                left_node, right_node = self.broadcast_object_args[node.value.id]
+                dims = self._broadcast_shape_dim_exprs(left_node, right_node)
+                return "[" + ", ".join(dims) + "]"
             if node.attr == "T":
                 vtxt = self.expr(node.value)
                 if self._rank_expr(node.value) <= 1:
                     # NumPy: vector.T is a no-op.
                     return vtxt
                 return f"transpose({vtxt})"
+            if node.attr == "flat":
+                vtxt = self.expr(node.value)
+                return f"reshape({vtxt}, [size({vtxt})])"
             if node.attr == "real":
                 return f"real({self.expr(node.value)}, kind=dp)"
             if node.attr == "imag":
@@ -16442,6 +18051,12 @@ class translator(ast.NodeVisitor):
                 return fstr("unknown")
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "pi":
                 return "acos(-1.0_dp)"
+            if isinstance(node.value, ast.Name) and node.value.id == "cmath" and node.attr == "pi":
+                return "acos(-1.0_dp)"
+            if isinstance(node.value, ast.Name) and node.value.id == "cmath" and node.attr == "e":
+                return "exp(1.0_dp)"
+            if isinstance(node.value, ast.Name) and node.value.id == "cmath" and node.attr == "tau":
+                return "(2.0_dp * acos(-1.0_dp))"
             if isinstance(node.value, ast.Name) and node.value.id == "np" and node.attr == "nan":
                 return "ieee_value(0.0_dp, ieee_quiet_nan)"
             if isinstance(node.value, ast.Name) and node.value.id in {"np", "numpy"} and node.attr in {"inf", "Inf"}:
@@ -16720,12 +18335,28 @@ class translator(ast.NodeVisitor):
                 and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute)
-                and isinstance(node.value.func.value, ast.Name)
-                and node.value.func.value.id == "random"
-                and node.value.func.attr == "Random"
+                and (
+                    (
+                        isinstance(node.value.func, ast.Attribute)
+                        and isinstance(node.value.func.value, ast.Attribute)
+                        and isinstance(node.value.func.value.value, ast.Name)
+                        and node.value.func.value.value.id == "np"
+                        and node.value.func.value.attr == "random"
+                        and node.value.func.attr == "default_rng"
+                    )
+                    or (
+                        isinstance(node.value.func, ast.Name)
+                        and node.value.func.id == "default_rng"
+                    )
+                    or (
+                        isinstance(node.value.func, ast.Attribute)
+                        and isinstance(node.value.func.value, ast.Name)
+                        and node.value.func.value.id == "random"
+                        and node.value.func.attr == "Random"
+                    )
+                )
             ):
-                self._mark_int(node.targets[0].id)
+                self._force_mark_int(node.targets[0].id)
                 self.rng_vars.add(node.targets[0].id)
             if (
                 isinstance(node, ast.Assign)
@@ -16749,6 +18380,16 @@ class translator(ast.NodeVisitor):
                 and isinstance(node.value.func.value, ast.Name)
             ):
                 self._mark_char(node.targets[0].id)
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute)
+                and node.value.func.attr == "readlines"
+                and isinstance(node.value.func.value, ast.Name)
+            ):
+                self._mark_alloc_char(node.targets[0].id, rank=1)
             if (
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
@@ -17108,7 +18749,14 @@ class translator(ast.NodeVisitor):
                     out_ranks = self.tuple_return_out_ranks.get(node.value.func.id, [])
                     formal_ranks = list(self.local_func_arg_ranks.get(node.value.func.id, []))
                     vec_rank = 0
-                    can_vec_tuple = (not out_ranks) or all(int(_r) == 0 for _r in out_ranks)
+                    can_vec_tuple = (
+                        ((not out_ranks) or all(int(_r) == 0 for _r in out_ranks))
+                        and all(
+                            _k not in {"alloc_real", "alloc_int", "alloc_log", "alloc_complex", "alloc_char"}
+                            for _k in out_kinds
+                            if _k is not None
+                        )
+                    )
                     if can_vec_tuple:
                         for i_arg, a_arg in enumerate(node.value.args):
                             fr = formal_ranks[i_arg] if i_arg < len(formal_ranks) else 0
@@ -17123,6 +18771,11 @@ class translator(ast.NodeVisitor):
                         rr = max(0, int(out_ranks[j])) if j < len(out_ranks) else 0
                         if vec_rank > rr:
                             rr = vec_rank
+                        if (
+                            (not can_vec_tuple)
+                            and k in {"real", "int", "logical", "char", "complex"}
+                        ):
+                            rr = 0
                         if k == "alloc_real":
                             self._mark_alloc_real(nm, rank=max(1, rr if rr > 0 else 1))
                         elif k == "alloc_int":
@@ -17162,6 +18815,7 @@ class translator(ast.NodeVisitor):
                             # Unknown tuple-output type: defer marking rather than
                             # forcing INTEGER and causing downstream mismatches.
                             pass
+                        self._check_type_stability_explicit(nm, k, rr, None, node)
                     continue
                 if (
                     len(node.targets) == 1
@@ -17343,41 +18997,30 @@ class translator(ast.NodeVisitor):
                     and isinstance(node.value.func, ast.Attribute)
                     and isinstance(node.value.func.value, ast.Name)
                     and node.value.func.value.id == "np"
-                    and node.value.func.attr in {"split", "array_split"}
-                    and len(node.value.args) >= 2
+                    and node.value.func.attr in {"split", "array_split", "hsplit", "vsplit", "dsplit"}
+                    and (
+                        (node.value.func.attr in {"split", "array_split"} and len(node.value.args) >= 2)
+                        or (node.value.func.attr in {"hsplit", "vsplit", "dsplit"} and len(node.value.args) >= 2)
+                    )
                 ):
                     nm = node.targets[0].id
                     arr = self.expr(node.value.args[0])
-                    if self._rank_expr(node.value.args[0]) != 1:
-                        raise NotImplementedError("np.split/array_split currently support only 1D arrays")
-                    mapping = {}
-                    if node.value.func.attr == "split":
-                        idx_node = node.value.args[1]
-                        if not (isinstance(idx_node, (ast.List, ast.Tuple)) and all(is_const_int(e) for e in idx_node.elts)):
-                            raise NotImplementedError("np.split currently requires constant split indices list")
-                        cuts = [int(e.value) for e in idx_node.elts]
-                        starts = [0] + cuts
-                        ends = cuts + [-1]
-                        for k, (s0, e0) in enumerate(zip(starts, ends)):
-                            lo = f"({s0} + 1)"
-                            hi = f"size({arr})" if e0 < 0 else str(e0)
-                            mapping[k] = f"{arr}({lo}:{hi})"
-                    else:
-                        sec_node = node.value.args[1]
-                        if not (isinstance(sec_node, ast.Constant) and isinstance(sec_node.value, int) and int(sec_node.value) > 0):
-                            raise NotImplementedError("np.array_split currently requires constant positive section count")
-                        m = int(sec_node.value)
-                        n_expr = f"size({arr})"
-                        q_expr = f"(({n_expr}) / {m})"
-                        r_expr = f"mod({n_expr}, {m})"
-                        for k in range(m):
-                            kk = str(k)
-                            lo = f"({kk}*({q_expr}) + min({kk}, {r_expr}) + 1)"
-                            sz = f"(({q_expr}) + merge(1, 0, ({kk} < {r_expr})))"
-                            hi = f"({lo} + {sz} - 1)"
-                            mapping[k] = f"{arr}({lo}:{hi})"
+                    arr_rank = self._rank_expr(node.value.args[0])
+                    axis_node = next((kw.value for kw in node.value.keywords if kw.arg == "axis"), None)
+                    mapping, _axis = build_numpy_split_mapping(
+                        arr,
+                        arr_rank,
+                        node.value.func.attr,
+                        split_node=node.value.args[1],
+                        axis_node=axis_node,
+                    )
                     self.synthetic_slices[nm] = mapping
+                    self.synthetic_slice_meta[nm] = {
+                        "kind": self._expr_kind(node.value.args[0]) or "real",
+                        "rank": arr_rank,
+                    }
                     translator.global_synthetic_slices[nm] = mapping
+                    translator.global_synthetic_slice_meta[nm] = dict(self.synthetic_slice_meta[nm])
                     continue
                 if len(node.targets) != 1:
                     continue
@@ -17955,11 +19598,15 @@ class translator(ast.NodeVisitor):
                             self._mark_alloc_int(t.id, rank=rank_hint)
                         elif k0 == "logical":
                             self._mark_alloc_log(t.id, rank=rank_hint)
+                        elif k0 == "complex":
+                            self._mark_alloc_complex(t.id, rank=rank_hint)
                         else:
                             self._mark_alloc_real(t.id, rank=rank_hint)
                     else:
                         if "int" in dtype_txt:
                             self._mark_alloc_int(t.id, rank=rank_hint)
+                        elif "complex" in dtype_txt:
+                            self._mark_alloc_complex(t.id, rank=rank_hint)
                         elif "bool" in dtype_txt:
                             self._mark_alloc_log(t.id, rank=rank_hint)
                         else:
@@ -19245,6 +20892,36 @@ class translator(ast.NodeVisitor):
             isinstance(t, ast.Name)
             and isinstance(v, ast.Call)
             and isinstance(v.func, ast.Attribute)
+            and v.func.attr == "readlines"
+            and isinstance(v.func.value, ast.Name)
+            and len(v.args) == 0
+        ):
+            hu = self.expr(v.func.value)
+            self.o.w("block")
+            self.o.push()
+            self.o.w("integer :: ios_readlines, n_readlines")
+            self.o.w("character(len=4096) :: line_readlines")
+            self.o.w("character(len=4096), allocatable :: lines_readlines(:), tmp_readlines(:)")
+            self.o.w("allocate(lines_readlines(0))")
+            self.o.w("do")
+            self.o.push()
+            self.o.w(f"read({hu}, '(A)', iostat=ios_readlines) line_readlines")
+            self.o.w("if (ios_readlines /= 0) exit")
+            self.o.w("n_readlines = size(lines_readlines)")
+            self.o.w("allocate(tmp_readlines(n_readlines + 1))")
+            self.o.w("if (n_readlines > 0) tmp_readlines(1:n_readlines) = lines_readlines")
+            self.o.w("tmp_readlines(n_readlines + 1) = trim(line_readlines)")
+            self.o.w("call move_alloc(tmp_readlines, lines_readlines)")
+            self.o.pop()
+            self.o.w("end do")
+            self.o.w(f"{t.id} = lines_readlines")
+            self.o.pop()
+            self.o.w("end block")
+            return
+        if (
+            isinstance(t, ast.Name)
+            and isinstance(v, ast.Call)
+            and isinstance(v.func, ast.Attribute)
             and isinstance(v.func.value, ast.Name)
             and v.func.value.id == "csv"
             and v.func.attr == "reader"
@@ -19391,6 +21068,47 @@ class translator(ast.NodeVisitor):
                 self.lambda_vars[t.id] = v
                 return
             self.lambda_vars.pop(t.id, None)
+            if isinstance(v, ast.Attribute):
+                parts = self._attr_chain_parts(v)
+                if parts in (["np", "transpose"], ["numpy", "transpose"], ["np", "permute_dims"], ["numpy", "permute_dims"]):
+                    self.callable_aliases[t.id] = f"{parts[0]}.{parts[1]}".replace("numpy.", "np.")
+                    return
+                if len(parts) >= 3 and parts[0] in {"np", "numpy"} and parts[-2:] == ["linalg", "matrix_transpose"]:
+                    self.callable_aliases[t.id] = "np.linalg.matrix_transpose"
+                    return
+            if (
+                isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Name)
+                and v.func.id == "getattr"
+                and len(v.args) >= 2
+                and isinstance(v.args[0], ast.Name)
+                and v.args[0].id in {"np", "numpy"}
+                and isinstance(v.args[1], ast.Constant)
+                and isinstance(v.args[1].value, str)
+            ):
+                attr_name = v.args[1].value
+                default_arg = v.args[2] if len(v.args) >= 3 else None
+                if attr_name == "permute_dims" and isinstance(default_arg, ast.Attribute):
+                    parts = self._attr_chain_parts(default_arg)
+                    if parts in (["np", "transpose"], ["numpy", "transpose"]):
+                        self.none_vars.discard(t.id)
+                        self.callable_aliases[t.id] = "np.transpose"
+                        return
+                if attr_name == "matrix_transpose" and is_none(default_arg):
+                    self.none_vars.add(t.id)
+                    self.callable_aliases.pop(t.id, None)
+                    return
+            if (
+                isinstance(v, ast.Call)
+                and isinstance(v.func, ast.Attribute)
+                and is_numpy_name_node(v.func.value)
+                and v.func.attr == "broadcast"
+                and len(v.args) >= 2
+            ):
+                self.broadcast_object_args[t.id] = (v.args[0], v.args[1])
+                self.callable_aliases.pop(t.id, None)
+                self.none_vars.discard(t.id)
+                return
             if isinstance(v, ast.Name) and self._is_local_callable_symbol(v.id):
                 # Python allows rebinding callables (f = f_01; call g(f)).
                 # For Fortran, carry a simple alias and pass the procedure
@@ -19404,7 +21122,7 @@ class translator(ast.NodeVisitor):
                 rk = None
             if rk is not None:
                 k_vis0, _r_vis0 = self._visible_kind_rank(t.id)
-                if k_vis0 == rk[0]:
+                if k_vis0 == rk[0] and int(_r_vis0) == int(rk[1]):
                     # Rank-only rebinds do not require block shadowing.
                     rk = None
             # Rebinding a name on a self-referential assignment would shadow the
@@ -19421,14 +21139,25 @@ class translator(ast.NodeVisitor):
                 # Path-insensitive prescan can miss needed branch-local rebinds
                 # in if/elif trees. If this name is known to rebind and visible
                 # kind/rank does not match RHS, open an explicit local block.
-                if t.id in self.type_rebind_targets:
+                if t.id in set(self.tuple_return_out_names or []):
+                    k_rhs = None
+                    r_rhs = 0
+                    k_vis = None
+                    r_vis = 0
+                else:
                     k_rhs = self._expr_kind(v)
                     r_rhs = max(0, int(self._rank_expr(v)))
                     k_vis, r_vis = self._visible_kind_rank(t.id)
                     if (
+                        k_vis == "complex"
+                        and k_rhs in {"int", "real"}
+                        and r_rhs == 0
+                    ):
+                        k_rhs = "complex"
+                    if (
                         k_rhs is not None
                         and k_vis is not None
-                        and (k_rhs != k_vis)
+                        and ((k_rhs != k_vis) or (int(r_rhs) != int(r_vis)))
                         and (not _expr_uses_name(v, t.id))
                     ):
                         self._open_type_rebind_block(t.id, k_rhs, r_rhs)
@@ -19863,10 +21592,97 @@ class translator(ast.NodeVisitor):
             and isinstance(v.func, ast.Name)
             and v.func.id in self.tuple_return_funcs
         ):
+            formal_in = list(self.local_func_arg_names.get(v.func.id, []))
+            if formal_in and getattr(v, "keywords", []):
+                args_nodes = [None] * len(formal_in)
+                for i, a in enumerate(v.args):
+                    if i < len(args_nodes):
+                        args_nodes[i] = a
+                name_to_idx = {nm: i for i, nm in enumerate(formal_in)}
+                for kw in v.keywords:
+                    if kw.arg is None:
+                        raise NotImplementedError("**kwargs not supported")
+                    if kw.arg in name_to_idx:
+                        args_nodes[name_to_idx[kw.arg]] = kw.value
+            else:
+                args_nodes = self._build_local_call_actual_nodes(v.func.id, v)
+            out_kinds_hint = list(self.tuple_return_out_kinds.get(v.func.id, []))
+            out_ranks_hint = list(self.tuple_return_out_ranks.get(v.func.id, []))
+            scalar_tuple_can_vectorize = (
+                ((not out_ranks_hint) or all(int(_r) == 0 for _r in out_ranks_hint))
+                and all(
+                    _k not in {"alloc_real", "alloc_int", "alloc_log", "alloc_complex", "alloc_char"}
+                    for _k in out_kinds_hint
+                    if _k is not None
+                )
+            )
+            dmap = self.local_overload_dispatch.get(v.func.id, None)
+            disp_out_rank = None
+            if dmap is not None:
+                iv = int(dmap.get("arg_index", -1))
+                if 0 <= iv < len(args_nodes) and args_nodes[iv] is not None:
+                    try:
+                        disp_out_rank = max(0, int(self._rank_expr(args_nodes[iv])))
+                    except Exception:
+                        disp_out_rank = None
+            out_name_pos = 0
+            for e in t.elts:
+                if not isinstance(e, ast.Name):
+                    continue
+                rk = self._consume_type_rebind(e.id, getattr(node, "lineno", None))
+                raw_want_kind = rk[0] if rk is not None else None
+                want_kind = raw_want_kind
+                want_rank = rk[1] if rk is not None else None
+                if want_kind is None and out_name_pos < len(out_kinds_hint):
+                    raw_want_kind = out_kinds_hint[out_name_pos]
+                    want_kind = raw_want_kind
+                if want_kind == "alloc_real":
+                    want_kind = "real"
+                    want_rank = max(1, int(want_rank)) if want_rank is not None else 1
+                elif want_kind == "alloc_int":
+                    want_kind = "int"
+                    want_rank = max(1, int(want_rank)) if want_rank is not None else 1
+                elif want_kind == "alloc_log":
+                    want_kind = "logical"
+                    want_rank = max(1, int(want_rank)) if want_rank is not None else 1
+                elif want_kind == "alloc_complex":
+                    want_kind = "complex"
+                    want_rank = max(1, int(want_rank)) if want_rank is not None else 1
+                elif want_kind == "alloc_char":
+                    want_kind = "char"
+                    want_rank = max(1, int(want_rank)) if want_rank is not None else 1
+                if want_rank is None:
+                    if disp_out_rank is not None:
+                        want_rank = disp_out_rank
+                    elif out_name_pos < len(out_ranks_hint):
+                        want_rank = out_ranks_hint[out_name_pos]
+                if (
+                    want_kind in {"real", "int", "logical", "char", "complex"}
+                    and (not scalar_tuple_can_vectorize)
+                ):
+                    want_rank = 0
+                if want_kind is None or want_rank is None:
+                    out_name_pos += 1
+                    continue
+                k_vis0, r_vis0 = self._visible_kind_rank(e.id)
+                if (
+                    raw_want_kind in {"alloc_real", "alloc_int", "alloc_log", "alloc_complex", "alloc_char"}
+                    and int(want_rank) <= 0
+                ):
+                    want_rank = max(1, int(r_vis0))
+                if k_vis0 == want_kind and int(r_vis0) == int(want_rank):
+                    out_name_pos += 1
+                    continue
+                if self.open_type_rebind_stack and self.open_type_rebind_stack[-1] == self._aliased_name(e.id):
+                    self._close_one_type_rebind_block()
+                self._open_type_rebind_block(e.id, want_kind, want_rank)
+                out_name_pos += 1
             outs = []
             for e in t.elts:
                 if isinstance(e, ast.Name):
                     outs.append(self._aliased_name(e.id))
+                elif isinstance(e, ast.Subscript):
+                    outs.append(self.expr(e))
                 elif isinstance(e, ast.Starred):
                     outs.append("_")
                 else:
@@ -19874,7 +21690,9 @@ class translator(ast.NodeVisitor):
             formal_ranks = list(self.local_func_arg_ranks.get(v.func.id, []))
             vec_rank = 0
             vec_idx = -1
-            for i_arg, a_arg in enumerate(v.args):
+            for i_arg, a_arg in enumerate(args_nodes):
+                if a_arg is None:
+                    continue
                 fr = formal_ranks[i_arg] if i_arg < len(formal_ranks) else 0
                 ar = int(self._rank_expr(a_arg))
                 if fr == 0 and ar > 0:
@@ -19883,10 +21701,16 @@ class translator(ast.NodeVisitor):
                         vec_idx = i_arg
             # Scalar tuple-return callee invoked with a rank-1 actual:
             # lower to elementwise loop and promote outputs to rank-1.
-            out_ranks_hint = list(self.tuple_return_out_ranks.get(v.func.id, []))
-            can_vec_tuple = (not out_ranks_hint) or all(int(_r) == 0 for _r in out_ranks_hint)
+            can_vec_tuple = scalar_tuple_can_vectorize
+            if can_vec_tuple and vec_idx < 0 and dmap is not None:
+                iv = int(dmap.get("arg_index", -1))
+                if 0 <= iv < len(args_nodes) and args_nodes[iv] is not None:
+                    ar = int(self._rank_expr(args_nodes[iv]))
+                    if ar > 0:
+                        vec_rank = ar
+                        vec_idx = iv
             if vec_rank == 1 and vec_idx >= 0 and can_vec_tuple:
-                vec_expr = self.expr(v.args[vec_idx])
+                vec_expr = self.expr(args_nodes[vec_idx])
                 loop_i = "i_tv"
                 while loop_i in self.ints or loop_i in self.reals or loop_i in self.complexes or loop_i in self.logs or loop_i in self.chars:
                     loop_i += "_2"
@@ -19916,7 +21740,8 @@ class translator(ast.NodeVisitor):
                         continue
                     frm = out_formals[j] if j < len(out_formals) else f"{v.func.id}_out_{j + 1}"
                     call_args.append(f"{frm}={onm}({loop_i})")
-                self.o.w(f"call {self._aliased_name(v.func.id)}(" + ", ".join(call_args) + ")")
+                _tuple_call_name = v.func.id if v.func.id in self.local_generic_overloads else self._aliased_name(v.func.id)
+                self.o.w(f"call {_tuple_call_name}(" + ", ".join(call_args) + ")")
                 self.o.pop()
                 self.o.w("end do")
                 self.o.pop()
@@ -19929,7 +21754,6 @@ class translator(ast.NodeVisitor):
                     raise NotImplementedError("**kwargs not supported")
                 args.append(f"{kw.arg}={self.expr(kw.value)}")
                 saw_named = True
-            formal_in = list(self.local_func_arg_names.get(v.func.id, []))
             force_named_outs = len(v.args) < len(formal_in)
             out_formals = list(self.local_tuple_return_out_names.get(v.func.id, []))
             in_actual_txt = set(args[: len(v.args)])
@@ -19979,7 +21803,8 @@ class translator(ast.NodeVisitor):
                     call_args.append(f"{frm}={onm}")
             else:
                 call_args.extend(out_actuals)
-            self.o.w(f"call {self._aliased_name(v.func.id)}(" + ", ".join(call_args) + ")")
+            _tuple_call_name = v.func.id if v.func.id in self.local_generic_overloads else self._aliased_name(v.func.id)
+            self.o.w(f"call {_tuple_call_name}(" + ", ".join(call_args) + ")")
 
             if tmp_decl:
                 for j, tnm, _k in tmp_decl:
@@ -20738,6 +22563,7 @@ class translator(ast.NodeVisitor):
                 seed_expr = self.expr(seed_node)
                 self.o.w(f"call seed_rng(int({seed_expr}))")
             # Keep a placeholder scalar for the RNG object name.
+            self._force_mark_int(t.id)
             self.o.w(f"{self._aliased_name(t.id)} = 0")
             self.rng_vars.add(t.id)
             return
@@ -20759,6 +22585,7 @@ class translator(ast.NodeVisitor):
                 self.o.w("call seed_rng()")
             else:
                 self.o.w(f"call seed_rng(int({self.expr(seed_node)}))")
+            self._force_mark_int(t.id)
             self.o.w(f"{self._aliased_name(t.id)} = 0")
             self.rng_vars.add(t.id)
             return
@@ -22037,40 +23864,26 @@ class translator(ast.NodeVisitor):
             and isinstance(v.func, ast.Attribute)
             and isinstance(v.func.value, ast.Name)
             and v.func.value.id == "np"
-            and v.func.attr in {"split", "array_split"}
+            and v.func.attr in {"split", "array_split", "hsplit", "vsplit", "dsplit"}
             and len(v.args) >= 2
         ):
             arr = self.expr(v.args[0])
-            if self._rank_expr(v.args[0]) != 1:
-                raise NotImplementedError("np.split/array_split currently support only 1D arrays")
-            mapping = {}
-            if v.func.attr == "split":
-                idx_node = v.args[1]
-                if not (isinstance(idx_node, (ast.List, ast.Tuple)) and all(is_const_int(e) for e in idx_node.elts)):
-                    raise NotImplementedError("np.split currently requires constant split indices list")
-                cuts = [int(e.value) for e in idx_node.elts]
-                starts = [0] + cuts
-                ends = cuts + [-1]
-                for k, (s0, e0) in enumerate(zip(starts, ends)):
-                    lo = f"({s0} + 1)"
-                    hi = f"size({arr})" if e0 < 0 else str(e0)
-                    mapping[k] = f"{arr}({lo}:{hi})"
-            else:
-                sec_node = v.args[1]
-                if not (isinstance(sec_node, ast.Constant) and isinstance(sec_node.value, int) and int(sec_node.value) > 0):
-                    raise NotImplementedError("np.array_split currently requires constant positive section count")
-                m = int(sec_node.value)
-                n_expr = f"size({arr})"
-                q_expr = f"(({n_expr}) / {m})"
-                r_expr = f"mod({n_expr}, {m})"
-                for k in range(m):
-                    kk = str(k)
-                    lo = f"({kk}*({q_expr}) + min({kk}, {r_expr}) + 1)"
-                    sz = f"(({q_expr}) + merge(1, 0, ({kk} < {r_expr})))"
-                    hi = f"({lo} + {sz} - 1)"
-                    mapping[k] = f"{arr}({lo}:{hi})"
+            arr_rank = self._rank_expr(v.args[0])
+            axis_node = next((kw.value for kw in v.keywords if kw.arg == "axis"), None)
+            mapping, _axis = build_numpy_split_mapping(
+                arr,
+                arr_rank,
+                v.func.attr,
+                split_node=v.args[1],
+                axis_node=axis_node,
+            )
             self.synthetic_slices[t.id] = mapping
+            self.synthetic_slice_meta[t.id] = {
+                "kind": self._expr_kind(v.args[0]) or "real",
+                "rank": arr_rank,
+            }
             translator.global_synthetic_slices[t.id] = mapping
+            translator.global_synthetic_slice_meta[t.id] = dict(self.synthetic_slice_meta[t.id])
             return
 
         # np.empty(shape, dtype=np.int_ / np.bool_)
@@ -23382,6 +25195,60 @@ class translator(ast.NodeVisitor):
             self.o.pop()
             self.o.w("end block")
 
+        def _emit_for_over_synthetic_slices(iter_name, target_name, idx_name=None, enum_start_txt=None):
+            mapping = self.synthetic_slices.get(iter_name, {})
+            meta = self.synthetic_slice_meta.get(iter_name, {})
+            if not mapping:
+                raise NotImplementedError("empty synthetic slice iterable")
+            iv = f"i_iter_{node.lineno}"
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {iv}")
+            if idx_name is not None and idx_name != "_":
+                self.o.w(f"integer :: {idx_name}")
+            if target_name != "_":
+                k = meta.get("kind", "real")
+                rr = int(meta.get("rank", 0) or 0)
+                dims = ",".join(":" for _ in range(max(1, rr)))
+                if rr > 0:
+                    if k == "real":
+                        self.o.w(f"real(kind=dp), allocatable :: {target_name}({dims})")
+                    elif k == "logical":
+                        self.o.w(f"logical, allocatable :: {target_name}({dims})")
+                    elif k == "complex":
+                        self.o.w(f"complex(kind=dp), allocatable :: {target_name}({dims})")
+                    elif k == "char":
+                        self.o.w(f"character(len=:), allocatable :: {target_name}({dims})")
+                    else:
+                        self.o.w(f"integer, allocatable :: {target_name}({dims})")
+                else:
+                    if k == "real":
+                        self.o.w(f"real(kind=dp) :: {target_name}")
+                    elif k == "logical":
+                        self.o.w(f"logical :: {target_name}")
+                    elif k == "complex":
+                        self.o.w(f"complex(kind=dp) :: {target_name}")
+                    elif k == "char":
+                        self.o.w(f"character(len=:), allocatable :: {target_name}")
+                    else:
+                        self.o.w(f"integer :: {target_name}")
+            self.o.w(f"do {iv} = 0, {len(mapping) - 1}")
+            self.o.push()
+            if idx_name is not None and enum_start_txt is not None and idx_name != "_":
+                self.o.w(f"{idx_name} = ({enum_start_txt}) + {iv}")
+            if target_name != "_":
+                self.o.w(f"{target_name} = {mapping.get(0, '')}")
+                for _k, _expr in sorted(mapping.items()):
+                    if _k == 0:
+                        continue
+                    self.o.w(f"if ({iv} == {_k}) {target_name} = {_expr}")
+            _visit_loop_body_and_close_rebinds()
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
+            return
+
         if (
             isinstance(node.iter, ast.Name)
             and node.iter.id in self.csv_reader_specs
@@ -23484,6 +25351,16 @@ class translator(ast.NodeVisitor):
             if not (isinstance(t_idx, ast.Name) and isinstance(t_val, ast.Name)):
                 raise NotImplementedError("enumerate targets must be names")
             seq_node = node.iter.args[0]
+            if isinstance(seq_node, ast.Name) and seq_node.id in self.synthetic_slices:
+                enum_start_node = None
+                if len(node.iter.args) >= 2:
+                    enum_start_node = node.iter.args[1]
+                for kw in getattr(node.iter, "keywords", []):
+                    if kw.arg == "start":
+                        enum_start_node = kw.value
+                enum_start_txt = "0" if enum_start_node is None else self.expr(enum_start_node)
+                _emit_for_over_synthetic_slices(seq_node.id, t_val.id, idx_name=t_idx.id, enum_start_txt=enum_start_txt)
+                return
             if self._rank_expr(seq_node) <= 0:
                 raise NotImplementedError("enumerate() currently supports range(...) or rank-1 iterables")
             enum_start_node = None
@@ -23784,6 +25661,59 @@ class translator(ast.NodeVisitor):
             self.o.w("end do")
             self.o.pop()
             self.o.w("end block")
+
+        def _emit_for_over_synthetic_slices(iter_name, target_name, idx_name=None, enum_start_txt=None):
+            mapping = self.synthetic_slices.get(iter_name, {})
+            meta = self.synthetic_slice_meta.get(iter_name, {})
+            if not mapping:
+                raise NotImplementedError("empty synthetic slice iterable")
+            iv = f"i_iter_{node.lineno}"
+            self.o.w("block")
+            self.o.push()
+            self.o.w(f"integer :: {iv}")
+            if idx_name is not None and idx_name != "_":
+                self.o.w(f"integer :: {idx_name}")
+            if target_name != "_":
+                k = meta.get("kind", "real")
+                rr = int(meta.get("rank", 0) or 0)
+                dims = ",".join(":" for _ in range(max(1, rr)))
+                if rr > 0:
+                    if k == "real":
+                        self.o.w(f"real(kind=dp), allocatable :: {target_name}({dims})")
+                    elif k == "logical":
+                        self.o.w(f"logical, allocatable :: {target_name}({dims})")
+                    elif k == "complex":
+                        self.o.w(f"complex(kind=dp), allocatable :: {target_name}({dims})")
+                    elif k == "char":
+                        self.o.w(f"character(len=:), allocatable :: {target_name}({dims})")
+                    else:
+                        self.o.w(f"integer, allocatable :: {target_name}({dims})")
+                else:
+                    if k == "real":
+                        self.o.w(f"real(kind=dp) :: {target_name}")
+                    elif k == "logical":
+                        self.o.w(f"logical :: {target_name}")
+                    elif k == "complex":
+                        self.o.w(f"complex(kind=dp) :: {target_name}")
+                    elif k == "char":
+                        self.o.w(f"character(len=:), allocatable :: {target_name}")
+                    else:
+                        self.o.w(f"integer :: {target_name}")
+            self.o.w(f"do {iv} = 0, {len(mapping) - 1}")
+            self.o.push()
+            if idx_name is not None and enum_start_txt is not None and idx_name != "_":
+                self.o.w(f"{idx_name} = ({enum_start_txt}) + {iv}")
+            if target_name != "_":
+                self.o.w(f"{target_name} = {mapping.get(0, '')}")
+                for _k, _expr in sorted(mapping.items()):
+                    if _k == 0:
+                        continue
+                    self.o.w(f"if ({iv} == {_k}) {target_name} = {_expr}")
+            _visit_loop_body_and_close_rebinds()
+            self.o.pop()
+            self.o.w("end do")
+            self.o.pop()
+            self.o.w("end block")
             return
 
         if not (isinstance(node.iter, ast.Call) and isinstance(node.iter.func, ast.Name) and node.iter.func.id == "range"):
@@ -23865,6 +25795,9 @@ class translator(ast.NodeVisitor):
                 self.o.w("end do")
                 self.o.pop()
                 self.o.w("end block")
+                return
+            if isinstance(node.target, ast.Name) and isinstance(node.iter, ast.Name) and node.iter.id in self.synthetic_slices:
+                _emit_for_over_synthetic_slices(node.iter.id, node.target.id)
                 return
             if isinstance(node.target, ast.Name) and self._rank_expr(node.iter) >= 1:
                 rr = self._rank_expr(node.iter)
@@ -24048,6 +25981,37 @@ class translator(ast.NodeVisitor):
             and len(c.args) == 0
         ):
             self.o.w(f"close({self.expr(c.func.value)})")
+            return
+        if (
+            isinstance(c.func, ast.Attribute)
+            and isinstance(c.func.value, ast.Name)
+            and c.func.value.id == "np"
+            and c.func.attr == "copyto"
+            and len(c.args) >= 2
+        ):
+            dst_node = c.args[0]
+            src_node = c.args[1]
+            dst_expr = self.expr(dst_node)
+            src_expr = self.expr(src_node)
+            dst_rank = max(0, int(self._rank_expr(dst_node)))
+            src_rank = max(0, int(self._rank_expr(src_node)))
+            if dst_rank == 2 and src_rank == 1:
+                src_expr = f"spread({src_expr}, dim=1, ncopies=size({dst_expr},1))"
+            elif dst_rank == 1 and src_rank == 0:
+                pass
+            elif dst_rank == 2 and src_rank == 0:
+                pass
+            elif dst_rank != src_rank:
+                raise NotImplementedError("np.copyto currently supports scalar, same-rank, or 1D->2D broadcast")
+            where_node = next((kw.value for kw in c.keywords if kw.arg == "where"), None)
+            if where_node is not None:
+                self.o.w(f"where ({self.expr(where_node)})")
+                self.o.push()
+                self.o.w(f"{dst_expr} = {src_expr}")
+                self.o.pop()
+                self.o.w("end where")
+            else:
+                self.o.w(f"{dst_expr} = {src_expr}")
             return
         if (
             isinstance(c.func, ast.Attribute)
@@ -24269,13 +26233,14 @@ class translator(ast.NodeVisitor):
             parts = []
             for i, a in enumerate(args_nodes):
                 ae = self.expr(a)
-                ae = self._coerce_local_actual_kind(c.func.id, i, a, ae)
-                er = ranks[i] if i < len(ranks) else 0
-                ar = self._rank_expr(a)
-                if er == 2 and ar == 1:
-                    ae = f"reshape({ae}, [size({ae}), 1])"
-                elif er == 1 and ar == 2:
-                    ae = f"reshape({ae}, [size({ae})])"
+                if c.func.id not in self.local_generic_overloads:
+                    ae = self._coerce_local_actual_kind(c.func.id, i, a, ae)
+                    er = ranks[i] if i < len(ranks) else 0
+                    ar = self._rank_expr(a)
+                    if er == 2 and ar == 1:
+                        ae = f"reshape({ae}, [size({ae}), 1])"
+                    elif er == 1 and ar == 2:
+                        ae = f"reshape({ae}, [size({ae})])"
                 parts.append(ae)
             call_name = c.func.id
             dmap = self.local_overload_dispatch.get(c.func.id, None)
@@ -24287,7 +26252,7 @@ class translator(ast.NodeVisitor):
                         key = "list" if self._is_python_list_expr(av) else "array"
                         if key in dmap:
                             call_name = dmap[key]
-            if call_name == c.func.id:
+            if call_name == c.func.id and c.func.id not in self.local_generic_overloads:
                 call_name = self._aliased_name(call_name)
             if parts:
                 self.o.w(f"call {call_name}(" + ", ".join(parts) + ")")
@@ -24597,6 +26562,33 @@ class translator(ast.NodeVisitor):
             self.o.w("end if")
             return
 
+        def _emit_sys_exit_call(exit_name, args):
+            if len(args) == 0:
+                self.o.w("stop")
+                return True
+            if len(args) != 1:
+                raise NotImplementedError(f"{exit_name}() currently supports at most one argument")
+            arg = args[0]
+            arg_txt = self.expr(arg)
+            arg_kind = self._expr_kind(arg)
+            arg_rank = self._rank_expr(arg)
+            if arg_rank != 0:
+                raise NotImplementedError(f"{exit_name}() currently supports only scalar exit values")
+            if arg_kind == "char":
+                self.o.w(f"error stop {arg_txt}")
+                return True
+            if arg_kind == "logical":
+                self.o.w(f"stop merge(1, 0, {arg_txt})")
+                return True
+            if arg_kind in {"int", "real"}:
+                self.o.w(f"stop int({arg_txt})")
+                return True
+            raise NotImplementedError(f"{exit_name}() unsupported argument type")
+
+        if isinstance(c.func, ast.Name) and c.func.id in self.sys_func_aliases:
+            if _emit_sys_exit_call(self.sys_func_aliases[c.func.id], c.args):
+                return
+
         # Plotting/visualization calls are side-effect only and can be safely
         # ignored for numeric transpilation workflows.
         if isinstance(c.func, ast.Attribute):
@@ -24660,6 +26652,9 @@ class translator(ast.NodeVisitor):
                     call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
                     print(f"note: no-op standalone write call: {call_txt}")
                 return
+            if root in self.sys_aliases and attr in {"exit", "quit"}:
+                if _emit_sys_exit_call(attr, c.args):
+                    return
 
         call_txt = ast.unparse(c) if hasattr(ast, "unparse") else ast.dump(c, include_attributes=False)
         raise NotImplementedError(f"unsupported expression call: {call_txt}")
@@ -24787,8 +26782,17 @@ class translator(ast.NodeVisitor):
                 else:
                     if prev_desc:
                         fmt_parts.append("1x")
-                    fmt_parts.append(ent[1])
-                    expr_txt = self.expr(ent[2])
+                    desc = ent[1]
+                    fmt_parts.append(desc)
+                    arg_node = ent[2]
+                    expr_txt = self.expr(arg_node)
+                    arg_kind = self._expr_kind(arg_node)
+                    arg_rank = self._rank_expr(arg_node)
+                    if desc.lower().startswith("i") and arg_rank == 0:
+                        if arg_kind == "real":
+                            expr_txt = f"int({expr_txt})"
+                        elif arg_kind == "logical":
+                            expr_txt = f"merge(1, 0, {expr_txt})"
                     if len(ent) >= 4 and bool(ent[3]):
                         expr_txt = f"real({expr_txt}, kind=dp)"
                     write_args.append(expr_txt)
@@ -24855,7 +26859,8 @@ class translator(ast.NodeVisitor):
                     call_args.append(f"{frm}={tmp_name}")
             else:
                 call_args.extend(tmp_names)
-            self.o.w(f"call {self._aliased_name(tuple_call.func.id)}(" + ", ".join(call_args) + ")")
+            _tuple_call_name = tuple_call.func.id if tuple_call.func.id in self.local_generic_overloads else self._aliased_name(tuple_call.func.id)
+            self.o.w(f"call {_tuple_call_name}(" + ", ".join(call_args) + ")")
             write_prefix = f"write({unit_txt},*, advance='no') " if advance_no else ( "print *, " if unit_txt == "*" else f"write({unit_txt},*) " )
             self.o.w(write_prefix + ", ".join(tmp_names))
             self.o.pop()
@@ -24873,6 +26878,32 @@ class translator(ast.NodeVisitor):
             return
         if len(call.args) == 1:
             a0 = call.args[0]
+            if (
+                isinstance(a0, ast.Call)
+                and isinstance(a0.func, ast.Attribute)
+                and is_numpy_name_node(a0.func.value)
+            ):
+                np_name = a0.func.attr
+                pair_parts = None
+                if np_name == "frexp" and len(a0.args) == 1:
+                    x0 = self.expr(a0.args[0])
+                    pair_parts = [f"fraction({x0})", f"exponent({x0})"]
+                elif np_name == "modf" and len(a0.args) == 1:
+                    x0 = self.expr(a0.args[0])
+                    pair_parts = [f"(({x0}) - aint({x0}))", f"aint({x0})"]
+                elif np_name == "divmod" and len(a0.args) == 2:
+                    x0 = self.expr(a0.args[0])
+                    y0 = self.expr(a0.args[1])
+                    pair_parts = [f"(({x0}) - modulo({x0}, {y0})) / ({y0})", f"modulo({x0}, {y0})"]
+                if pair_parts is not None:
+                    if advance_no:
+                        self.o.w(f"write({unit_txt},*, advance='no') " + ", ".join(pair_parts))
+                    else:
+                        if unit_txt == "*":
+                            self.o.w("print *, " + ", ".join(pair_parts))
+                        else:
+                            self.o.w(f"write({unit_txt},*) " + ", ".join(pair_parts))
+                    return
             if self._rank_expr(a0) == 2 and self._expr_kind(a0) == "real":
                 self.o.w(f"call print_matrix({self.expr(a0)})")
                 return
@@ -25976,6 +28007,18 @@ def _emit_local_function(
                     return True
         return False
 
+    def _arg_used_as_rng_receiver(nm):
+        for st in fn.body:
+            for n in ast.walk(st):
+                if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)):
+                    continue
+                recv = n.func.value
+                if not (isinstance(recv, ast.Name) and recv.id == nm):
+                    continue
+                if n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice"}:
+                    return True
+        return False
+
     def _arg_name_prefers_int(nm):
         nm_l = str(nm).lower()
         return nm_l in {
@@ -26200,6 +28243,10 @@ def _emit_local_function(
             _dk = tr._expr_kind(defaults_map[a.arg])
             if _dk in {"char", "logical", "complex"}:
                 rk_hint = _dk
+        if a.arg in getattr(tr, "rng_vars", set()):
+            rk_hint = "int"
+        if _arg_used_as_rng_receiver(a.arg):
+            rk_hint = "int"
         if rk_hint is None:
             if _arg_used_in_numeric_arith(a.arg) and (not _arg_used_as_index_or_range(a.arg)):
                 rk_hint = "real"
@@ -26242,6 +28289,63 @@ def _emit_local_function(
                 tr._mark_char(a.arg)
 
     tr.prescan(fn.body)
+    def _apply_strong_scalar_local_specs():
+        fn_args_set = set(args)
+        tuple_out_names_set = set(local_tuple_return_out_names.get(fn.name, []))
+        skip_names = fn_args_set | tuple_out_names_set | {ret_name}
+        local_names = (
+            set(tr.reals) | set(tr.complexes) | set(tr.ints) | set(tr.logs) | set(tr.chars) |
+            set(tr.alloc_reals) | set(tr.alloc_complexes) | set(tr.alloc_ints) |
+            set(tr.alloc_logs) | set(tr.alloc_chars)
+        ) - skip_names
+        def _clear_name(_nm):
+            tr.reals.discard(_nm)
+            tr.complexes.discard(_nm)
+            tr.ints.discard(_nm)
+            tr.logs.discard(_nm)
+            tr.chars.discard(_nm)
+            tr.alloc_reals.discard(_nm)
+            tr.alloc_complexes.discard(_nm)
+            tr.alloc_ints.discard(_nm)
+            tr.alloc_logs.discard(_nm)
+            tr.alloc_chars.discard(_nm)
+            tr.alloc_real_rank.pop(_nm, None)
+            tr.alloc_complex_rank.pop(_nm, None)
+            tr.alloc_int_rank.pop(_nm, None)
+            tr.alloc_log_rank.pop(_nm, None)
+            tr.alloc_char_rank.pop(_nm, None)
+        for _nm in sorted(local_names):
+            assign_specs = []
+            bad = False
+            for _st in ast.walk(fn):
+                if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _nm):
+                    continue
+                _rr = int(tr._rank_expr(_st.value))
+                _kk = tr._expr_kind(_st.value)
+                if _kk not in {"int", "real", "logical", "char", "complex"}:
+                    bad = True
+                    break
+                assign_specs.append((_kk, _rr))
+            if bad or (not assign_specs):
+                continue
+            if any(int(_rr) != 0 for _, _rr in assign_specs):
+                continue
+            kind_set = {_kk for _kk, _rr in assign_specs}
+            if len(kind_set) != 1:
+                continue
+            _kk = next(iter(kind_set))
+            _clear_name(_nm)
+            if _kk == "int":
+                tr._mark_int(_nm)
+            elif _kk == "real":
+                tr._mark_real(_nm)
+            elif _kk == "logical":
+                tr._mark_log(_nm)
+            elif _kk == "char":
+                tr._mark_char(_nm)
+            elif _kk == "complex":
+                tr._mark_complex(_nm)
+    _apply_strong_scalar_local_specs()
     for _i, _arg in enumerate(args):
         if not _char_scalar_arg_pattern_local(_arg):
             continue
@@ -26882,6 +28986,30 @@ def _emit_local_function(
         rv0 = returns[0].value
         rr0 = max(0, int(tr._rank_expr(rv0)))
         rk0 = tr._expr_kind(rv0)
+        if (
+            isinstance(rv0, ast.Call)
+            and isinstance(rv0.func, ast.Name)
+            and rv0.func.id in callback_specs
+        ):
+            _cb = callback_specs[rv0.func.id]
+            if rr0 <= 0:
+                rr0 = max(0, int(_cb.get("ret_rank", 0)))
+            if rk0 is None:
+                rk0 = _cb.get("ret_kind", None)
+        if local_return_specs is not None and rk0 in {"real", "complex", "logical", "char", "int"}:
+            if rr0 > 0:
+                spec_map = {
+                    "real": "alloc_real",
+                    "complex": "alloc_complex",
+                    "logical": "alloc_log",
+                    "char": "alloc_char",
+                    "int": "alloc_int",
+                }
+                local_return_specs[fn.name] = spec_map.get(rk0, "alloc_int")
+                if local_return_ranks is not None:
+                    local_return_ranks[fn.name] = max(int(local_return_ranks.get(fn.name, 0)), rr0)
+            else:
+                local_return_specs[fn.name] = rk0
         if rr0 > 0:
             if rk0 == "real":
                 tr._mark_alloc_real(ret_name, rank=rr0)
@@ -26893,6 +29021,14 @@ def _emit_local_function(
                 tr._mark_alloc_char(ret_name, rank=rr0)
             else:
                 tr._mark_alloc_int(ret_name, rank=rr0)
+        elif rk0 == "real":
+            tr._mark_real(ret_name)
+        elif rk0 == "complex":
+            tr._mark_complex(ret_name)
+        elif rk0 == "logical":
+            tr._mark_log(ret_name)
+        elif rk0 == "char":
+            tr._mark_char(ret_name)
     void_return = (not tuple_return) and (not dict_return) and (len(returns) == 0)
 
     # Normalize tuple-unpacked locals from name sources (e.g. `x0, x1 = x`)
@@ -27237,11 +29373,55 @@ def _emit_local_function(
         ):
             polyroots_targets.add(_st.targets[0].id)
 
+    def _strong_scalar_local_kind_map():
+        fn_args_set = set(args)
+        tuple_out_names_set = set(local_tuple_return_out_names.get(fn.name, []))
+        skip_names = fn_args_set | tuple_out_names_set | {ret_name}
+        local_names = (
+            set(tr.reals) | set(tr.complexes) | set(tr.ints) | set(tr.logs) | set(tr.chars) |
+            set(tr.alloc_reals) | set(tr.alloc_complexes) | set(tr.alloc_ints) |
+            set(tr.alloc_logs) | set(tr.alloc_chars)
+        ) - skip_names
+        out = {}
+        for _nm in sorted(local_names):
+            specs = []
+            bad = False
+            for _st in ast.walk(fn):
+                if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _nm):
+                    continue
+                try:
+                    _rr = int(tr._rank_expr(_st.value))
+                except Exception:
+                    _rr = 0
+                try:
+                    _kk = tr._expr_kind(_st.value)
+                except Exception:
+                    _kk = None
+                if _kk not in {"int", "real", "logical", "char", "complex"}:
+                    bad = True
+                    break
+                specs.append((_kk, _rr))
+            if bad or (not specs):
+                continue
+            if any(int(_rr) != 0 for _, _rr in specs):
+                continue
+            kind_set = {_kk for _kk, _rr in specs}
+            if len(kind_set) == 1:
+                out[_nm] = next(iter(kind_set))
+        return out
+    _apply_strong_scalar_local_specs()
+    strong_scalar_local_kinds = _strong_scalar_local_kind_map()
     alloc_logs_set = set(tr.alloc_logs)
     alloc_ints_set = set(tr.alloc_ints - {ret_name})
     alloc_reals_set = set(tr.alloc_reals - {ret_name})
     alloc_complexes_set = set(tr.alloc_complexes - {ret_name}) | polyroots_targets
     alloc_chars_set = set(tr.alloc_chars - {ret_name})
+    for _nm in strong_scalar_local_kinds:
+        alloc_logs_set.discard(_nm)
+        alloc_ints_set.discard(_nm)
+        alloc_reals_set.discard(_nm)
+        alloc_complexes_set.discard(_nm)
+        alloc_chars_set.discard(_nm)
     alloc_logs_set -= set(args)
     alloc_ints_set -= set(args)
     alloc_reals_set -= set(args)
@@ -27254,11 +29434,12 @@ def _emit_local_function(
         alloc_complexes_set -= set(out_names)
         alloc_chars_set -= set(out_names)
     remove_names = set(args) | ({ret_name} if not tuple_return else set(out_names)) | module_global_names
-    complexes = sorted((tr.complexes - remove_names - polyroots_targets) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
-    ints = sorted(({*tr.ints, *set(local_list_counts.values())} - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
-    reals = sorted((tr.reals - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
-    logs = sorted((tr.logs - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
-    chars = sorted((getattr(tr, "chars", set()) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    rng_scalar_names = set(getattr(tr, "rng_vars", set())) - remove_names
+    complexes = sorted(((tr.complexes | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "complex"}) - remove_names - polyroots_targets) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
+    ints = sorted((((({*tr.ints, *set(local_list_counts.values())} | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "int"}) | rng_scalar_names) - remove_names)) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    reals = sorted((((tr.reals | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "real"}) - rng_scalar_names) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    logs = sorted(((tr.logs | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "logical"}) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
+    chars = sorted((((getattr(tr, "chars", set())) | {nm for nm, kk in strong_scalar_local_kinds.items() if kk == "char"}) - remove_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - set(complexes))
     alloc_logs = sorted([nm for nm in alloc_logs_set if nm not in module_global_names])
     alloc_ints = sorted([nm for nm in alloc_ints_set if nm not in module_global_names])
     alloc_complexes = sorted([nm for nm in alloc_complexes_set if nm not in module_global_names])
@@ -27486,11 +29667,16 @@ def _emit_local_function(
                     and n.func.value.id in {"np", "numpy"}
                     and n.func.attr == "sqrt"
                     and len(n.args) >= 1
-                    and _name_used(n.args[0], nm)
                 ):
-                    # sqrt on potentially complex expressions should keep a
-                    # complex-typed argument available.
-                    return True
+                    if not _name_used(n.args[0], nm):
+                        continue
+                    if any(isinstance(t, ast.Constant) and isinstance(t.value, complex) for t in ast.walk(n.args[0])):
+                        return True
+                    try:
+                        if tr._expr_kind(n.args[0]) == "complex":
+                            return True
+                    except Exception:
+                        pass
         return False
 
     def _arg_array_rank(nm):
@@ -27946,6 +30132,10 @@ def _emit_local_function(
             _dk = tr._expr_kind(defaults_map[arg])
             if _dk in {"char", "logical", "complex"}:
                 hint_kind = _dk
+        if arg in getattr(tr, "rng_vars", set()):
+            hint_kind = "int"
+        if _arg_used_as_rng_receiver(arg):
+            hint_kind = "int"
         if _self_norm_kind is None and _arg_used_as_index_or_range(arg):
             hint_kind = "int"
             if (
@@ -27973,15 +30163,15 @@ def _emit_local_function(
             arr_rank = 1
         if (hint_kind == "char" or arg in tr.char_scalar_names) and _char_scalar_arg_pattern_local(arg):
             arr_rank = 0
-        if _self_norm_rank != 1 and arg in tr.alloc_real_rank:
+        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_real_rank:
             arr_rank = max(arr_rank, int(tr.alloc_real_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and arg in tr.alloc_int_rank:
+        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_int_rank:
             arr_rank = max(arr_rank, int(tr.alloc_int_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and arg in tr.alloc_log_rank:
+        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_log_rank:
             arr_rank = max(arr_rank, int(tr.alloc_log_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and arg in tr.alloc_complex_rank:
+        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_complex_rank:
             arr_rank = max(arr_rank, int(tr.alloc_complex_rank.get(arg, 0)))
-        if _self_norm_rank != 1 and arg in tr.alloc_char_rank:
+        if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and arg in tr.alloc_char_rank:
             arr_rank = max(arr_rank, int(tr.alloc_char_rank.get(arg, 0)))
         if _self_norm_rank != 1 and (force_arg_ranks is None or arg not in force_arg_ranks) and local_func_arg_ranks is not None and fn.name in local_func_arg_ranks:
             if idx >= 0 and idx < len(local_func_arg_ranks[fn.name]):
@@ -28039,7 +30229,7 @@ def _emit_local_function(
                 else:
                     arg_decl = f"integer, intent({intent_txt}) :: {arg_emit}({dims})"
             else:
-                arg_decl = f"integer, intent({intent_txt}) :: {arg_emit}(:)"
+                arg_decl = f"integer, intent({intent_txt}) :: {arg_emit}"
             decl_kind = "integer"
         elif arg in tr.alloc_logs:
             if arr_rank > 0:
@@ -28049,7 +30239,7 @@ def _emit_local_function(
                 else:
                     arg_decl = f"logical, intent({intent_txt}) :: {arg_emit}({dims})"
             else:
-                arg_decl = f"logical, intent({intent_txt}) :: {arg_emit}(:)"
+                arg_decl = f"logical, intent({intent_txt}) :: {arg_emit}"
             decl_kind = "logical"
         elif arg in tr.alloc_complexes:
             if arr_rank > 0:
@@ -28059,7 +30249,7 @@ def _emit_local_function(
                 else:
                     arg_decl = f"complex(kind=dp), intent({intent_txt}) :: {arg_emit}({dims})"
             else:
-                arg_decl = f"complex(kind=dp), intent({intent_txt}) :: {arg_emit}(:)"
+                arg_decl = f"complex(kind=dp), intent({intent_txt}) :: {arg_emit}"
             decl_kind = "complex(kind=dp)"
         elif arg in tr.alloc_chars:
             if arg in tr.char_scalar_names and arr_rank <= 0:
@@ -28071,7 +30261,7 @@ def _emit_local_function(
                 else:
                     arg_decl = f"character(len=*), intent({intent_txt}) :: {arg_emit}({dims})"
             else:
-                arg_decl = f"character(len=*), intent({intent_txt}) :: {arg_emit}(:)"
+                arg_decl = f"character(len=*), intent({intent_txt}) :: {arg_emit}"
             decl_kind = "character(len=*)"
         elif arr_rank > 0:
             if hint_kind == "char":
@@ -28100,12 +30290,15 @@ def _emit_local_function(
                 arg_decl = f"{arg_kind}, intent({intent_txt}) :: {arg_emit}({dims})"
             decl_kind = arg_kind
         elif arg in tr.alloc_reals:
-            rr = max(1, tr.alloc_real_rank.get(arg, 1))
-            dims = ",".join(":" for _ in range(rr))
-            if is_count_mapped_output_array or is_alloc_rebind_output_array:
-                arg_decl = f"real(kind=dp), allocatable, intent({intent_txt}) :: {arg_emit}({dims})"
+            if arr_rank <= 0:
+                arg_decl = f"real(kind=dp), intent({intent_txt}) :: {arg_emit}"
             else:
-                arg_decl = f"real(kind=dp), intent({intent_txt}) :: {arg_emit}({dims})"
+                rr = max(1, tr.alloc_real_rank.get(arg, 1), int(arr_rank))
+                dims = ",".join(":" for _ in range(rr))
+                if is_count_mapped_output_array or is_alloc_rebind_output_array:
+                    arg_decl = f"real(kind=dp), allocatable, intent({intent_txt}) :: {arg_emit}({dims})"
+                else:
+                    arg_decl = f"real(kind=dp), intent({intent_txt}) :: {arg_emit}({dims})"
             decl_kind = "real(kind=dp)"
         else:
             if hint_kind == "char":
@@ -28284,9 +30477,59 @@ def _emit_local_function(
                     tuple_ret_src_names.append(_e.id)
                 else:
                     tuple_ret_src_names.append(None)
+        def _sync_tuple_out_state(_nm, _kind_hint, _rank_hint):
+            _rr = max(0, int(_rank_hint))
+            tr.alloc_reals.discard(_nm)
+            tr.alloc_ints.discard(_nm)
+            tr.alloc_logs.discard(_nm)
+            tr.alloc_complexes.discard(_nm)
+            tr.alloc_chars.discard(_nm)
+            tr.alloc_real_rank.pop(_nm, None)
+            tr.alloc_int_rank.pop(_nm, None)
+            tr.alloc_log_rank.pop(_nm, None)
+            tr.alloc_complex_rank.pop(_nm, None)
+            tr.alloc_char_rank.pop(_nm, None)
+            tr.reals.discard(_nm)
+            tr.ints.discard(_nm)
+            tr.logs.discard(_nm)
+            tr.complexes.discard(_nm)
+            tr.chars.discard(_nm)
+            if _kind_hint == "alloc_real":
+                _kind_hint = "real"
+            elif _kind_hint == "alloc_int":
+                _kind_hint = "int"
+            elif _kind_hint == "alloc_log":
+                _kind_hint = "logical"
+            elif _kind_hint == "alloc_complex":
+                _kind_hint = "complex"
+            elif _kind_hint == "alloc_char":
+                _kind_hint = "char"
+            if _rr > 0:
+                if _kind_hint == "real":
+                    tr._mark_alloc_real(_nm, rank=_rr)
+                elif _kind_hint == "int":
+                    tr._mark_alloc_int(_nm, rank=_rr)
+                elif _kind_hint == "logical":
+                    tr._mark_alloc_log(_nm, rank=_rr)
+                elif _kind_hint == "complex":
+                    tr._mark_alloc_complex(_nm, rank=_rr)
+                elif _kind_hint == "char":
+                    tr._mark_alloc_char(_nm, rank=_rr)
+            else:
+                if _kind_hint == "real":
+                    tr._mark_real(_nm)
+                elif _kind_hint == "int":
+                    tr._mark_int(_nm)
+                elif _kind_hint == "logical":
+                    tr._mark_log(_nm)
+                elif _kind_hint == "complex":
+                    tr._mark_complex(_nm)
+                elif _kind_hint == "char":
+                    tr._mark_char(_nm)
         for idx_out, nm in enumerate(out_names):
             kind_hint = None
             rank_hint = 0
+            forced_tuple_rank = None
             if tuple_return_out_kinds is not None:
                 kh = tuple_return_out_kinds.get(fn.name, [])
                 if idx_out < len(kh):
@@ -28295,19 +30538,31 @@ def _emit_local_function(
                 rh = tuple_return_out_ranks.get(fn.name, [])
                 if idx_out < len(rh):
                     rank_hint = max(0, int(rh[idx_out]))
+            if (
+                force_arg_ranks is not None
+                and local_overload_dispatch is not None
+                and fn.name in local_overload_dispatch
+            ):
+                _dmap = local_overload_dispatch.get(fn.name, {})
+                _iv = int(_dmap.get("arg_index", -1))
+                _argn = args[_iv] if 0 <= _iv < len(args) else None
+                if _argn is not None and _argn in force_arg_ranks:
+                    forced_tuple_rank = int(force_arg_ranks.get(_argn, 0))
+                    rank_hint = forced_tuple_rank
             # Keep tuple-out rank consistent with current inferred symbol rank
             # when the tuple-rank map is stale/underestimated.
-            rank_hint = max(
-                rank_hint,
-                int(tr.alloc_real_rank.get(nm, 0)),
-                int(tr.alloc_int_rank.get(nm, 0)),
-                int(tr.alloc_log_rank.get(nm, 0)),
-                int(tr.alloc_complex_rank.get(nm, 0)),
-                int(tr.alloc_char_rank.get(nm, 0)),
-            )
+            if forced_tuple_rank is None:
+                rank_hint = max(
+                    rank_hint,
+                    int(tr.alloc_real_rank.get(nm, 0)),
+                    int(tr.alloc_int_rank.get(nm, 0)),
+                    int(tr.alloc_log_rank.get(nm, 0)),
+                    int(tr.alloc_complex_rank.get(nm, 0)),
+                    int(tr.alloc_char_rank.get(nm, 0)),
+                )
             # If tuple-return inference underestimates rank for a renamed output
             # that forwards a local array value, recover a better rank here.
-            if idx_out < len(tuple_ret_src_names):
+            if forced_tuple_rank is None and idx_out < len(tuple_ret_src_names):
                 src_nm = tuple_ret_src_names[idx_out]
                 if isinstance(src_nm, str):
                     src_rank = _arg_array_rank(src_nm)
@@ -28332,66 +30587,124 @@ def _emit_local_function(
                     elif kind_hint in {"real", "alloc_real"} or src_nm in tr.alloc_reals or src_nm in tr.reals:
                         kind_hint = "alloc_real" if src_rank > 0 else "real"
             if kind_hint == "alloc_real":
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_real_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "real", 0)
+                    o.w(f"real(kind=dp), intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_real_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "real", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif kind_hint == "alloc_int":
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_int_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"integer, allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "int", 0)
+                    o.w(f"integer, intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_int_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "int", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"integer, allocatable, intent(out) :: {nm}({dims})")
             elif kind_hint == "alloc_log":
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_log_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "logical", 0)
+                    o.w(f"logical, intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_log_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "logical", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
             elif kind_hint == "alloc_complex":
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_complex_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"complex(kind=dp), allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "complex", 0)
+                    o.w(f"complex(kind=dp), intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_complex_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "complex", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"complex(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif kind_hint == "alloc_char":
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_char_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"character(len=:), allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "char", 0)
+                    o.w(f"character(len=:), allocatable, intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_char_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "char", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"character(len=:), allocatable, intent(out) :: {nm}({dims})")
             elif kind_hint == "real":
+                _sync_tuple_out_state(nm, "complex" if nm in callback_complex_targets else "real", 0)
                 if nm in callback_complex_targets:
                     o.w(f"complex(kind=dp), intent(out) :: {nm}")
                 else:
                     o.w(f"real(kind=dp), intent(out) :: {nm}")
             elif kind_hint == "int":
+                _sync_tuple_out_state(nm, "int", 0)
                 o.w(f"integer, intent(out) :: {nm}")
             elif kind_hint == "complex":
+                _sync_tuple_out_state(nm, "complex", 0)
                 o.w(f"complex(kind=dp), intent(out) :: {nm}")
             elif kind_hint == "logical":
+                _sync_tuple_out_state(nm, "logical", 0)
                 o.w(f"logical, intent(out) :: {nm}")
             elif kind_hint == "char":
+                _sync_tuple_out_state(nm, "char", 0)
                 o.w(f"character(len=:), allocatable, intent(out) :: {nm}")
             elif nm in tr.alloc_reals:
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_real_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "real", 0)
+                    o.w(f"real(kind=dp), intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_real_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "real", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"real(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_ints:
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_int_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"integer, allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "int", 0)
+                    o.w(f"integer, intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_int_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "int", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"integer, allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_logs:
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_log_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "logical", 0)
+                    o.w(f"logical, intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_log_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "logical", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"logical, allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_complexes:
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_complex_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"complex(kind=dp), allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "complex", 0)
+                    o.w(f"complex(kind=dp), intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_complex_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "complex", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"complex(kind=dp), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.alloc_chars:
-                rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_char_rank.get(nm, 1))
-                dims = ",".join(":" for _ in range(rr))
-                o.w(f"character(len=:), allocatable, intent(out) :: {nm}({dims})")
+                if rank_hint <= 0:
+                    _sync_tuple_out_state(nm, "char", 0)
+                    o.w(f"character(len=:), allocatable, intent(out) :: {nm}")
+                else:
+                    rr = max(1, rank_hint if rank_hint > 0 else tr.alloc_char_rank.get(nm, 1))
+                    _sync_tuple_out_state(nm, "char", rr)
+                    dims = ",".join(":" for _ in range(rr))
+                    o.w(f"character(len=:), allocatable, intent(out) :: {nm}({dims})")
             elif nm in tr.reals:
+                _sync_tuple_out_state(nm, "complex" if nm in callback_complex_targets else "real", 0)
                 if nm in callback_complex_targets:
                     o.w(f"complex(kind=dp), intent(out) :: {nm}")
                 else:
                     o.w(f"real(kind=dp), intent(out) :: {nm}")
             elif nm in tr.complexes:
+                _sync_tuple_out_state(nm, "complex", 0)
                 o.w(f"complex(kind=dp), intent(out) :: {nm}")
             else:
+                _sync_tuple_out_state(nm, "int", 0)
                 o.w(f"integer, intent(out) :: {nm}")
     elif not void_return:
         ret_scalar_kind = None
@@ -28602,6 +30915,18 @@ def _emit_local_function(
                 ret_scalar_kind = "real"
             if ret_scalar_kind is None and (ret_name in tr.complexes or (ret_name_src is not None and ret_name_src in tr.complexes)):
                 ret_scalar_kind = "complex"
+            if ret_scalar_kind is None and returns:
+                for _r in returns:
+                    _rv = _r.value
+                    if (
+                        isinstance(_rv, ast.Call)
+                        and isinstance(_rv.func, ast.Name)
+                        and _rv.func.id in callback_specs
+                    ):
+                        _rk = str(callback_specs[_rv.func.id].get("ret_kind", "real"))
+                        if _rk in {"real", "complex", "logical", "char", "int"}:
+                            ret_scalar_kind = _rk
+                            break
             if ret_scalar_kind is None:
                 ret_scalar_kind = "int"
             if ret_scalar_kind == "real":
@@ -29844,6 +32169,14 @@ def generate_flat(
                     and _contains_name_ref(n.args[0])
                 ):
                     return _ret("char")
+                if (
+                    isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == nm
+                    and n.func.attr in {"random", "uniform", "standard_normal", "normal", "integers", "randint", "choice"}
+                ):
+                    return _ret("int")
 
         def _name_prefers_int_local(_nm):
             _nm_l = str(_nm).lower()
@@ -30151,10 +32484,12 @@ def generate_flat(
                 return newk
             if cur == newk:
                 return cur
-            if "real" in {cur, newk} and "logical" not in {cur, newk}:
-                return "real"
             if "complex" in {cur, newk}:
                 return "complex"
+            if "int" in {cur, newk} and "logical" not in {cur, newk} and "char" not in {cur, newk}:
+                return "int"
+            if "real" in {cur, newk} and "logical" not in {cur, newk}:
+                return "real"
             return cur
         def _name_possible_specs(_tr, _nm):
             specs = set()
@@ -30169,7 +32504,53 @@ def generate_flat(
                     if _en == _nm and _ek is not None:
                         specs.add((_ek, max(0, int(_er))))
             return specs
-        def _record_call_hints(scan_node, tr_ctx):
+        def _name_direct_assign_spec(fn_node, name_nm, tr_ctx):
+            _seen = set()
+            def _infer(_name):
+                if _name in _seen:
+                    return (None, 0)
+                _seen.add(_name)
+                best_kind = None
+                best_rank = 0
+                saw = False
+                for _st in ast.walk(fn_node):
+                    if not (isinstance(_st, ast.Assign) and len(_st.targets) == 1 and isinstance(_st.targets[0], ast.Name) and _st.targets[0].id == _name):
+                        continue
+                    saw = True
+                    try:
+                        _rr = int(tr_ctx._rank_expr(_st.value))
+                    except Exception:
+                        _rr = 0
+                    try:
+                        _kk = tr_ctx._expr_kind(_st.value)
+                    except Exception:
+                        _kk = None
+                    if _kk is None and isinstance(_st.value, ast.Name):
+                        _kk, _rr2 = _infer(_st.value.id)
+                        _rr = max(_rr, int(_rr2))
+                    elif _kk is None and isinstance(_st.value, ast.Subscript) and isinstance(_st.value.value, ast.Name):
+                        _bk, _br = _infer(_st.value.value.id)
+                        if _bk in {"int", "real", "logical", "char", "complex"}:
+                            _kk = _bk
+                            _rr = int(tr_ctx._rank_expr(_st.value))
+                    if _kk in {"int", "real", "logical", "char", "complex"}:
+                        if _rr > best_rank:
+                            best_rank = _rr
+                            best_kind = _kk
+                        elif best_kind is None:
+                            best_kind = _kk
+                        elif _rr == best_rank and _kk != best_kind:
+                            if "complex" in {best_kind, _kk}:
+                                best_kind = "complex"
+                            elif "real" in {best_kind, _kk} and "logical" not in {best_kind, _kk}:
+                                best_kind = "real"
+                            elif "int" in {best_kind, _kk} and "logical" not in {best_kind, _kk} and "char" not in {best_kind, _kk}:
+                                best_kind = "int"
+                if not saw:
+                    return (None, 0)
+                return (best_kind, best_rank)
+            return _infer(name_nm)
+        def _record_call_hints(scan_node, tr_ctx, fn_node=None):
             for n in ast.walk(scan_node):
                 if not (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)):
                     continue
@@ -30207,6 +32588,10 @@ def generate_flat(
                     if isinstance(a, ast.Name):
                         anm = tr_ctx._aliased_name(tr_ctx._resolve_list_alias(a.id))
                         poss = _name_possible_specs(tr_ctx, anm)
+                        if fn_node is not None:
+                            _dk, _dr = _name_direct_assign_spec(fn_node, a.id, tr_ctx)
+                            if _dk in {"int", "real", "logical", "char", "complex"}:
+                                poss.add((_dk, int(_dr)))
                         if poss:
                             for pk, pr in poss:
                                 krp[i].add((pk, pr))
@@ -30239,6 +32624,10 @@ def generate_flat(
                         if isinstance(kw.value, ast.Name):
                             anm = tr_ctx._aliased_name(tr_ctx._resolve_list_alias(kw.value.id))
                             poss = _name_possible_specs(tr_ctx, anm)
+                            if fn_node is not None:
+                                _dk, _dr = _name_direct_assign_spec(fn_node, kw.value.id, tr_ctx)
+                                if _dk in {"int", "real", "logical", "char", "complex"}:
+                                    poss.add((_dk, int(_dr)))
                             if poss:
                                 for pk, pr in poss:
                                     krp[i].add((pk, pr))
@@ -30251,7 +32640,7 @@ def generate_flat(
                                         rk[i] = _promote_kind_hint(rk[i], pk)
 
         for st in _top_level_scan_nodes:
-            _record_call_hints(st, tr_seed)
+            _record_call_hints(st, tr_seed, None)
         for _fn_scan in (local_funcs or []):
             if not isinstance(_fn_scan, ast.FunctionDef):
                 continue
@@ -30266,7 +32655,7 @@ def generate_flat(
                 local_return_specs=_prov_scalar_specs,
             )
             tr_local_scan.prescan(_fn_scan.body)
-            _record_call_hints(_fn_scan, tr_local_scan)
+            _record_call_hints(_fn_scan, tr_local_scan, _fn_scan)
 
     local_return_specs, local_return_ranks, tuple_return_out_kinds, tuple_return_out_ranks = _local_return_maps(
         local_funcs,
@@ -30333,6 +32722,8 @@ def generate_flat(
             elif hk == "int" and bk != "int":
                 merged_kinds.append(bk)
             elif hk == "real" and bk in {"int", "logical", "char", "complex"}:
+                merged_kinds.append(bk)
+            elif hk == "complex" and bk in {"int", "logical", "char", "real"}:
                 merged_kinds.append(bk)
             else:
                 merged_kinds.append(hk)
@@ -30608,7 +32999,7 @@ def generate_flat(
                         if j >= len(callee_kinds):
                             break
                         want = callee_kinds[j]
-                        if want not in {"real", "complex", "logical", "char"}:
+                        if want not in {"int", "real", "complex", "logical", "char"}:
                             continue
                         if isinstance(a, ast.Name) and a.id in caller_idx:
                             i_src = caller_idx[a.id]
@@ -30627,7 +33018,7 @@ def generate_flat(
                         if j >= len(callee_kinds):
                             continue
                         want = callee_kinds[j]
-                        if want not in {"real", "complex", "logical", "char"}:
+                        if want not in {"int", "real", "complex", "logical", "char"}:
                             continue
                         if isinstance(kw.value, ast.Name) and kw.value.id in caller_idx:
                             i_src = caller_idx[kw.value.id]
@@ -30704,23 +33095,28 @@ def generate_flat(
 
     tuple_return_funcs = set()
     local_tuple_return_out_names = {}
+    local_tuple_return_src_names = {}
     for fn in (local_funcs or []):
         for st in fn.body:
             if isinstance(st, ast.Return) and isinstance(st.value, ast.Tuple):
                 tuple_return_funcs.add(fn.name)
                 fn_args = {a.arg for a in (list(fn.args.args) + list(fn.args.kwonlyargs))}
                 out_names = []
+                src_names = []
                 for j, e in enumerate(st.value.elts):
                     if isinstance(e, ast.Name):
                         nm = e.id
+                        src_names.append(e.id)
                         if nm in fn_args:
                             nm = f"{fn.name}_out_{j + 1}"
                         if nm in {"dp", "eye"}:
                             nm = f"{nm}_v"
                         out_names.append(nm)
                     else:
+                        src_names.append(None)
                         out_names.append(f"{fn.name}_out_{j + 1}")
                 local_tuple_return_out_names[fn.name] = out_names
+                local_tuple_return_src_names[fn.name] = src_names
                 break
     local_void_funcs = set()
     def _has_value_return_in_body(stmts):
@@ -30746,6 +33142,45 @@ def generate_flat(
         if (not has_value_return) and (fn.name not in tuple_return_funcs) and (fn.name not in dict_return_specs):
             local_void_funcs.add(fn.name)
 
+    # Refine tuple-return metadata from the function body itself. Some callers
+    # invoke scalar tuple-return locals with rank-1 actuals and consume them
+    # elementwise. Preserve the source-level scalar tuple outputs here so later
+    # lowering can choose caller-side vectorization instead of fabricating
+    # incorrect rank-1 specifics.
+    for fn in (local_funcs or []):
+        if fn.name not in tuple_return_funcs:
+            continue
+        src_names = list(local_tuple_return_src_names.get(fn.name, []))
+        if not src_names or any((not isinstance(_nm, str)) for _nm in src_names):
+            continue
+        _tr_fn = translator(
+            emit(),
+            params=params,
+            context="flat",
+            list_counts=list_counts,
+            tuple_return_funcs=set(_prov_tuple_out.keys()),
+            tuple_return_out_kinds=_prov_tuple_out,
+            tuple_return_out_ranks=_prov_tuple_out_ranks,
+            local_return_specs=_prov_scalar_specs,
+        )
+        _tr_fn.prescan(fn.body)
+        base_kinds = list(tuple_return_out_kinds.get(fn.name, []))
+        base_ranks = list(tuple_return_out_ranks.get(fn.name, []))
+        if len(base_kinds) < len(src_names):
+            base_kinds.extend([None] * (len(src_names) - len(base_kinds)))
+        if len(base_ranks) < len(src_names):
+            base_ranks.extend([0] * (len(src_names) - len(base_ranks)))
+        refined_any = False
+        for _i, _nm in enumerate(src_names):
+            _dk, _dr = _name_direct_assign_spec(fn, _nm, _tr_fn)
+            if _dk in {"int", "real", "logical", "char", "complex"} and int(_dr) == 0:
+                base_kinds[_i] = _dk
+                base_ranks[_i] = 0
+                refined_any = True
+        if refined_any:
+            tuple_return_out_kinds[fn.name] = list(base_kinds)
+            tuple_return_out_ranks[fn.name] = list(base_ranks)
+
     def _is_print_only_void(fn):
         for st in fn.body:
             if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and isinstance(st.value.value, str):
@@ -30761,6 +33196,74 @@ def generate_flat(
 
     local_overload_specs = {}
     local_overload_dispatch = {}
+    def _observed_local_call_specs(fn_name):
+        arg_names = list(local_func_arg_names.get(fn_name, []))
+        pair_lists = [set() for _ in arg_names]
+        triad_lists = [set() for _ in arg_names]
+        if not arg_names:
+            return pair_lists, triad_lists
+        def _record(scan_node, tr_ctx, owner_fn=None):
+            name_to_idx = {nm: i for i, nm in enumerate(arg_names)}
+            for _n in ast.walk(scan_node):
+                if not (isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name) and _n.func.id == fn_name):
+                    continue
+                for _i, _a in enumerate(_n.args):
+                    if _i >= len(arg_names):
+                        break
+                    try:
+                        _ak = tr_ctx._expr_kind(_a)
+                    except Exception:
+                        _ak = None
+                    try:
+                        _ar = int(tr_ctx._rank_expr(_a))
+                    except Exception:
+                        _ar = 0
+                    if owner_fn is not None and isinstance(_a, ast.Name):
+                        _dk, _dr = _name_direct_assign_spec(owner_fn, _a.id, tr_ctx)
+                        if _dk in {"int", "real", "logical", "char", "complex"}:
+                            pair_lists[_i].add((_dk, int(_dr)))
+                            triad_lists[_i].add((_dk, int(_dr), bool(tr_ctx._is_python_list_expr(_a))))
+                    if _ak in {"int", "real", "logical", "char", "complex"}:
+                        pair_lists[_i].add((_ak, _ar))
+                        triad_lists[_i].add((_ak, _ar, bool(tr_ctx._is_python_list_expr(_a))))
+                for _kw in getattr(_n, "keywords", []):
+                    if _kw.arg is None or _kw.arg not in name_to_idx:
+                        continue
+                    _i = name_to_idx[_kw.arg]
+                    try:
+                        _ak = tr_ctx._expr_kind(_kw.value)
+                    except Exception:
+                        _ak = None
+                    try:
+                        _ar = int(tr_ctx._rank_expr(_kw.value))
+                    except Exception:
+                        _ar = 0
+                    if owner_fn is not None and isinstance(_kw.value, ast.Name):
+                        _dk, _dr = _name_direct_assign_spec(owner_fn, _kw.value.id, tr_ctx)
+                        if _dk in {"int", "real", "logical", "char", "complex"}:
+                            pair_lists[_i].add((_dk, int(_dr)))
+                            triad_lists[_i].add((_dk, int(_dr), bool(tr_ctx._is_python_list_expr(_kw.value))))
+                    if _ak in {"int", "real", "logical", "char", "complex"}:
+                        pair_lists[_i].add((_ak, _ar))
+                        triad_lists[_i].add((_ak, _ar, bool(tr_ctx._is_python_list_expr(_kw.value))))
+        for _st in _top_level_scan_nodes:
+            _record(_st, tr_seed, None)
+        for _fn_scan in (local_funcs or []):
+            if not isinstance(_fn_scan, ast.FunctionDef):
+                continue
+            _tr_local_scan = translator(
+                emit(),
+                params=params,
+                context="flat",
+                list_counts=list_counts,
+                tuple_return_funcs=set(_prov_tuple_out.keys()),
+                tuple_return_out_kinds=_prov_tuple_out,
+                tuple_return_out_ranks=_prov_tuple_out_ranks,
+                local_return_specs=_prov_scalar_specs,
+            )
+            _tr_local_scan.prescan(_fn_scan.body)
+            _record(_fn_scan, _tr_local_scan, _fn_scan)
+        return pair_lists, triad_lists
     for fn in (local_funcs or []):
         if fn.name not in local_void_funcs:
             continue
@@ -30769,10 +33272,12 @@ def generate_flat(
         arg_names = [a.arg for a in fn.args.args]
         if not arg_names:
             continue
+        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
         pair_lists = []
         for i in range(len(arg_names)):
             prs = set(call_kind_rank_pairs.get(fn.name, [set() for _ in arg_names])[i])
-            prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char"} and r in {0, 1}}
+            prs |= set(obs_pair_lists[i])
+            prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
             pair_lists.append(prs)
         if any((not prs) for prs in pair_lists):
             continue
@@ -30928,8 +33433,10 @@ def generate_flat(
         if _fn_requires_rank1_arg(fn, arg0):
             req_rank = max(req_rank, 1)
         pairs = set(call_kind_rank_pairs.get(fn.name, [set()])[0])
-        triads = set(call_kind_rank_islist.get(fn.name, [set()])[0])
-        pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char"} and r in {0, 1}}
+        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
+        triads = set(call_kind_rank_islist.get(fn.name, [set()])[0]) | set(obs_triad_lists[0])
+        pairs = set(pairs) | set(obs_pair_lists[0])
+        pairs = {(k, r) for (k, r) in pairs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
         if _flat_arg_name_prefers_int(arg0) and ("int", 0) in pairs:
             pairs = {(k, r) for (k, r) in pairs if not (k == "real" and r == 0)}
         if req_rank > 0:
@@ -30965,6 +33472,143 @@ def generate_flat(
         if dmap:
             local_overload_dispatch[fn.name] = dmap
         local_func_arg_kinds[fn.name][0] = None
+    # Generic overloads for tuple-return and multi-argument local procedures
+    # when exactly one dummy varies by observed kind/rank across call sites.
+    for fn in (local_funcs or []):
+        if fn.name in local_overload_specs:
+            continue
+        if fn.name in dict_return_specs:
+            continue
+        if fn.name in local_void_funcs:
+            continue
+        arg_names = [a.arg for a in fn.args.args]
+        if not arg_names:
+            continue
+        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
+        pair_lists = []
+        triad_lists = []
+        for i, arg_nm in enumerate(arg_names):
+            prs = set(call_kind_rank_pairs.get(fn.name, [set() for _ in arg_names])[i])
+            trs = set(call_kind_rank_islist.get(fn.name, [set() for _ in arg_names])[i])
+            prs |= set(obs_pair_lists[i])
+            trs |= set(obs_triad_lists[i])
+            prs = {(k, r) for (k, r) in prs if k in {"int", "real", "logical", "char", "complex"} and r in {0, 1}}
+            req_rank = 0
+            if fn.name in base_func_arg_ranks and i < len(base_func_arg_ranks[fn.name]):
+                req_rank = int(base_func_arg_ranks[fn.name][i])
+            if _fn_requires_rank1_arg(fn, arg_nm):
+                req_rank = max(req_rank, 1)
+            if req_rank > 0:
+                prs = {(k, r) for (k, r) in prs if int(r) == req_rank}
+                trs = {(k, r, is_list) for (k, r, is_list) in trs if int(r) == req_rank}
+            pair_lists.append(prs)
+            triad_lists.append(trs)
+        if any((not prs) for prs in pair_lists):
+            continue
+        varying = [i for i, prs in enumerate(pair_lists) if len(prs) > 1]
+        if len(varying) != 1:
+            continue
+        iv = varying[0]
+        fixed = {}
+        ok = True
+        for j, prs in enumerate(pair_lists):
+            if j == iv:
+                continue
+            if len(prs) != 1:
+                ok = False
+                break
+            fixed[j] = next(iter(prs))
+        if not ok:
+            continue
+        specs = []
+        dmap = {"arg_index": iv}
+        seen = set()
+        triads_v = triad_lists[iv]
+        base_tuple_ranks = list(tuple_return_out_ranks.get(fn.name, [])) if fn.name in tuple_return_funcs else []
+        elementwise_tuple = fn.name in tuple_return_funcs and ((not base_tuple_ranks) or all(int(_r) == 0 for _r in base_tuple_ranks))
+        pair_iter = sorted(pair_lists[iv])
+        if elementwise_tuple:
+            pair_iter = [(k, r) for (k, r) in pair_iter if int(r) == 0]
+        for k, r in pair_iter:
+            key = (k, r)
+            if key in seen:
+                continue
+            seen.add(key)
+            forced_kinds = {}
+            forced_ranks = {}
+            for j, anm in enumerate(arg_names):
+                if j == iv:
+                    kk, rr = k, r
+                else:
+                    kk, rr = fixed[j]
+                forced_kinds[anm] = kk
+                forced_ranks[anm] = rr
+            suf = "s" if r == 0 else f"r{r}"
+            if k == "int" and r == 1:
+                saw_list = ("int", 1, True) in triads_v
+                saw_arr = ("int", 1, False) in triads_v
+                if saw_list and saw_arr:
+                    pname_arr = f"{fn.name}_{arg_names[iv]}_{k}_{suf}_arr"
+                    pname_list = f"{fn.name}_{arg_names[iv]}_{k}_{suf}_list"
+                    specs.append((pname_arr, forced_kinds, forced_ranks, set(), True))
+                    specs.append((pname_list, forced_kinds, forced_ranks, {arg_names[iv]}, False))
+                    dmap["array"] = pname_arr
+                    dmap["list"] = pname_list
+                    continue
+            pname = f"{fn.name}_{arg_names[iv]}_{k}_{suf}"
+            list_args = {arg_names[iv]} if (k == "int" and r == 1 and ("int", 1, True) in triads_v and ("int", 1, False) not in triads_v) else set()
+            specs.append((pname, forced_kinds, forced_ranks, list_args, True))
+        if len(specs) <= 1:
+            continue
+        local_overload_specs[fn.name] = specs
+        if dmap:
+            local_overload_dispatch[fn.name] = dmap
+    # Fallback for tuple-return locals whose one varying argument is observed
+    # at both scalar and vector rank across call sites.
+    for fn in (local_funcs or []):
+        if fn.name in local_overload_specs:
+            continue
+        if fn.name not in tuple_return_funcs:
+            continue
+        arg_names = list(local_func_arg_names.get(fn.name, []))
+        if not arg_names:
+            continue
+        obs_pair_lists, obs_triad_lists = _observed_local_call_specs(fn.name)
+        varying = []
+        for i, prs in enumerate(obs_pair_lists):
+            ranks_seen = {int(r) for (_k, r) in prs}
+            if 0 in ranks_seen and 1 in ranks_seen:
+                varying.append(i)
+        if len(varying) != 1:
+            continue
+        iv = varying[0]
+        specs = []
+        dmap = {"arg_index": iv}
+        base_tuple_ranks = list(tuple_return_out_ranks.get(fn.name, []))
+        elementwise_tuple = (not base_tuple_ranks) or all(int(_r) == 0 for _r in base_tuple_ranks)
+        want_r_values = (0,) if elementwise_tuple else (0, 1)
+        for want_r in want_r_values:
+            forced_kinds = {}
+            forced_ranks = {}
+            for j, anm in enumerate(arg_names):
+                forced_ranks[anm] = want_r if j == iv else int(local_func_arg_ranks.get(fn.name, [0 for _ in arg_names])[j])
+                _obs_kind = None
+                for _k, _r in sorted(obs_pair_lists[j]):
+                    if int(_r) == forced_ranks[anm]:
+                        _obs_kind = _k
+                        break
+                if _obs_kind is None and j < len(local_func_arg_kinds.get(fn.name, [])):
+                    _obs_kind = local_func_arg_kinds[fn.name][j]
+                if _obs_kind is not None:
+                    forced_kinds[anm] = _obs_kind
+            _vk = forced_kinds.get(arg_names[iv], None) or "real"
+            suf = "s" if want_r == 0 else f"r{want_r}"
+            pname = f"{fn.name}_{arg_names[iv]}_{_vk}_{suf}"
+            list_args = {arg_names[iv]} if (_vk == "int" and want_r == 1 and ("int", 1, True) in obs_triad_lists[iv] and ("int", 1, False) not in obs_triad_lists[iv]) else set()
+            specs.append((pname, forced_kinds, forced_ranks, list_args, True))
+        if len(specs) > 1 or (elementwise_tuple and len(specs) == 1):
+            local_overload_specs[fn.name] = specs
+            local_overload_dispatch[fn.name] = dmap
     local_generic_overloads = set(local_overload_specs.keys())
     pure_local_calls = set(known_pure_calls or set()) | set((user_class_types or {}).keys())
 
@@ -31622,10 +34266,11 @@ def generate_flat(
     alloc_chars_set -= module_global_names
     chars_set -= module_global_names
     complexes_set -= module_global_names
+    rng_scalar_names = set(getattr(tr, "rng_vars", set())) - module_global_names
     ints = sorted(
-        (({*tr.ints, *set(list_counts.values())} - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set
+        ((({*tr.ints, *set(list_counts.values())} | rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set
     )
-    reals = sorted(((tr.reals - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
+    reals = sorted((((tr.reals - rng_scalar_names) - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
     complexes = sorted(((complexes_set - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set)
     logs = sorted(((tr.logs - set(params.keys())) - module_global_names) - chars_set - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
     chars = sorted(((chars_set - set(params.keys())) - module_global_names) - alloc_logs_set - alloc_ints_set - alloc_reals_set - alloc_complexes_set - alloc_chars_set - complexes_set)
@@ -32253,13 +34898,21 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     src = normalize_numpy_removed_aliases(Path(py_path).read_text(encoding="utf-8-sig"))
     stem = Path(py_path).stem
     tree = ast.parse(src)
+    validate_imports_supported(tree, py_path)
     translator.global_synthetic_slices = {}
+    translator.global_synthetic_slice_meta = {}
     translator.global_vectorize_aliases = {}
     translator.global_linalg_aliases = set()
     translator.global_scipy_special_aliases = set()
     translator.global_scipy_special_func_aliases = {}
     translator.global_statistics_aliases = set()
     translator.global_statistics_func_aliases = {}
+    translator.global_time_aliases = set()
+    translator.global_time_func_aliases = {}
+    translator.global_sys_aliases = set()
+    translator.global_sys_func_aliases = {}
+    translator.global_math_aliases = set()
+    translator.global_math_func_aliases = {}
     comment_map = extract_python_comments(src)
 
     exec_nodes = [
@@ -32389,6 +35042,18 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
         translator.global_statistics_aliases,
         translator.global_statistics_func_aliases,
     ) = collect_statistics_aliases(tree)
+    (
+        translator.global_time_aliases,
+        translator.global_time_func_aliases,
+    ) = collect_time_aliases(tree)
+    (
+        translator.global_sys_aliases,
+        translator.global_sys_func_aliases,
+    ) = collect_sys_aliases(tree)
+    (
+        translator.global_math_aliases,
+        translator.global_math_func_aliases,
+    ) = collect_math_aliases(tree)
     structured_type_components, structured_array_types, structured_dtype_strings = collect_structured_dtype_info(effective_tree)
     user_class_types, user_type_components = collect_dataclass_info(tree)
     for tnm, fields in user_type_components.items():
@@ -32516,6 +35181,7 @@ def transpile_file(py_path, helper_paths, flat, no_comment=False, out_path=None,
     f90_lines = simplify_index_arithmetic_notation(f90_lines)
     f90_lines = simplify_generated_parentheses(f90_lines)
     f90_lines = simplify_allocate_default_lower_bounds(f90_lines)
+    f90_lines = mark_recursive_procedures(f90_lines)
     if postprocess:
         f90_lines = remove_redundant_first_guarded_deallocate(f90_lines)
         f90_lines = collapse_alloc_dealloc_before_assignment(f90_lines)
@@ -32590,6 +35256,7 @@ def transpile_partial_file(py_path, helper_paths, flat, no_comment=False, out_pa
     src_path = Path(py_path)
     src = src_path.read_text(encoding="utf-8-sig")
     tree = ast.parse(src)
+    validate_imports_supported(tree, py_path)
 
     top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
     top_funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
@@ -32723,6 +35390,8 @@ def main():
     ap.add_argument("--run", action="store_true", help="compile and run transpiled source with helper files")
     ap.add_argument("--run-both", action="store_true", help="run original Python and transpiled Fortran (no timing)")
     ap.add_argument("--run-diff", action="store_true", help="run Python and Fortran and compare outputs")
+    ap.add_argument("--numeric-diff", action="store_true", help="with --run-diff, also compare numeric literals only, ignoring non-numeric text/formatting")
+    ap.add_argument("--numeric-diff-tol", type=float, default=1.0e-12, help="relative tolerance for --numeric-diff comparisons")
     ap.add_argument("--rng-replay", action="store_true", help="record supported Python RNG draws during the Python run and replay them in the transpiled Fortran runtime")
     ap.add_argument("--tee-rng-replay", action="store_true", help="print the generated Python RNG-replay wrapper source")
     ap.add_argument("--out-rng-replay-python", help="write the generated Python RNG-replay wrapper to this path and keep it")
@@ -32758,9 +35427,18 @@ def main():
             print("Hint: use xp2f_batch.py for multi-file globs.")
             return 1
         args.input_py = matches[0]
+    raw_argv = list(sys.argv[1:])
+    saw_numeric_diff_tol = any(
+        _arg == "--numeric-diff-tol" or _arg.startswith("--numeric-diff-tol=")
+        for _arg in raw_argv
+    )
     if args.tee_both:
         args.tee = True
     if args.time_both:
+        args.run_diff = True
+    if saw_numeric_diff_tol:
+        args.numeric_diff = True
+    if args.numeric_diff:
         args.run_diff = True
     if args.run_diff:
         args.run_both = True
@@ -33332,6 +36010,90 @@ def main():
                         lines.pop()
                     return lines
 
+                _num_core = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?|(?:inf|nan)"
+                _signed_num = rf"[+-]?(?:{_num_core})"
+                _token_re = re.compile(
+                    rf"""
+                    (?P<ft_complex>\(\s*(?P<ft_re>{_signed_num}),(?P<ft_im>{_signed_num})\s*\))
+                    |
+                    (?P<py_complex_paren>\(\s*(?P<py_re>{_signed_num})\s*(?P<py_sign>[+-])\s*(?P<py_im>{_num_core})j\s*\))
+                    |
+                    (?P<py_complex>(?<![A-Za-z_])(?P<pyb_re>{_signed_num})\s*(?P<pyb_sign>[+-])\s*(?P<pyb_im>{_num_core})j\b)
+                    |
+                    (?P<py_imag>(?<![A-Za-z_])(?P<pyi>{_signed_num})j\b)
+                    |
+                    (?P<real>(?<![A-Za-z_])(?P<r>{_signed_num})(?![A-Za-z_]))
+                    """,
+                    re.IGNORECASE | re.VERBOSE,
+                )
+
+                def _parse_float_token(txt):
+                    return float(txt.replace("_dp", "").replace("D", "e").replace("d", "e"))
+
+                def _skip_numeric_diff_line(line):
+                    ls = line.lstrip().lower()
+                    return (
+                        ls.startswith("elapsed_time_seconds:")
+                        or ls.startswith("python version:")
+                        or ls.startswith("numpy version:")
+                    )
+
+                def _numeric_stream(lines):
+                    nums = []
+                    for i_ln, ln in enumerate(lines, start=1):
+                        if _skip_numeric_diff_line(ln):
+                            continue
+                        for m in _token_re.finditer(ln):
+                            raw = m.group(0)
+                            try:
+                                if m.group("ft_complex") is not None:
+                                    val = complex(
+                                        _parse_float_token(m.group("ft_re")),
+                                        _parse_float_token(m.group("ft_im")),
+                                    )
+                                elif m.group("py_complex_paren") is not None:
+                                    im = _parse_float_token(m.group("py_im"))
+                                    if m.group("py_sign") == "-":
+                                        im = -im
+                                    val = complex(_parse_float_token(m.group("py_re")), im)
+                                elif m.group("py_complex") is not None:
+                                    im = _parse_float_token(m.group("pyb_im"))
+                                    if m.group("pyb_sign") == "-":
+                                        im = -im
+                                    val = complex(_parse_float_token(m.group("pyb_re")), im)
+                                elif m.group("py_imag") is not None:
+                                    val = complex(0.0, _parse_float_token(m.group("pyi")))
+                                else:
+                                    val = complex(_parse_float_token(m.group("r")), 0.0)
+                            except Exception:
+                                continue
+                            nums.append((i_ln, raw, val))
+                    return nums
+
+                def _numeric_values_close(av, bv):
+                    tol = float(args.numeric_diff_tol)
+                    for ax, bx in ((av.real, bv.real), (av.imag, bv.imag)):
+                        if math.isnan(ax) or math.isnan(bx):
+                            if math.isnan(ax) and math.isnan(bx):
+                                continue
+                            return False
+                        if math.isinf(ax) or math.isinf(bx):
+                            if ax == bx:
+                                continue
+                            return False
+                        scale = max(1.0, abs(ax), abs(bx))
+                        if abs(ax - bx) > (tol * scale):
+                            return False
+                    return True
+
+                def _numeric_streams_close(a_nums, b_nums):
+                    if len(a_nums) != len(b_nums):
+                        return False
+                    for (_ali, _at, av), (_bli, _bt, bv) in zip(a_nums, b_nums):
+                        if not _numeric_values_close(av, bv):
+                            return False
+                    return True
+
                 py_lines = _norm((py_run.stdout or "") + (("\n" + py_run.stderr) if py_run.stderr else ""))
                 ft_lines = _norm((rp.stdout or "") + (("\n" + rp.stderr) if rp.stderr else ""))
                 if py_lines == ft_lines or _lines_close(py_lines, ft_lines):
@@ -33360,6 +36122,34 @@ def main():
                         # keep diff compact
                         if dl.startswith("@@"):
                             break
+                if args.numeric_diff:
+                    py_nums = _numeric_stream(py_lines)
+                    ft_nums = _numeric_stream(ft_lines)
+                    if _numeric_streams_close(py_nums, ft_nums):
+                        print("Run numeric diff: MATCH")
+                    else:
+                        print("Run numeric diff: DIFF")
+                        first_num = None
+                        nmin_num = min(len(py_nums), len(ft_nums))
+                        for i_num in range(nmin_num):
+                            _pln, _ptxt, pv = py_nums[i_num]
+                            _fln, _ftxt, fv = ft_nums[i_num]
+                            if not _numeric_values_close(pv, fv):
+                                first_num = i_num
+                                break
+                        if first_num is None:
+                            first_num = nmin_num
+                        print(f"  first numeric mismatch index: {first_num + 1}")
+                        if first_num < len(py_nums):
+                            _pln, _ptxt, pv = py_nums[first_num]
+                            print(f"  python : line {_pln} -> {_ptxt} ({pv})")
+                        else:
+                            print("  python : <no number>")
+                        if first_num < len(ft_nums):
+                            _fln, _ftxt, fv = ft_nums[first_num]
+                            print(f"  fortran: line {_fln} -> {_ftxt} ({fv})")
+                        else:
+                            print("  fortran: <no number>")
         elif args.compile:
             final_run_status = "not_requested"
     _emit_timing_summary()

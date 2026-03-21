@@ -3073,6 +3073,10 @@ def wrap_long_fortran_lines(lines: List[str], max_len: int = 80) -> List[str]:
     """Wrap long free-form Fortran lines; keep unwrappable lines unchanged."""
     out: List[str] = []
     for line in lines:
+        code, comment = _split_code_comment(line.rstrip("\r\n"))
+        if comment.strip():
+            out.append(line)
+            continue
         wrapped = wrap_long_fortran_line(line, max_len=max_len)
         if wrapped is None:
             out.append(line)
