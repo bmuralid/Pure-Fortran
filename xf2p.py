@@ -1,4 +1,5 @@
 import re
+import ast
 import sys
 import argparse
 import subprocess
@@ -8,6 +9,7 @@ import difflib
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
+from typing import cast
 
 
 def split_fortran_comment(line: str) -> tuple[str, str]:
@@ -208,7 +210,64 @@ def _parse_file_interface(src: str) -> tuple[list[str], list[str], list[UseSpec]
             uses.append(UseSpec(module=mod, only_items=only_items, intrinsic=intrinsic))
             continue
 
+    i = 0
+    n = len(code_lines)
+    while i < n:
+        s = code_lines[i].strip()
+        mgi = re.match(r"^interface(?:\s+([a-z_]\w*))?\s*$", s, re.I)
+        if not mgi:
+            i += 1
+            continue
+        gname = mgi.group(1)
+        block: list[str] = []
+        i += 1
+        while i < n and not re.match(r"^\s*end\s+interface\b", code_lines[i], re.I):
+            block.append(code_lines[i].strip())
+            i += 1
+        if i < n:
+            i += 1
+        if not gname:
+            continue
+        has_module_proc = any(re.match(r"^module\s+procedure\b", b, re.I) for b in block)
+        if has_module_proc:
+            defs.append(gname)
+
     return unique_preserve(mods), unique_preserve(defs), uses
+
+
+def _extract_generic_interfaces(lines: list[tuple[str, str]]) -> tuple[list[tuple[str, str]], list[dict[str, list[str]]]]:
+    """Extract generic interface blocks that name module procedures."""
+    filtered: list[tuple[str, str]] = []
+    generics: list[dict[str, list[str]]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        s = lines[i][0].strip()
+        m = re.match(r"^interface(?:\s+([a-z_]\w*))?\s*$", s, re.I)
+        if not m:
+            filtered.append(lines[i])
+            i += 1
+            continue
+        gname = m.group(1)
+        block: list[tuple[str, str]] = []
+        i += 1
+        while i < n and not re.match(r"^\s*end\s+interface\b", lines[i][0], re.I):
+            block.append(lines[i])
+            i += 1
+        if i < n:
+            i += 1
+        procs: list[str] = []
+        for code, _comment in block:
+            mm = re.match(r"^\s*module\s+procedure\s+(.+)$", code.strip(), re.I)
+            if mm:
+                procs.extend([p.strip() for p in split_args(mm.group(1)) if p.strip()])
+        if gname and procs:
+            generics.append({"name": gname, "procedures": unique_preserve(procs)})
+        else:
+            filtered.append((s, ""))
+            filtered.extend(block)
+            filtered.append(("end interface", ""))
+    return filtered, generics
 
 
 def _insert_imports(py_text: str, import_lines: list[str]) -> str:
@@ -331,11 +390,169 @@ def split_args(s: str) -> list[str]:
         args.append(tail)
     return args
 
+def split_top_level(s: str, delim: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    pdepth = 0
+    bdepth = 0
+    in_str = False
+    quote = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            buf.append(ch)
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '(':
+            pdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ')':
+            pdepth = max(0, pdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '[':
+            bdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ']':
+            bdepth = max(0, bdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == delim and pdepth == 0 and bdepth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = ''.join(buf).strip()
+    if tail or not parts:
+        parts.append(tail)
+    return parts
+
+def split_top_level_concat(s: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    pdepth = 0
+    bdepth = 0
+    in_str = False
+    quote = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            buf.append(ch)
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '(':
+            pdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ')':
+            pdepth = max(0, pdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '[':
+            bdepth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ']':
+            bdepth = max(0, bdepth - 1)
+            buf.append(ch)
+            i += 1
+            continue
+        if i + 1 < n and s[i:i + 2] == '//' and pdepth == 0 and bdepth == 0:
+            parts.append(''.join(buf).strip())
+            buf = []
+            i += 2
+            continue
+        buf.append(ch)
+        i += 1
+    tail = ''.join(buf).strip()
+    if tail or not parts:
+        parts.append(tail)
+    return parts
+
 def _fortran_unquote(s: str) -> str:
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", "\""):
         q = s[0]
         return s[1:-1].replace(q + q, q)
     return s
+
+
+def _is_fortran_string_literal(s: str) -> bool:
+    s = s.strip()
+    if len(s) < 2 or s[0] not in ("'", "\""):
+        return False
+    q = s[0]
+    i = 1
+    n = len(s)
+    while i < n:
+        if s[i] == q:
+            if i + 1 < n and s[i + 1] == q:
+                i += 2
+                continue
+            i += 1
+            while i < n and s[i].isspace():
+                i += 1
+            return i == n
+        i += 1
+    return False
+
+
+def _rewrite_fortran_string_literals(s: str) -> str:
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch not in ("'", '"'):
+            out.append(ch)
+            i += 1
+            continue
+        q = ch
+        j = i + 1
+        while j < n:
+            if s[j] == q:
+                if j + 1 < n and s[j + 1] == q:
+                    j += 2
+                    continue
+                lit = s[i:j + 1]
+                out.append(repr(_fortran_unquote(lit)))
+                i = j + 1
+                break
+            j += 1
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
 
 
 def _strip_one_outer_paren(s: str) -> str:
@@ -402,12 +619,17 @@ def _fortran_implied_do_expr(raw: str, translate_expr, arrays_1d: set[str]) -> s
 
 def _is_recyclable_io_iterable(raw: str, decl_array_types: dict[str, str]) -> bool:
     s = raw.strip()
-    return (
+    if (
         s.startswith('[')
         or s.startswith('(/')
         or _fortran_implied_do_expr(s, lambda x, _a: x, set()) is not None
         or (re.fullmatch(r"[a-z_]\w*", s, flags=re.I) and s.lower() in decl_array_types)
-    )
+    ):
+        return True
+    concat_parts = split_top_level_concat(s)
+    if len(concat_parts) > 1:
+        return any(_is_recyclable_io_iterable(part, decl_array_types) for part in concat_parts)
+    return False
 
 
 def _fortran_format_arg_count(fmt_literal: str) -> int | None:
@@ -744,6 +966,13 @@ _type_ndarray_hint = {
     "character": "npt.NDArray[object]",
 }
 
+_type_target_scalar_hint = {
+    "integer": "npt.NDArray[np.int_]",
+    "real": "npt.NDArray[np.float64]",
+    "logical": "npt.NDArray[np.bool_]",
+    "complex": "npt.NDArray[np.complex128]",
+}
+
 _LOCAL_RUNTIME_HELPERS = {
     "_f_size",
     "_f_spread",
@@ -771,18 +1000,64 @@ def infer_function_result_ftype(header: str) -> str | None:
         return None
     return m.group(1).lower()
 
-_decl_re = re.compile(r"^(integer|real|logical|complex|character(?:\s*\([^)]*\))?)\b(.*)::(.*)$", re.I)
+_decl_re = re.compile(r"^(integer|real|logical|complex|character(?:\s*\([^)]*\))?)\b(.*)$", re.I)
+
+
+def _find_top_level_double_colon(s: str) -> int:
+    in_str = False
+    quote = ""
+    pdepth = 0
+    bdepth = 0
+    i = 0
+    n = len(s)
+    while i < n - 1:
+        ch = s[i]
+        if in_str:
+            if ch == quote:
+                in_str = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            in_str = True
+            quote = ch
+            i += 1
+            continue
+        if ch == "(":
+            pdepth += 1
+            i += 1
+            continue
+        if ch == ")":
+            pdepth = max(0, pdepth - 1)
+            i += 1
+            continue
+        if ch == "[":
+            bdepth += 1
+            i += 1
+            continue
+        if ch == "]":
+            bdepth = max(0, bdepth - 1)
+            i += 1
+            continue
+        if pdepth == 0 and bdepth == 0 and s.startswith("::", i):
+            return i
+        i += 1
+    return -1
 
 
 def parse_decl(line: str):
-    m = _decl_re.match(line.strip())
+    s = line.strip()
+    pos = _find_top_level_double_colon(s)
+    if pos == -1:
+        return None
+    lhs = s[:pos].strip()
+    rest = s[pos + 2 :].strip()
+    m = _decl_re.match(lhs)
     if not m:
         return None
     ftype = m.group(1).lower()
     if ftype.startswith("character"):
         ftype = "character"
-    attrs = m.group(2).strip()
-    rest = m.group(3).strip()
+    attrs = m.group(2).strip().rstrip(",").strip()
     return ftype, attrs, rest
 
 
@@ -795,17 +1070,64 @@ def parse_decl_attr_dimension(attrs: str) -> str | None:
 
 def parse_decl_items(rest: str, default_shape: str | None = None):
     items = []
+
+    def _split_init(part: str):
+        """Split a declaration item into (lhs, init, op).
+
+        Fortran allows both normal initialization ("=") and pointer
+        initialization ("=>") in declaration lists.
+
+        We must treat "=>" as a single token (not as "=" + ">") so that
+        pointer initializers don't leak stray ">" characters into Python.
+        """
+        in_str = False
+        quote = ""
+        pdepth = 0
+        bdepth = 0
+        i = 0
+        n = len(part)
+        while i < n:
+            ch = part[i]
+            if in_str:
+                if ch == quote:
+                    in_str = False
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                in_str = True
+                quote = ch
+                i += 1
+                continue
+            if ch == "(":
+                pdepth += 1
+                i += 1
+                continue
+            if ch == ")":
+                pdepth = max(0, pdepth - 1)
+                i += 1
+                continue
+            if ch == "[":
+                bdepth += 1
+                i += 1
+                continue
+            if ch == "]":
+                bdepth = max(0, bdepth - 1)
+                i += 1
+                continue
+            if pdepth == 0 and bdepth == 0:
+                if part.startswith("=>", i):
+                    return part[:i].strip(), part[i + 2 :].strip(), "=>"
+                if ch == "=":
+                    return part[:i].strip(), part[i + 1 :].strip(), "="
+            i += 1
+        return part.strip(), None, None
+
     for part in split_args(rest):
         part = part.strip()
         if not part:
             continue
-        init = None
-        if "=" in part:
-            left, init = part.split("=", 1)
-            left = left.strip()
-            init = init.strip()
-        else:
-            left = part.strip()
+
+        left, init, _op = _split_init(part)
 
         shape = None
         mm = re.match(r"^([a-z_]\w*)\s*\(\s*(.+)\s*\)\s*$", left, re.I)
@@ -817,6 +1139,7 @@ def parse_decl_items(rest: str, default_shape: str | None = None):
             shape = default_shape
 
         items.append((name, shape, init))
+
     return items
 
 
@@ -829,10 +1152,24 @@ class basic_f2p:
         self._block_code_start: list[int] = []
         self._decl_types: dict[str, str] = {}
         self._decl_array_types: dict[str, str] = {}
-        self._subr_sigs: dict[str, dict[str, list[str]]] = {}
+        self._decl_pointer: set[str] = set()
+        self._decl_target: set[str] = set()
+        self._decl_char_len: dict[str, str] = {}
+        self._decl_lbounds: dict[str, list[str]] = {}
+        self._decl_ubounds: dict[str, list[str]] = {}
+        self._save_stack: list[tuple[str, list[str]]] = []
+        self._subr_sigs: dict[str, dict] = {}
+        self._func_sigs: dict[str, dict] = {}
         self._current_result_name: str | None = None
         self._derived_types: set[str] = set()
+        self._select_case_stack: list[dict[str, object]] = []
+        self._associate_stack: list[dict[str, object]] = []
+        self._where_stack: list[dict[str, str]] = []
+        self._forall_stack: list[int] = []
+        self._do_stack: list[dict[str, object] | int] = []
+        self._loop_counter = 0
         self._seen_scipy_special = False
+        self._elemental_funcs: set[str] = set()
 
     def _kind_alias_value(self, remote: str) -> str | None:
         r = remote.strip().lower()
@@ -892,6 +1229,105 @@ class basic_f2p:
             return "type", td.group(1), attrs.lower(), parse_decl_items(td.group(3).strip(), parse_decl_attr_dimension(attrs))
         return None
 
+    def _parse_character_len(self, decl_line: str) -> str | None:
+        s = decl_line.strip()
+        m = re.search(r"\bcharacter\s*\(", s, re.I)
+        if m:
+            p0 = s.find("(", m.start())
+            p1 = find_matching_paren(s, p0)
+            if p0 != -1 and p1 != -1:
+                inner = s[p0 + 1 : p1].strip()
+                for part in split_args(inner):
+                    mm = re.match(r"^len\s*=\s*(.+)$", part.strip(), re.I)
+                    if mm:
+                        return mm.group(1).strip()
+                parts = [p.strip() for p in split_args(inner) if p.strip()]
+                if parts and all(("kind" not in p.lower()) and ("=" not in p) for p in parts):
+                    return parts[0]
+        m = re.search(r"\bcharacter\s*\*\s*([a-z_]\w*|\d+)", s, re.I)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _collect_save_names(self, lines: list[tuple[str, str]], sym: dict[str, dict], args: list[str]) -> list[str]:
+        save_names: set[str] = set()
+        arg_set = {a.lower() for a in args}
+        for name, info in sym.items():
+            attrs_l = str(info.get("attrs_l", "")).lower()
+            if name.lower() in arg_set:
+                continue
+            if "save" in attrs_l or info.get("init") is not None:
+                save_names.add(name)
+        for code, _comment in lines:
+            s = code.strip()
+            if re.fullmatch(r"save", s, re.I):
+                for name in sym:
+                    if name.lower() not in arg_set:
+                        save_names.add(name)
+                continue
+            m = re.match(r"save\s*(?:::)?\s*(.+)$", s, re.I)
+            if m:
+                for item in split_args(m.group(1)):
+                    nm = item.strip()
+                    if nm and nm.lower() not in arg_set and nm in sym:
+                        save_names.add(nm)
+        return sorted(save_names)
+
+    def _emit_save_restore(self, save_dict_name: str, save_names: list[str], sym: dict[str, dict], arrays_1d: set[str]) -> None:
+        for name in save_names:
+            info = sym.get(name, {})
+            ftype = info.get("ftype")
+            is_array = bool(info.get("is_array"))
+            init = info.get("init")
+            if is_array:
+                shape = info.get("shape")
+                if shape is None:
+                    init_py = "None"
+                else:
+                    shape_py = self._shape_to_py(str(shape), arrays_1d)
+                    if ftype == "type":
+                        init_py = f"np.empty({shape_py}, dtype=object)"
+                    else:
+                        dtype = _type_dtype.get(ftype, "object")
+                        if init is None:
+                            init_py = f"np.empty({shape_py}, dtype={dtype})"
+                        else:
+                            rhs = self.translate_expr(str(init), arrays_1d)
+                            if ftype == "character" and info.get("char_len") is not None:
+                                clen = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                                rhs = f"_f_str_assign({rhs}, {clen})"
+                            init_py = f"np.full({shape_py}, {rhs}, dtype={dtype})"
+            else:
+                if ftype == "type":
+                    cls = info.get("type_name") or "SimpleNamespace"
+                    init_py = f"{cls}()"
+                elif init is None:
+                    default_val = _type_default_scalar_value.get(ftype, "0")
+                    if ftype == "character" and info.get("char_len") is not None:
+                        clen = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                        default_val = f"_f_str_assign({default_val}, {clen})"
+                    init_py = default_val
+                else:
+                    init_py = self.translate_expr(str(init), arrays_1d)
+                    if ftype == "character" and info.get("char_len") is not None:
+                        clen = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                        init_py = f"_f_str_assign({init_py}, {clen})"
+            self.emit(f"if {name!r} in {save_dict_name}:")
+            self.indent += 1
+            self.emit(f"{name} = _xf2p_copy_value({save_dict_name}[{name!r}])")
+            self.indent -= 1
+            self.emit("else:")
+            self.indent += 1
+            self.emit(f"{name} = _xf2p_copy_value({init_py})")
+            self.indent -= 1
+
+    def _emit_save_sync(self) -> None:
+        if not self._save_stack:
+            return
+        save_dict_name, save_names = self._save_stack[-1]
+        for name in save_names:
+            self.emit(f"{save_dict_name}[{name!r}] = _xf2p_copy_value({name})")
+
     def _validate_unit_symbols(self, unit_kind: str, unit_name: str, args: list[str], body_lines: list[tuple[str, str]]) -> None:
         dups = _find_dups_ci(args)
         if dups:
@@ -940,10 +1376,24 @@ class basic_f2p:
 
 
     def _is_function_header(self, s: str) -> bool:
-        return bool(re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", s, re.I))
+        return bool(re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure|elemental|recursive)\s+)*(?:\w+(?:\s*\([^)]*\))?\s+)*function\b", s, re.I))
 
     def _is_subroutine_header(self, s: str) -> bool:
-        return bool(re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", s, re.I))
+        return bool(re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:(?:pure|elemental|recursive)\s+)*subroutine\b", s, re.I))
+
+    def _is_elemental_header(self, s: str) -> bool:
+        return bool(re.search(r"\belemental\b", s, re.I))
+
+    def _scalar_otype_expr(self, ftype: str | None, type_name: str | None = None) -> str:
+        if ftype == "integer":
+            return "np.int_"
+        if ftype == "real":
+            return "np.float64"
+        if ftype == "logical":
+            return "np.bool_"
+        if ftype == "complex":
+            return "np.complex128"
+        return "object"
 
     def _collect_subprogram_body(self, lines: list[tuple[str, str]], start_idx: int, outer_kind: str) -> tuple[list[tuple[str, str]], int]:
         body: list[tuple[str, str]] = []
@@ -1054,7 +1504,7 @@ class basic_f2p:
                 had_field = True
                 cmt = f"  # {comment.strip()}" if comment.strip() else ""
                 if shape is not None:
-                    if "allocatable" in attrs_l:
+                    if "allocatable" in attrs_l or "pointer" in attrs_l:
                         self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} | None = None{cmt}")
                         continue
                     shape_py = self._shape_to_py(shape, set())
@@ -1064,7 +1514,7 @@ class basic_f2p:
                         dtype = _type_dtype[ftype]
                         self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=True)} = field(default_factory=lambda: np.empty({shape_py}, dtype={dtype})){cmt}")
                     continue
-                if "allocatable" in attrs_l:
+                if "allocatable" in attrs_l or "pointer" in attrs_l:
                     self.emit(f"{name}: {self._type_hint(ftype, type_name, is_array=False)} | None = None{cmt}")
                     continue
                 if ftype == "type":
@@ -1184,41 +1634,134 @@ class basic_f2p:
             return dims[0]
         return "(" + ", ".join(dims) + ")"
 
+    def _shape_bounds(self, shape: str) -> list[tuple[str, str]]:
+        bounds: list[tuple[str, str]] = []
+        for d in split_args(shape):
+            ds = d.strip()
+            if ":" in ds:
+                lo, hi = ds.split(":", 1)
+                lo = lo.strip() or "1"
+                hi = hi.strip()
+                bounds.append((lo, hi))
+            else:
+                bounds.append(("1", ds))
+        return bounds
+
+    def _decl_bound_expr(self, name: str, dim0: int, which: str, arrays_1d: set[str]) -> str | None:
+        key = name.split(".", 1)[0].lower()
+        src = self._decl_lbounds if which == "lo" else self._decl_ubounds
+        vals = src.get(key)
+        if not vals or dim0 < 0 or dim0 >= len(vals):
+            return None
+        raw = str(vals[dim0]).strip()
+        if which == "hi":
+            if raw == "":
+                lo_vals = self._decl_lbounds.get(key)
+                lo_raw = "1"
+                if lo_vals and 0 <= dim0 < len(lo_vals):
+                    lo_raw = str(lo_vals[dim0]).strip() or "1"
+                lo_py = self.translate_expr(lo_raw, arrays_1d)
+                base_name = name.split(".", 1)[0]
+                return f"(_f_size({base_name}, dim={dim0 + 1}) + ({lo_py}) - 1)"
+            if raw == "*":
+                return None
+        return self.translate_expr(raw, arrays_1d)
+
+    def _index_expr_from_decl_bounds(self, name: str, idx_txt: str, dim0: int, arrays_1d: set[str]) -> str:
+        idx_py = self.translate_expr(idx_txt, arrays_1d)
+        lo_py = self._decl_bound_expr(name, dim0, "lo", arrays_1d)
+        if lo_py is None or lo_py == "1":
+            return f"({idx_py}) - 1"
+        return f"({idx_py}) - ({lo_py})"
+
+    def _slice_expr_from_decl_bounds(self, name: str, lo_txt: str, hi_txt: str, dim0: int, arrays_1d: set[str]) -> str:
+        base_lo_py = self._decl_bound_expr(name, dim0, "lo", arrays_1d)
+        lo_txt = lo_txt.strip()
+        hi_txt = hi_txt.strip()
+        if lo_txt:
+            lo_py = self.translate_expr(lo_txt, arrays_1d)
+            start = f"(int({lo_py}) - 1)" if base_lo_py is None or base_lo_py == "1" else f"(int({lo_py}) - int({base_lo_py}))"
+        else:
+            start = ""
+        if hi_txt:
+            hi_py = self.translate_expr(hi_txt, arrays_1d)
+            stop = f"int({hi_py})" if base_lo_py is None or base_lo_py == "1" else f"(int({hi_py}) - int({base_lo_py}) + 1)"
+        else:
+            stop = ""
+        return f"{start}:{stop}"
+
     def translate_expr(self, expr: str, arrays_1d: set[str]) -> str:
         s = expr.strip()
         s = s.replace("%", ".")
-        had_concat = False
+        concat_parts = split_top_level_concat(s)
+        if len(concat_parts) > 1:
+            parts_py = [self.translate_expr(part, arrays_1d) for part in concat_parts]
+            expr_py = parts_py[0]
+            for part_py in parts_py[1:]:
+                expr_py = f"_xf2p_concat({expr_py}, {part_py})"
+            return expr_py
 
-        # Fortran string concatenation operator.
-        if "//" in s:
-            out_concat: list[str] = []
-            i = 0
-            in_str = False
-            quote = ""
-            while i < len(s):
-                ch = s[i]
-                if in_str:
-                    out_concat.append(ch)
-                    if ch == quote:
-                        in_str = False
-                    i += 1
-                    continue
-                if ch in ("'", '"'):
-                    in_str = True
-                    quote = ch
-                    out_concat.append(ch)
-                    i += 1
-                    continue
-                if i + 1 < len(s) and s[i : i + 2] == "//":
-                    out_concat.append(" + ")
-                    had_concat = True
-                    i += 2
-                    continue
-                out_concat.append(ch)
-                i += 1
-            s = "".join(out_concat)
-            if had_concat and re.match(r"^\s*\+", s):
-                s = '"" ' + s
+        if len(s) >= 2 and s[0] in ("'", '"') and s[-1] == s[0]:
+            return repr(_fortran_unquote(s))
+
+        s = _rewrite_fortran_string_literals(s)
+
+        implied_py = _fortran_implied_do_expr(s, self.translate_expr, arrays_1d)
+        if implied_py is not None:
+            return implied_py
+
+        if len(s) >= 2 and s[0] == "[" and s[-1] == "]":
+            inner = s[1:-1].strip()
+            cc = _find_top_level_double_colon(inner)
+            if cc != -1:
+                type_spec = inner[:cc].strip().lower()
+                elems_txt = inner[cc + 2 :].strip()
+                dtype_map = {
+                    "integer": "int",
+                    "logical": "bool",
+                    "real": "np.float64",
+                    "complex": "np.complex128",
+                    "character": "object",
+                }
+                base_type = None
+                for key in dtype_map:
+                    if type_spec.startswith(key):
+                        base_type = key
+                        break
+                if base_type is not None:
+                    if not elems_txt:
+                        return f"np.asarray([], dtype={dtype_map[base_type]})"
+                    elems_parts = [p.strip() for p in split_args(elems_txt) if p.strip()]
+                    list_terms = []
+                    for p in elems_parts:
+                        implied_term = _fortran_implied_do_expr(p, self.translate_expr, arrays_1d)
+                        if implied_term is not None:
+                            list_terms.append(implied_term)
+                        else:
+                            list_terms.append(f"[{self.translate_expr(p, arrays_1d)}]")
+                    if not list_terms:
+                        return f"np.asarray([], dtype={dtype_map[base_type]})"
+                    list_py = list_terms[0]
+                    for term in list_terms[1:]:
+                        list_py = f"{list_py} + {term}"
+                    return f"np.asarray({list_py}, dtype={dtype_map[base_type]})"
+            elems_parts = [p.strip() for p in split_args(inner) if p.strip()]
+            list_terms = []
+            has_implied = False
+            for p in elems_parts:
+                implied_term = _fortran_implied_do_expr(p, self.translate_expr, arrays_1d)
+                if implied_term is not None:
+                    has_implied = True
+                    list_terms.append(implied_term)
+                else:
+                    list_terms.append(f"[{self.translate_expr(p, arrays_1d)}]")
+            if has_implied:
+                if not list_terms:
+                    return "np.asarray([])"
+                list_py = list_terms[0]
+                for term in list_terms[1:]:
+                    list_py = f"{list_py} + {term}"
+                return f"np.asarray({list_py})"
 
         # kind(...) used as a kind selector
         # basic rule: if it uses a d exponent constant, treat it as double precision -> 8
@@ -1236,8 +1779,27 @@ class basic_f2p:
         # e.g. 1.0_dp, 2_ikind, 3.5_rk
         s = re.sub(r"(?i)\b((?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*_[a-z_]\w*\b", r"\1", s)
 
+        def _top_level_complex_literal(txt: str) -> tuple[str, str] | None:
+            t = txt.strip()
+            if len(t) < 2 or t[0] != "(" or t[-1] != ")":
+                return None
+            if find_matching_paren(t, 0) != len(t) - 1:
+                return None
+            parts = [p.strip() for p in split_args(t[1:-1])]
+            if len(parts) != 2:
+                return None
+            return parts[0], parts[1]
+
+        complex_parts = _top_level_complex_literal(s)
+        if complex_parts is not None:
+            re_py = self.translate_expr(complex_parts[0], arrays_1d)
+            im_py = self.translate_expr(complex_parts[1], arrays_1d)
+            return f"_xf2p_cmplx({re_py}, {im_py})"
+
         s = re.sub(r"\.true\.", "True", s, flags=re.I)
         s = re.sub(r"\.false\.", "False", s, flags=re.I)
+        s = re.sub(r"\.eqv\.", " == ", s, flags=re.I)
+        s = re.sub(r"\.neqv\.", " != ", s, flags=re.I)
         s = re.sub(r"\.eq\.", " == ", s, flags=re.I)
         s = re.sub(r"\.ne\.", " != ", s, flags=re.I)
         s = re.sub(r"\.lt\.", " < ", s, flags=re.I)
@@ -1259,7 +1821,8 @@ class basic_f2p:
         s = re.sub(r"\bmin\s*\(", "np.minimum(", s, flags=re.I)
         s = re.sub(r"\breshape\s*\(", "np.reshape(", s, flags=re.I)
         s = re.sub(r"\bspread\s*\(", "_f_spread(", s, flags=re.I)
-        s = re.sub(r"\bmod\s*\(", "np.mod(", s, flags=re.I)
+        s = re.sub(r"\bmodulo\s*\(", "_xf2p_modulo(", s, flags=re.I)
+        s = re.sub(r"\bmod\s*\(", "_xf2p_mod(", s, flags=re.I)
         s = re.sub(r"\bmaxval\s*\(", "np.max(", s, flags=re.I)
         s = re.sub(r"\bminval\s*\(", "np.min(", s, flags=re.I)
         s = re.sub(r"\bcount\s*\(", "np.count_nonzero(", s, flags=re.I)
@@ -1272,9 +1835,13 @@ class basic_f2p:
         )
         s = re.sub(r"\ballocated\s*\(\s*([^)]+?)\s*\)", r"(\1 is not None)", s, flags=re.I)
         s = re.sub(r"\bpresent\s*\(\s*([a-z_]\w*)\s*\)", r"(\1 is not None)", s, flags=re.I)
+        s = re.sub(r"\bassociated\s*\(\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\)", r"(\1 is not None)", s, flags=re.I)
+        s = re.sub(r"\bnull\s*\(\s*\)", "None", s, flags=re.I)
         s = re.sub(r"\btiny\s*\(\s*[^)]*\)", "np.finfo(float).tiny", s, flags=re.I)
         s = re.sub(r"\bhuge\s*\(\s*[^)]*\)", "np.finfo(float).max", s, flags=re.I)
         s = s.replace("np.np.", "np.")
+        s = re.sub(r"(?i)\.re\b", ".real", s)
+        s = re.sub(r"(?i)\.im\b", ".imag", s)
 
         s = re.sub(r"\bsize\s*\(\s*([a-z_]\w*)\s*\)", r"_f_size(\1)", s, flags=re.I)
         s = re.sub(r"\bsize\s*\(\s*([^)]+)\s*\)", r"_f_size(\1)", s, flags=re.I)
@@ -1362,25 +1929,51 @@ class basic_f2p:
                 "sinpi",
                 "tanpi",
                 "trim",
+                "len",
+                "len_trim",
+                "new_line",
+                "achar",
+                "char",
+                "adjustl",
                 "real",
+                "aimag",
+                "conjg",
+                "cmplx",
                 "int",
+                "nint",
+                "anint",
+                "aint",
+                "ceiling",
+                "floor",
+                "lbound",
+                "ubound",
             }:
                 return None
             parts = [p.strip() for p in split_args(inner)]
             args_py = [self.translate_expr(p, arrays_1d) for p in parts]
             if lname == "trim" and len(args_py) == 1:
                 return f"str({args_py[0]}).rstrip()"
-            if lname == "real":
-                if len(parts) >= 1:
-                    arg0_raw = parts[0].strip()
-                    arg0_py = args_py[0]
-                    if (
-                        arg0_raw.startswith("[")
-                        or arg0_raw.startswith("(/")
-                        or arg0_raw.lower() in arrays_1d
-                    ):
-                        return f"np.asarray({arg0_py}, dtype=np.float64)"
-                    return f"np.float64({arg0_py})"
+            if lname == "len" and len(args_py) == 1:
+                return f"_f_len({args_py[0]})"
+            if lname == "len_trim" and len(args_py) == 1:
+                return f"_f_len_trim({args_py[0]})"
+            if lname == "new_line" and len(args_py) == 1:
+                return repr("\n")
+            if lname in {"achar", "char"} and len(args_py) >= 1:
+                return f"chr(int({args_py[0]}))"
+            if lname == "adjustl" and len(args_py) == 1:
+                return f"_f_adjustl({args_py[0]})"
+            if lname == "real" and len(args_py) >= 1:
+                return f"_xf2p_real({args_py[0]})"
+            if lname == "aimag" and len(args_py) == 1:
+                return f"_xf2p_aimag({args_py[0]})"
+            if lname == "conjg" and len(args_py) == 1:
+                return f"_xf2p_conjg({args_py[0]})"
+            if lname == "cmplx":
+                if len(args_py) == 1:
+                    return f"_xf2p_cmplx({args_py[0]})"
+                if len(args_py) >= 2:
+                    return f"_xf2p_cmplx({args_py[0]}, {args_py[1]})"
                 return None
             if lname == "int":
                 if len(parts) >= 1:
@@ -1394,6 +1987,52 @@ class basic_f2p:
                         return f"np.asarray({arg0_py}, dtype=int)"
                     return f"int({arg0_py})"
                 return None
+            if lname == "nint" and len(args_py) == 1:
+                return f"_xf2p_nint({args_py[0]})"
+            if lname == "anint" and len(args_py) == 1:
+                return f"_xf2p_anint({args_py[0]})"
+            if lname == "aint" and len(args_py) == 1:
+                return f"_xf2p_aint({args_py[0]})"
+            if lname == "ceiling" and len(args_py) == 1:
+                return f"_xf2p_ceiling({args_py[0]})"
+            if lname == "floor" and len(args_py) == 1:
+                return f"_xf2p_floor({args_py[0]})"
+            if lname in {"lbound", "ubound"} and len(parts) >= 1:
+                base_raw = parts[0].strip()
+                base_py = self.translate_expr(base_raw, arrays_1d)
+                dim_raw = None
+                dim_py = None
+                for idx_part, p in enumerate(parts[1:], start=1):
+                    pm = re.match(r"(?is)^dim\s*=\s*(.+)$", p.strip())
+                    if pm:
+                        dim_raw = pm.group(1).strip()
+                        dim_py = self.translate_expr(dim_raw, arrays_1d)
+                    elif idx_part == 1 and dim_raw is None:
+                        dim_raw = p.strip()
+                        dim_py = self.translate_expr(dim_raw, arrays_1d)
+                if re.fullmatch(r"[a-z_]\w*(?:\.[a-z_]\w*)*", base_raw, flags=re.I):
+                    key = base_raw.split(".", 1)[0].lower()
+                    vals = self._decl_lbounds.get(key) if lname == "lbound" else self._decl_ubounds.get(key)
+                    if vals:
+                        if dim_raw is None:
+                            parts_py: list[str] = []
+                            for idx0 in range(len(vals)):
+                                bnd = self._decl_bound_expr(base_raw, idx0, "lo" if lname == "lbound" else "hi", arrays_1d)
+                                if bnd is None:
+                                    parts_py = []
+                                    break
+                                parts_py.append(bnd)
+                            if parts_py:
+                                return "np.asarray([" + ", ".join(parts_py) + "], dtype=int)"
+                        if re.fullmatch(r"[+-]?\d+", dim_raw):
+                            idx0 = int(dim_raw) - 1
+                            bnd = self._decl_bound_expr(base_raw, idx0, "lo" if lname == "lbound" else "hi", arrays_1d)
+                            if bnd is not None:
+                                return bnd
+                helper = "_xf2p_lbound" if lname == "lbound" else "_xf2p_ubound"
+                if dim_py is None:
+                    return f"{helper}({base_py})"
+                return f"{helper}({base_py}, dim={dim_py})"
             if lname == "gamma" and len(args_py) == 1:
                 return f"sps.gamma({args_py[0]})"
             if lname == "log_gamma" and len(args_py) == 1:
@@ -1492,13 +2131,9 @@ class basic_f2p:
                                         lo, hi = ptxt.split(":", 1)
                                         lo = lo.strip()
                                         hi = hi.strip()
-                                        lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                                        hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                                        start = f"(int({lo_py}) - 1)" if lo_py else ""
-                                        stop = f"int({hi_py})" if hi_py else ""
-                                        idx_parts.append(f"{start}:{stop}")
+                                        idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
                                     else:
-                                        idx_parts.append(f"({self.translate_expr(ptxt, arrays_1d)}) - 1")
+                                        idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
                                 out.append(f"{name}[{', '.join(idx_parts)}]")
                                 i = pclose + 1
                                 continue
@@ -1506,15 +2141,12 @@ class basic_f2p:
                                 lo, hi = inner.split(":", 1)
                                 lo = lo.strip()
                                 hi = hi.strip()
-                                lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                                hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                                start = f"(int({lo_py}) - 1)" if lo_py else ""
-                                stop = f"int({hi_py})" if hi_py else ""
-                                out.append(f"{name}[{start}:{stop}]")
+                                out.append(f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]")
                             else:
-                                out.append(f"{name}[({inner_py}) - 1]")
+                                out.append(f"{name}[{self._index_expr_from_decl_bounds(name, inner, 0, arrays_1d)}]")
                         else:
-                            if ":" in inner and "," not in inner:
+                            is_char_substring = self._decl_types.get(name.lower()) == "character"
+                            if is_char_substring and ":" in inner and "," not in inner:
                                 lo, hi = inner.split(":", 1)
                                 lo = lo.strip()
                                 hi = hi.strip()
@@ -1524,7 +2156,12 @@ class basic_f2p:
                                 stop = f"int({hi_py})" if hi_py else ""
                                 out.append(f"{name}[{start}:{stop}]")
                             else:
-                                out.append(f"{name}({inner_py})")
+                                arg_parts = split_args(inner)
+                                if len(arg_parts) > 1:
+                                    args_joined = ", ".join(self.translate_expr(p.strip(), arrays_1d) for p in arg_parts)
+                                    out.append(f"{name}({args_joined})")
+                                else:
+                                    out.append(f"{name}({inner_py})")
                         i = pclose + 1
                         continue
                 root = name.split(".", 1)[0].lower()
@@ -1537,13 +2174,126 @@ class basic_f2p:
             return "".join(out)
 
         s = _convert_refs(s)
+
+        def _expr_kind(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, bool):
+                    return "logical"
+                if isinstance(node.value, int):
+                    return "integer"
+                if isinstance(node.value, float):
+                    return "real"
+                if isinstance(node.value, complex):
+                    return "complex"
+                if isinstance(node.value, str):
+                    return "character"
+                return None
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+                return _expr_kind(node.operand)
+            if isinstance(node, ast.Name):
+                return self._decl_types.get(node.id.lower())
+            if isinstance(node, ast.List):
+                if not node.elts:
+                    return "real"
+                kinds = {_expr_kind(elt) for elt in node.elts}
+                kinds.discard(None)
+                if not kinds:
+                    return None
+                if "character" in kinds:
+                    return "character"
+                if "complex" in kinds:
+                    return "complex"
+                if "real" in kinds:
+                    return "real"
+                if "integer" in kinds:
+                    return "integer"
+                if "logical" in kinds:
+                    return "logical"
+                return None
+            if isinstance(node, ast.Call):
+                fname = None
+                if isinstance(node.func, ast.Name):
+                    fname = node.func.id
+                elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+                    fname = f"{node.func.value.id}.{node.func.attr}"
+                if fname in {"int", "_f_len", "_f_len_trim", "_xf2p_mod", "_xf2p_modulo", "_xf2p_div", "_xf2p_nint"}:
+                    return "integer"
+                if fname in {"float", "_xf2p_real", "np.float64", "np.sqrt", "np.log", "np.exp", "np.sin", "np.cos", "np.arccos", "np.arcsin", "np.arctan", "np.degrees", "np.radians"}:
+                    return "real"
+                if fname in {"complex", "_xf2p_cmplx", "_xf2p_conjg", "np.conj"}:
+                    return "complex"
+                if fname == "_xf2p_concat":
+                    return "character"
+                if fname == "np.asarray":
+                    for kw in node.keywords:
+                        if kw.arg == "dtype":
+                            if isinstance(kw.value, ast.Name):
+                                if kw.value.id == "int":
+                                    return "integer"
+                                if kw.value.id == "bool":
+                                    return "logical"
+                                if kw.value.id == "object":
+                                    return "character"
+                            if isinstance(kw.value, ast.Attribute) and isinstance(kw.value.value, ast.Name) and kw.value.value.id == "np":
+                                if kw.value.attr in {"float64", "float32"}:
+                                    return "real"
+                                if kw.value.attr in {"complex128", "complex64"}:
+                                    return "complex"
+                    return None
+            return None
+
+        class _ExprFixer(ast.NodeTransformer):
+            def visit_List(self, node: ast.List):
+                self.generic_visit(node)
+                kind = _expr_kind(node)
+                if kind is None:
+                    return node
+                dtype_map = {
+                    "integer": "int",
+                    "real": "np.float64",
+                    "logical": "bool",
+                    "complex": "np.complex128",
+                    "character": "object",
+                }
+                dtype_expr = ast.parse(dtype_map[kind], mode="eval").body
+                return ast.Call(
+                    func=ast.Attribute(value=ast.Name(id="np", ctx=ast.Load()), attr="asarray", ctx=ast.Load()),
+                    args=[node],
+                    keywords=[ast.keyword(arg="dtype", value=dtype_expr)],
+                )
+
+            def visit_BinOp(self, node: ast.BinOp):
+                self.generic_visit(node)
+                if isinstance(node.op, ast.Div):
+                    if _expr_kind(node.left) == "integer" and _expr_kind(node.right) == "integer":
+                        return ast.Call(
+                            func=ast.Name(id="_xf2p_div", ctx=ast.Load()),
+                            args=[node.left, node.right],
+                            keywords=[],
+                        )
+                return node
+
+        try:
+            tree = ast.parse(s, mode="eval")
+            tree = _ExprFixer().visit(tree)
+            ast.fix_missing_locations(tree)
+            s = ast.unparse(tree)
+        except Exception:
+            pass
         return s
 
     def transpile_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> None:
+        if self._where_masked_assignment(lhs, rhs_py, arrays_1d):
+            return
         lhs = lhs.replace("%", ".")
-        lhs_base = lhs.split(".", 1)[0].strip().lower()
+        mb = re.match(r"\s*([A-Za-z_]\w*)", lhs)
+        lhs_base = mb.group(1).lower() if mb else lhs.split(".", 1)[0].strip().lower()
         if self._decl_types.get(lhs_base) == "integer":
             rhs_py = f"int({rhs_py})"
+        char_len_raw = self._decl_char_len.get(lhs_base)
+        if char_len_raw is not None:
+            clen_py = self.translate_expr(str(char_len_raw), arrays_1d)
+            rhs_py = f"_f_str_assign({rhs_py}, {clen_py})"
         mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
         idx_name = None
         idx = None
@@ -1570,32 +2320,33 @@ class basic_f2p:
                             lo, hi = ptxt.split(":", 1)
                             lo = lo.strip()
                             hi = hi.strip()
-                            lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                            hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                            start = f"(int({lo_py}) - 1)" if lo_py else ""
-                            stop = f"int({hi_py})" if hi_py else ""
-                            idx_parts.append(f"{start}:{stop}")
+                            idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
                         else:
-                            idx_parts.append(f"({self.translate_expr(ptxt, arrays_1d)}) - 1")
+                            idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
                     self.emit(f"{name}[{', '.join(idx_parts)}] = {rhs_py}")
                     return
                 if ":" in idx:
                     lo, hi = idx.split(":", 1)
                     lo = lo.strip()
                     hi = hi.strip()
-                    lo_py = self.translate_expr(lo, arrays_1d) if lo else ""
-                    hi_py = self.translate_expr(hi, arrays_1d) if hi else ""
-                    start = f"(int({lo_py}) - 1)" if lo_py else ""
-                    stop = f"int({hi_py})" if hi_py else ""
-                    self.emit(f"{name}[{start}:{stop}] = {rhs_py}")
+                    self.emit(f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}] = {rhs_py}")
                 else:
-                    idx_py = self.translate_expr(idx, arrays_1d)
-                    self.emit(f"{name}[({idx_py}) - 1] = {rhs_py}")
+                    self.emit(f"{name}[{self._index_expr_from_decl_bounds(name, idx, 0, arrays_1d)}] = {rhs_py}")
                 return
+        # Whole-array assignment or scalar assignment.
+        # POINTER and TARGET entities need in-place updates to preserve aliasing.
         if lhs in arrays_1d:
-            self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
+            if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
+                self.emit(f"{lhs}[...] = {rhs_py}")
+            else:
+                self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
             return
-        self.emit(f"{lhs} = {rhs_py}")
+
+        if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
+            self.emit(f"{lhs}[...] = {rhs_py}")
+            return
+
+        self.emit(f"{lhs} = _xf2p_copy_value({rhs_py})")
 
     def transpile_simple_stmt(self, stmt: str, arrays_1d: set[str]) -> None:
         s = stmt.strip()
@@ -1606,6 +2357,7 @@ class basic_f2p:
             self.emit(f"raise RuntimeError({mm.group(1).strip()})")
             return
         if s.lower() == "return":
+            self._emit_save_sync()
             if self._current_result_name:
                 self.emit(f"return {self._current_result_name}")
             else:
@@ -1646,7 +2398,10 @@ class basic_f2p:
         parameter_names: set[str],
         skip_names: set[str] | None = None,
     ) -> None:
-        # allocate explicit-shape arrays and initialize scalars so python is always valid
+        # Allocate explicit-shape arrays and initialize scalars so Python is always valid.
+        # Special handling:
+        #   * POINTER entities start disassociated (None) unless initialized with => target.
+        #   * TARGET scalars are represented as 0-d numpy arrays so pointers can alias them.
         if skip_names is None:
             skip_names = set()
         for name, info in sym.items():
@@ -1654,50 +2409,447 @@ class basic_f2p:
                 continue
             if name in skip_names:
                 continue
+
             ftype = info["ftype"]
             ftype_name = info.get("type_name")
-            is_array = info["is_array"]
-            shape = info["shape"]
-            init = info["init"]
-            alloc = info["alloc"]
+            is_array = bool(info.get("is_array"))
+            shape = info.get("shape")
+            init = info.get("init")
+            alloc = bool(info.get("alloc"))
+            attrs_l = str(info.get("attrs_l", ""))
+            is_ptr = bool(info.get("pointer")) or ("pointer" in attrs_l)
+            is_tgt = bool(info.get("target")) or ("target" in attrs_l)
 
+            # Arrays
             if is_array:
-                # only allocate explicit-shape, non-allocatable arrays
+                # Pointer arrays: start disassociated (None) unless explicitly initialized.
+                if is_ptr:
+                    if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
+                        self.emit(f"{name} = None")
+                    else:
+                        init_py = self.translate_expr(str(init), arrays_1d)
+                        self.emit(f"{name} = {init_py}")
+                    continue
+
+                # Allocatable arrays start unallocated.
                 if alloc:
                     self.emit(f"{name} = None")
                     continue
+
+                # Only allocate explicit-shape, non-allocatable arrays here.
                 if shape is None:
                     continue
-                if shape.strip() == ":":
+                if str(shape).strip() == ":":
                     continue
+
+                shape_py = self._shape_to_py(str(shape), arrays_1d)
                 if ftype == "type":
-                    shape_py = self._shape_to_py(shape, arrays_1d)
                     self.emit(f"{name} = np.empty({shape_py}, dtype=object)")
                     continue
+
                 dtype = _type_dtype[ftype]
-                shape_py = self._shape_to_py(shape, arrays_1d)
                 hint = _type_ndarray_hint[ftype]
                 if init is None:
                     self.emit(f"{name}: {hint} = np.empty({shape_py}, dtype={dtype})")
                 else:
-                    init_py = self.translate_expr(init, arrays_1d)
+                    init_py = self.translate_expr(str(init), arrays_1d)
+                    if ftype == "character" and info.get("char_len") is not None:
+                        clen_py = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                        init_py = f"_f_str_assign({init_py}, {clen_py})"
                     self.emit(f"{name}: {hint} = np.full({shape_py}, {init_py}, dtype={dtype})")
-            else:
-                # scalar
-                if ftype == "type":
-                    cls = ftype_name if ftype_name else "SimpleNamespace"
+                continue
+
+            # Scalars
+            if ftype == "type":
+                # Derived-type scalars.
+                cls = ftype_name if ftype_name else "SimpleNamespace"
+                if is_ptr:
+                    # Pointer-to-derived-type starts disassociated.
+                    self.emit(f"{name} = None")
+                else:
                     self.emit(f"{name} = {cls}()")
-                    continue
-                hint = _type_scalar_hint.get(ftype, "int")
+                continue
+
+            # Pointer scalars start disassociated unless explicitly initialized.
+            if is_ptr:
+                if init is None or re.match(r"^null\s*\(\s*\)\s*$", str(init), re.I):
+                    self.emit(f"{name} = None")
+                else:
+                    init_py = self.translate_expr(str(init), arrays_1d)
+                    self.emit(f"{name} = {init_py}")
+                continue
+
+            # Target scalars are stored as 0-d numpy arrays for aliasing.
+            if is_tgt and ftype in _type_dtype and ftype != "character":
+                dtype = _type_dtype[ftype]
+                hint = _type_target_scalar_hint.get(ftype, "np.ndarray")
                 if init is None:
                     default_val = _type_default_scalar_value.get(ftype, "0")
-                    self.emit(f"{name}: {hint} = {default_val}")
+                    self.emit(f"{name}: {hint} = np.array({default_val}, dtype={dtype})")
                 else:
-                    init_py = self.translate_expr(init, arrays_1d)
-                    self.emit(f"{name}: {hint} = {init_py}")
+                    init_py = self.translate_expr(str(init), arrays_1d)
+                    self.emit(f"{name}: {hint} = np.array({init_py}, dtype={dtype})")
+                continue
+
+            # Regular (non-target) scalars.
+            hint = _type_scalar_hint.get(ftype, "int")
+            if init is None:
+                default_val = _type_default_scalar_value.get(ftype, "0")
+                if ftype == "character" and info.get("char_len") is not None:
+                    clen_py = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                    default_val = f"_f_str_assign({default_val}, {clen_py})"
+                self.emit(f"{name}: {hint} = {default_val}")
+            else:
+                init_py = self.translate_expr(str(init), arrays_1d)
+                if ftype == "character" and info.get("char_len") is not None:
+                    clen_py = self.translate_expr(str(info.get("char_len")), arrays_1d)
+                    init_py = f"_f_str_assign({init_py}, {clen_py})"
+                self.emit(f"{name}: {hint} = {init_py}")
+
+    def _xf2p_select_case_cond(self, select_expr_py: str, raw_case_list: str, arrays_1d: set[str]) -> str:
+        conds: list[str] = []
+        for item in split_args(raw_case_list):
+            tok = item.strip()
+            if not tok:
+                continue
+            if ":" in tok:
+                lo, hi = tok.split(":", 1)
+                lo = lo.strip()
+                hi = hi.strip()
+                parts: list[str] = []
+                if lo:
+                    lo_py = self.translate_expr(lo, arrays_1d)
+                    parts.append(f"({select_expr_py}) >= ({lo_py})")
+                if hi:
+                    hi_py = self.translate_expr(hi, arrays_1d)
+                    parts.append(f"({select_expr_py}) <= ({hi_py})")
+                conds.append(" and ".join(parts) if parts else "True")
+            else:
+                tok_py = self.translate_expr(tok, arrays_1d)
+                conds.append(f"({select_expr_py}) == ({tok_py})")
+        if not conds:
+            return "False"
+        return " or ".join(f"({c})" for c in conds)
+
+    def _xf2p_select_case_start(self, head: str, arrays_1d: set[str], inline_stmt: str | None = None) -> None:
+        if not self._select_case_stack:
+            return
+        st = self._select_case_stack[-1]
+        if st.get("in_case", False):
+            start = int(st.get("case_start", self._code_emit_count))
+            if self._code_emit_count == start:
+                self.emit("pass")
+            self.indent = max(0, self.indent - 1)
+        if head == "default":
+            kw = "else"
+            line = f"{kw}:"
+        else:
+            cond = self._xf2p_select_case_cond(str(st["expr"]), head, arrays_1d)
+            kw = "if" if not st.get("had_case", False) else "elif"
+            line = f"{kw} {cond}:"
+        self.emit(line)
+        self.indent += 1
+        st["had_case"] = True
+        st["in_case"] = True
+        st["case_start"] = self._code_emit_count
+        if inline_stmt and inline_stmt.strip():
+            self.transpile_simple_stmt(inline_stmt.strip(), arrays_1d)
+
+
+    def _associate_bindings(self, raw: str) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for item in split_args(raw):
+            part = item.strip()
+            if not part:
+                continue
+            if "=>" not in part:
+                continue
+            name, selector = part.split("=>", 1)
+            name = name.strip()
+            selector = selector.strip()
+            if name:
+                out.append((name, selector))
+        return out
+
+    def _associate_array_element_ref(self, selector: str, arrays_1d: set[str]) -> str | None:
+        mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*\((.*)\)\s*$", selector, re.I)
+        if not mm:
+            return None
+        name_raw = mm.group(1).strip()
+        idx_raw = mm.group(2).strip()
+        root = name_raw.split("%", 1)[0].lower()
+        if root not in arrays_1d:
+            return None
+        if "," in idx_raw or ":" in idx_raw:
+            return None
+        name_py = name_raw.replace("%", ".")
+        idx_py = self.translate_expr(idx_raw, arrays_1d)
+        return f"{name_py}[(({idx_py}) - 1):((({idx_py}) - 1) + 1)].reshape(())"
+
+    def _associate_alias_metadata(self, selector: str, arrays_1d: set[str]) -> tuple[bool, bool, str | None]:
+        sel = selector.strip()
+        mm_name = re.fullmatch(r"[a-z_]\w*(?:%[a-z_]\w*)*", sel, re.I)
+        if mm_name:
+            root = sel.split("%", 1)[0].lower()
+            is_array = root in arrays_1d
+            return True, is_array, root
+        mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*\((.*)\)\s*$", sel, re.I)
+        if mm:
+            root = mm.group(1).split("%", 1)[0].lower()
+            if root not in arrays_1d:
+                return False, False, None
+            idx = mm.group(2).strip()
+            is_array = (":" in idx) or ("," in idx)
+            return True, is_array, root
+        return False, False, None
+
+    def _start_associate_block(self, raw: str, arrays_1d: set[str]) -> None:
+        self.emit("if True:")
+        self.indent += 1
+        frame: dict[str, object] = {
+            "added_decl_pointer": set(),
+            "added_decl_types": {},
+            "added_decl_array_types": {},
+            "added_arrays_1d": set(),
+            "code_start": self._code_emit_count,
+        }
+        for assoc_name, selector in self._associate_bindings(raw):
+            assoc_l = assoc_name.lower()
+            can_alias, is_array_alias, root = self._associate_alias_metadata(selector, arrays_1d)
+            if can_alias:
+                if is_array_alias:
+                    rhs_py = self.translate_expr(selector, arrays_1d)
+                else:
+                    rhs_py = self._associate_array_element_ref(selector, arrays_1d)
+                    if rhs_py is None:
+                        selector_py = self.translate_expr(selector, arrays_1d)
+                        if re.fullmatch(r"[a-z_]\w*", selector.strip(), re.I):
+                            self.emit(f"if not isinstance({selector_py}, np.ndarray):")
+                            self.indent += 1
+                            self.emit(f"{selector_py} = np.asarray({selector_py})")
+                            self.indent -= 1
+                        rhs_py = selector_py
+                self.emit(f"{assoc_name} = {rhs_py}")
+                self._decl_pointer.add(assoc_l)
+                cast(set[str], frame["added_decl_pointer"]).add(assoc_l)
+                if is_array_alias:
+                    base_type = self._decl_array_types.get(root or "", self._decl_types.get(root or "", "real"))
+                    self._decl_array_types[assoc_l] = base_type
+                    cast(dict[str, str], frame["added_decl_array_types"])[assoc_l] = base_type
+                    arrays_1d.add(assoc_l)
+                    cast(set[str], frame["added_arrays_1d"]).add(assoc_l)
+                else:
+                    base_type = self._decl_types.get(root or "", "real")
+                    self._decl_types[assoc_l] = base_type
+                    cast(dict[str, str], frame["added_decl_types"])[assoc_l] = base_type
+            else:
+                rhs_py = self.translate_expr(selector, arrays_1d)
+                self.emit(f"{assoc_name} = _xf2p_copy_value({rhs_py})")
+                if assoc_l in arrays_1d:
+                    cast(set[str], frame["added_arrays_1d"]).add(assoc_l)
+        self._associate_stack.append(frame)
+
+    def _end_associate_block(self, arrays_1d: set[str]) -> None:
+        if not self._associate_stack:
+            return
+        frame = self._associate_stack.pop()
+        for name in cast(set[str], frame.get("added_decl_pointer", set())):
+            self._decl_pointer.discard(name)
+        for name in cast(dict[str, str], frame.get("added_decl_types", {})).keys():
+            self._decl_types.pop(name, None)
+        for name in cast(dict[str, str], frame.get("added_decl_array_types", {})).keys():
+            self._decl_array_types.pop(name, None)
+        for name in cast(set[str], frame.get("added_arrays_1d", set())):
+            arrays_1d.discard(name)
+        start = int(frame.get("code_start", self._code_emit_count))
+        if self._code_emit_count == start:
+            self.emit("pass")
+        self.indent = max(0, self.indent - 1)
+
+    def _where_parent_mask_expr(self) -> str | None:
+        if len(self._where_stack) <= 1:
+            return None
+        parts = [frame["active"] for frame in self._where_stack[:-1]]
+        if not parts:
+            return None
+        return " & ".join(f"({p})" for p in parts)
+
+    def _where_current_mask_expr(self) -> str | None:
+        if not self._where_stack:
+            return None
+        parts = [frame["active"] for frame in self._where_stack]
+        return " & ".join(f"({p})" for p in parts)
+
+    def _start_where_block(self, cond_raw: str, arrays_1d: set[str]) -> None:
+        cond_py = self.translate_expr(cond_raw, arrays_1d)
+        tag = f"{len(self._where_stack) + 1}_{self._code_emit_count + 1}"
+        active_name = f"_xf2p_where_mask_{tag}"
+        matched_name = f"_xf2p_where_matched_{tag}"
+        outer = self._where_current_mask_expr()
+        if outer is None:
+            active_expr = f"np.asarray({cond_py}, dtype=bool)"
+        else:
+            active_expr = f"(np.asarray({outer}, dtype=bool) & np.asarray({cond_py}, dtype=bool))"
+        self.emit(f"{active_name} = np.asarray({active_expr}, dtype=bool)")
+        self.emit(f"{matched_name} = np.array({active_name}, copy=True)")
+        self._where_stack.append({"active": active_name, "matched": matched_name})
+
+    def _where_elsewhere(self, cond_raw: str | None, arrays_1d: set[str]) -> None:
+        if not self._where_stack:
+            return
+        frame = self._where_stack[-1]
+        active_name = frame["active"]
+        matched_name = frame["matched"]
+        parent = self._where_parent_mask_expr()
+        if cond_raw is None:
+            base_expr = f"np.ones_like({matched_name}, dtype=bool)"
+        else:
+            cond_py = self.translate_expr(cond_raw, arrays_1d)
+            base_expr = f"np.asarray({cond_py}, dtype=bool)"
+        if parent is not None:
+            base_expr = f"(np.asarray({parent}, dtype=bool) & ({base_expr}))"
+        self.emit(f"{active_name} = np.asarray(({base_expr}) & (~{matched_name}), dtype=bool)")
+        self.emit(f"{matched_name} = np.asarray({matched_name} | {active_name}, dtype=bool)")
+
+    def _end_where_block(self) -> None:
+        if self._where_stack:
+            self._where_stack.pop()
+
+    def _where_masked_assignment(self, lhs: str, rhs_py: str, arrays_1d: set[str]) -> bool:
+        mask_expr = self._where_current_mask_expr()
+        if mask_expr is None:
+            return False
+        lhs = lhs.replace("%", ".")
+        lhs_base = lhs.split(".", 1)[0].strip().lower()
+        if self._decl_types.get(lhs_base) == "integer":
+            rhs_py = f"int({rhs_py})"
+        mname = re.match(r"^\s*([a-z_]\w*(?:\.[a-z_]\w*)*)\s*\(", lhs, re.I)
+        idx_name = None
+        idx = None
+        if mname:
+            name_try = mname.group(1)
+            open_pos = lhs.find("(", mname.end(1))
+            if open_pos >= 0:
+                close_pos = find_matching_paren(lhs, open_pos)
+                if close_pos == len(lhs) - 1:
+                    idx_name = name_try
+                    idx = lhs[open_pos + 1 : close_pos].strip()
+        if idx_name is not None and idx is not None and (":" in idx or "," in idx):
+            name = idx_name
+            if "," in idx:
+                parts = [p.strip() for p in split_args(idx)]
+                idx_parts: list[str] = []
+                for ptxt in parts:
+                    if ptxt == ":":
+                        idx_parts.append(":")
+                    elif ":" in ptxt:
+                        lo, hi = ptxt.split(":", 1)
+                        lo = lo.strip()
+                        hi = hi.strip()
+                        idx_parts.append(self._slice_expr_from_decl_bounds(name, lo, hi, len(idx_parts), arrays_1d))
+                    else:
+                        idx_parts.append(self._index_expr_from_decl_bounds(name, ptxt, len(idx_parts), arrays_1d))
+                target = f"{name}[{', '.join(idx_parts)}]"
+            else:
+                lo, hi = idx.split(":", 1)
+                lo = lo.strip()
+                hi = hi.strip()
+                target = f"{name}[{self._slice_expr_from_decl_bounds(name, lo, hi, 0, arrays_1d)}]"
+            self.emit(f"{target} = np.where({mask_expr}, {rhs_py}, {target})")
+            return True
+        is_array_target = (lhs in arrays_1d) or (lhs_base in self._decl_array_types)
+        if is_array_target:
+            if re.fullmatch(r"[A-Za-z_]\w*", lhs) and (lhs.lower() in self._decl_pointer or lhs.lower() in self._decl_target):
+                self.emit(f"{lhs}[...] = np.where({mask_expr}, {rhs_py}, {lhs})")
+            else:
+                self.emit(f"{lhs} = _f_assign_array({lhs}, np.where({mask_expr}, {rhs_py}, {lhs}))")
+            return True
+        return False
+
+    def _parse_forall_header(self, raw: str, arrays_1d: set[str]) -> tuple[list[tuple[str, str, str, str | None]], str | None]:
+        loops: list[tuple[str, str, str, str | None]] = []
+        mask_raw: str | None = None
+        for part in split_args(raw):
+            part = part.strip()
+            if not part:
+                continue
+            mm = re.match(r"^([a-z_]\w*)\s*=\s*(.+)$", part, re.I)
+            if mm:
+                var = mm.group(1)
+                rhs = mm.group(2).strip()
+                trip = [p.strip() for p in split_top_level(rhs, ':')]
+                if len(trip) in (2, 3) and trip[0] != '' and trip[1] != '':
+                    lo_py = self.translate_expr(trip[0], arrays_1d)
+                    hi_py = self.translate_expr(trip[1], arrays_1d)
+                    step_py = self.translate_expr(trip[2], arrays_1d) if len(trip) == 3 and trip[2] != '' else None
+                    loops.append((var, lo_py, hi_py, step_py))
+                    continue
+            if mask_raw is None:
+                mask_raw = part
+            else:
+                mask_raw = mask_raw + ', ' + part
+        mask_py = self.translate_expr(mask_raw, arrays_1d) if mask_raw is not None else None
+        return loops, mask_py
+
+    def _emit_forall_block_start(self, header_raw: str, arrays_1d: set[str]) -> int:
+        loops, mask_py = self._parse_forall_header(header_raw, arrays_1d)
+        levels = 0
+        for var, lo_py, hi_py, step_py in loops:
+            if step_py is None:
+                self.emit(f"for {var} in range({lo_py}, ({hi_py}) + 1):")
+            else:
+                self.emit(f"for {var} in range({lo_py}, ({hi_py}) + (1 if ({step_py}) > 0 else -1), {step_py}):")
+            self.indent += 1
+            self._block_code_start.append(self._code_emit_count)
+            levels += 1
+        if mask_py is not None:
+            self.emit(f"if {mask_py}:")
+            self.indent += 1
+            self._block_code_start.append(self._code_emit_count)
+            levels += 1
+        return levels
+
+    def _emit_forall_block_end(self, levels: int) -> None:
+        for _ in range(levels):
+            if self._block_code_start:
+                start = self._block_code_start.pop()
+                if self._code_emit_count == start:
+                    self.emit("pass")
+            self.indent = max(0, self.indent - 1)
 
     def handle_exec_line(self, s: str, arrays_1d: set[str]) -> bool:
         sl = s.lower()
+
+        pwhere = None
+        if sl.startswith("where"):
+            p0 = s.lower().find("where") + len("where")
+            while p0 < len(s) and s[p0].isspace():
+                p0 += 1
+            if p0 < len(s) and s[p0] == "(":
+                p1 = find_matching_paren(s, p0)
+                if p1 != -1:
+                    pwhere = (p0, p1)
+
+        pforall = None
+        if sl.startswith("forall"):
+            p0 = s.lower().find("forall") + len("forall")
+            while p0 < len(s) and s[p0].isspace():
+                p0 += 1
+            if p0 < len(s) and s[p0] == "(":
+                p1 = find_matching_paren(s, p0)
+                if p1 != -1:
+                    pforall = (p0, p1)
+
+        pdo_concurrent = None
+        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+concurrent", s, re.I)
+        if mm:
+            p0 = mm.end()
+            while p0 < len(s) and s[p0].isspace():
+                p0 += 1
+            if p0 < len(s) and s[p0] == "(":
+                p1 = find_matching_paren(s, p0)
+                if p1 != -1:
+                    pdo_concurrent = (p0, p1)
 
         # ignore some non-exec lines
         if sl in ("implicit none", "contains"):
@@ -1707,6 +2859,98 @@ class basic_f2p:
         if sl.startswith("end function") or sl.startswith("end program") or sl.startswith("end module"):
             return True
         if sl == "end":
+            return True
+
+        mm = re.match(r"associate\s*\(\s*(.*)\s*\)\s*(?:;\s*(.*))?$", s, re.I)
+        if mm:
+            self._start_associate_block(mm.group(1), arrays_1d)
+            inline_stmt = (mm.group(2) or "").strip()
+            if inline_stmt:
+                self.transpile_simple_stmt(inline_stmt, arrays_1d)
+            return True
+
+        if re.match(r"end\s+associate", s, re.I):
+            self._end_associate_block(arrays_1d)
+            return True
+
+        if re.match(r"end\s+where", s, re.I):
+            self._end_where_block()
+            return True
+
+        mm = re.match(r"elsewhere\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            self._where_elsewhere(mm.group(1), arrays_1d)
+            return True
+
+        if re.match(r"elsewhere\s*$", s, re.I):
+            self._where_elsewhere(None, arrays_1d)
+            return True
+
+        if pwhere is not None:
+            p0, p1 = pwhere
+            cond_raw = s[p0 + 1 : p1].strip()
+            tail = s[p1 + 1 :].strip()
+            if tail:
+                self._start_where_block(cond_raw, arrays_1d)
+                self.transpile_simple_stmt(tail, arrays_1d)
+                self._end_where_block()
+            else:
+                self._start_where_block(cond_raw, arrays_1d)
+            return True
+
+        if re.match(r"end\s+forall", s, re.I):
+            levels = self._forall_stack.pop() if self._forall_stack else 0
+            self._emit_forall_block_end(levels)
+            return True
+
+        if pforall is not None:
+            p0, p1 = pforall
+            header_raw = s[p0 + 1 : p1].strip()
+            tail = s[p1 + 1 :].strip()
+            levels = self._emit_forall_block_start(header_raw, arrays_1d)
+            if tail:
+                self.transpile_simple_stmt(tail, arrays_1d)
+                self._emit_forall_block_end(levels)
+            else:
+                self._forall_stack.append(levels)
+            return True
+
+        if pdo_concurrent is not None:
+            p0, p1 = pdo_concurrent
+            header_raw = s[p0 + 1 : p1].strip()
+            tail = s[p1 + 1 :].strip()
+            levels = self._emit_forall_block_start(header_raw, arrays_1d)
+            if tail:
+                self.transpile_simple_stmt(tail, arrays_1d)
+                self._emit_forall_block_end(levels)
+            else:
+                self._do_stack.append(levels)
+            return True
+
+        mm = re.match(r"select\s+case\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            expr = self.translate_expr(mm.group(1), arrays_1d)
+            self._select_case_stack.append({"expr": expr, "had_case": False, "in_case": False, "case_start": self._code_emit_count})
+            return True
+
+        mm = re.match(r"case\s+default\s*(?:;\s*(.*))?$", s, re.I)
+        if mm and self._select_case_stack:
+            self._xf2p_select_case_start("default", arrays_1d, mm.group(1))
+            return True
+
+        mm = re.match(r"case\s*\(\s*(.*?)\s*\)\s*(?:;\s*(.*))?$", s, re.I)
+        if mm and self._select_case_stack:
+            self._xf2p_select_case_start(mm.group(1), arrays_1d, mm.group(2))
+            return True
+
+        if sl.startswith("end select"):
+            if self._select_case_stack:
+                st = self._select_case_stack.pop()
+                if st.get("in_case", False):
+                    start = int(st.get("case_start", self._code_emit_count))
+                    if self._code_emit_count == start:
+                        self.emit("pass")
+                    self.indent = max(0, self.indent - 1)
             return True
 
         # if (...) then
@@ -1740,32 +2984,67 @@ class basic_f2p:
             self.indent = max(0, self.indent - 1)
             return True
 
-        # do while (...)
-        mm = re.match(r"do\s+while\s*\(\s*(.+)\s*\)$", s, re.I)
+        # [label:] do while (...)
+        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+while\s*\(\s*(.+)\s*\)$", s, re.I)
         if mm:
             cond = self.translate_expr(mm.group(1), arrays_1d)
             self.emit(f"while {cond}:")
             self.indent += 1
             self._block_code_start.append(self._code_emit_count)
+            self._do_stack.append(1)
             return True
 
-        # do i = a, b
-        mm = re.match(r"do\s+([a-z_]\w*)\s*=\s*(.+?)\s*,\s*(.+)$", s, re.I)
+        # [label:] do i = a, b[, step]
+        mm = re.match(r"(?:[a-z_]\w*\s*:\s*)?do\s+([a-z_]\w*)\s*=\s*(.+)$", s, re.I)
         if mm:
             var = mm.group(1)
-            a = self.translate_expr(mm.group(2), arrays_1d)
-            b = self.translate_expr(mm.group(3), arrays_1d)
-            self.emit(f"for {var} in range({a}, ({b}) + 1):")
-            self.indent += 1
-            self._block_code_start.append(self._code_emit_count)
-            return True
+            rhs = mm.group(2).strip()
+            parts = split_args(rhs)
+            if len(parts) in (2, 3):
+                a = self.translate_expr(parts[0], arrays_1d)
+                b = self.translate_expr(parts[1], arrays_1d)
+                self._loop_counter += 1
+                loop_id = self._loop_counter
+                lo_tmp = f"_xf2p_do_lo_{loop_id}"
+                hi_tmp = f"_xf2p_do_hi_{loop_id}"
+                step_tmp = f"_xf2p_do_step_{loop_id}"
+                stop_tmp = f"_xf2p_do_stop_{loop_id}"
+                self.emit(f"{lo_tmp} = {a}")
+                self.emit(f"{hi_tmp} = {b}")
+                if len(parts) == 2:
+                    self.emit(f"{step_tmp} = 1")
+                else:
+                    step_py = self.translate_expr(parts[2], arrays_1d)
+                    self.emit(f"{step_tmp} = {step_py}")
+                self.emit(f"{stop_tmp} = {hi_tmp} + (1 if {step_tmp} > 0 else -1)")
+                self.emit(f"for {var} in range({lo_tmp}, {stop_tmp}, {step_tmp}):")
+                self.indent += 1
+                self._block_code_start.append(self._code_emit_count)
+                self._do_stack.append({"kind": "fortran_do", "levels": 1, "post_assign": f"{var} = {hi_tmp} + {step_tmp}"})
+                return True
 
-        if sl.startswith("end do"):
-            if self._block_code_start:
-                start = self._block_code_start.pop()
-                if self._code_emit_count == start:
-                    self.emit("pass")
-            self.indent = max(0, self.indent - 1)
+        if re.match(r"end\s+do(?:\s+[a-z_]\w*)?$", s, re.I):
+            entry = self._do_stack.pop() if self._do_stack else 1
+            if isinstance(entry, dict) and entry.get("kind") == "fortran_do":
+                if self._block_code_start:
+                    start = self._block_code_start.pop()
+                    if self._code_emit_count == start:
+                        self.emit("pass")
+                self.indent = max(0, self.indent - 1)
+                post_assign = str(entry.get("post_assign", ""))
+                if post_assign:
+                    self.emit("else:")
+                    self.indent += 1
+                    self.emit(post_assign)
+                    self.indent = max(0, self.indent - 1)
+                return True
+            levels = int(entry.get("levels", 1)) if isinstance(entry, dict) else int(entry)
+            for _ in range(levels):
+                if self._block_code_start:
+                    start = self._block_code_start.pop()
+                    if self._code_emit_count == start:
+                        self.emit("pass")
+                self.indent = max(0, self.indent - 1)
             return True
 
         # allocate(a(n))
@@ -1883,16 +3162,62 @@ class basic_f2p:
                             mk = re.match(r"^\s*([a-z_]\w*)\s*=\s*(.+?)\s*$", p, re.I)
                             if mk:
                                 kws[mk.group(1).lower()] = mk.group(2).strip()
+                        unit_raw = parts[0].strip()
+                        unit_base_m = re.match(r"([a-z_]\w*)", unit_raw, re.I)
+                        unit_base = unit_base_m.group(1).lower() if unit_base_m else ""
+                        internal_char_source = (
+                            self._decl_types.get(unit_base) == "character"
+                            or self._decl_array_types.get(unit_base) == "character"
+                        )
+                        unit_py = self.translate_expr(unit_raw, arrays_1d)
+                        if fmt == "*" and internal_char_source and rest:
+                            ios_var = kws.get("iostat")
+                            items = [a.strip() for a in split_args(rest) if a.strip()]
+                            self.emit(f"__xf2p_read_parts = str({unit_py}).split()")
+                            self.emit("try:")
+                            self.indent += 1
+                            for i, tgt in enumerate(items):
+                                lhs = self.translate_expr(tgt, arrays_1d)
+                                base = re.match(r"^([a-z_]\w*)", tgt, re.I)
+                                bnm = base.group(1).lower() if base else ""
+                                ftype = self._decl_types.get(bnm, self._decl_array_types.get(bnm, ""))
+                                if ftype == "integer":
+                                    rhs = f"int(__xf2p_read_parts[{i}])"
+                                elif ftype == "logical":
+                                    rhs = f"(str(__xf2p_read_parts[{i}]).strip().lower() in ('t', 'true', '.true.'))"
+                                elif ftype == "character":
+                                    rhs = f"_f_str_assign(str(__xf2p_read_parts[{i}]), _f_len({lhs}))"
+                                else:
+                                    rhs = f"float(__xf2p_read_parts[{i}])"
+                                self.emit(f"{lhs} = {rhs}")
+                            if ios_var is not None:
+                                self.emit(f"{ios_var} = 0")
+                            self.indent -= 1
+                            self.emit("except Exception:")
+                            self.indent += 1
+                            if ios_var is not None:
+                                self.emit(f"{ios_var} = 1")
+                            else:
+                                self.emit("raise")
+                            self.indent -= 1
+                            return True
                         if fmt != "*":
                             fmt_txt = _fortran_unquote(fmt).strip().lower() if (len(fmt) >= 2 and fmt[0] in ("'", '"') and fmt[-1] == fmt[0]) else ""
                             if fmt_txt in {"(a)", "a"} and rest:
                                 ios_var = kws.get("iostat")
                                 lhs = self.translate_expr(rest, arrays_1d)
+                                if internal_char_source:
+                                    self.emit(f"__xf2p_line = str({unit_py})")
+                                    if ios_var is not None:
+                                        self.emit(f"{ios_var} = 0")
+                                    self.emit(f"{lhs} = __xf2p_line.rstrip('\\n')")
+                                    return True
                                 self.emit(f"__xf2p_line = {unit}.readline()")
                                 if ios_var is not None:
                                     self.emit(f"{ios_var} = 0 if __xf2p_line != '' else -1")
                                 self.emit(f"{lhs} = __xf2p_line.rstrip('\\n')")
                                 return True
+
         # read(fp,*) a, b, arr(i,:), ...
         mm = re.match(r"read\s*\(\s*([a-z_]\w*)\s*,\s*\*\s*\)\s*(.+)$", s, re.I)
         if mm:
@@ -1909,7 +3234,7 @@ class basic_f2p:
                     ftype = self._decl_array_types.get(arr.lower(), "")
                     cast = "int" if ftype == "integer" else "float"
                     self.emit(f"__read_vals = [{cast}(v) for v in {unit}.readline().split()]")
-                    self.emit(f"{arr}[({ridx}) - 1, :] = np.asarray(__read_vals[:{arr}.shape[1]], dtype={arr}.dtype)")
+                    self.emit(f"{arr}[{self._index_expr_from_decl_bounds(arr, mrow.group(2), 0, arrays_1d)}, :] = np.asarray(__read_vals[:{arr}.shape[1]], dtype={arr}.dtype)")
                     return True
                 # scalar target
                 lhs = self.translate_expr(tgt, arrays_1d)
@@ -1986,13 +3311,52 @@ class basic_f2p:
             else:
                 self.emit("return")
             return True
-        if sl == "exit":
+        if re.match(r"^exit(?:\s+[a-z_]\w*)?$", s, re.I):
             self.emit("break")
+            return True
+        if re.match(r"^cycle(?:\s+[a-z_]\w*)?$", s, re.I):
+            self.emit("continue")
             return True
         mm = re.match(r"(?:error\s+)?stop(?:\s+(.+))?$", s, re.I)
         if mm:
             msg = (mm.group(1) or '"stop"').strip()
             self.emit(f"raise RuntimeError({msg})")
+            return True
+
+        # pointer association: p => target_expr
+        mm = re.match(r"^([a-z_]\w*(?:%[a-z_]\w*)*)\s*=>\s*(.+)$", s, re.I)
+        if mm:
+            lhs = mm.group(1).replace("%", ".")
+            rhs_raw = mm.group(2).strip()
+            if re.match(r"^null\s*\(\s*\)\s*$", rhs_raw, re.I):
+                self.emit(f"{lhs} = None")
+            else:
+                rhs_py = self.translate_expr(rhs_raw, arrays_1d)
+                self.emit(f"{lhs} = {rhs_py}")
+            return True
+
+        # nullify(p1, p2, ...)
+        mm = re.match(r"nullify\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            for a in split_args(mm.group(1)):
+                nm = a.strip().replace("%", ".")
+                if nm:
+                    self.emit(f"{nm} = None")
+            return True
+
+        # deallocate(p) / deallocate(a) -- model as None
+        mm = re.match(r"deallocate\s*\(\s*(.+)\s*\)\s*$", s, re.I)
+        if mm:
+            for a in split_args(mm.group(1)):
+                nm = a.strip().replace("%", ".")
+                if nm:
+                    self.emit(f"{nm} = None")
+            return True
+
+        # print *
+        mm = re.match(r"print\s*\*\s*$", s, re.I)
+        if mm:
+            self.emit("print()")
             return True
 
         # print *, ...
@@ -2003,22 +3367,22 @@ class basic_f2p:
                 a0 = raw_args[0].strip()
                 implied_py = _fortran_implied_do_expr(a0, self.translate_expr, arrays_1d)
                 if implied_py is not None:
-                    self.emit(f"print(*{implied_py})")
+                    self.emit(f"_xf2p_print_star(*{implied_py})")
                     return True
                 if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
-                    self.emit(f"print(*np.ravel({a0}, order='F'))")
+                    self.emit(f"_xf2p_print_star(*np.ravel({a0}, order='F'))")
                     return True
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", '"')):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
-            self.emit(f"print({', '.join(args2)})")
+                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+            self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
         # print "fmt", ...
@@ -2028,7 +3392,7 @@ class basic_f2p:
             raw_args = [a.strip() for a in split_args(mm.group(3))]
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2062,7 +3426,133 @@ class basic_f2p:
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr})")
             else:
-                self.emit(f"print({', '.join(args2)})")
+                self.emit(f"_xf2p_print_star({', '.join(args2)})")
+            return True
+
+        # robust write(...) parser
+        if re.match(r"write\b", s, re.I):
+            mkw = re.match(r"write\b", s, re.I)
+            j = mkw.end()
+            while j < len(s) and s[j].isspace():
+                j += 1
+            if j < len(s) and s[j] == "(":
+                p1 = find_matching_paren(s, j)
+                if p1 != -1:
+                    ctl = s[j + 1 : p1].strip()
+                    rest = s[p1 + 1 :].strip()
+                    ctl_parts = [p.strip() for p in split_args(ctl)]
+                    unit_raw = ctl_parts[0] if ctl_parts else "*"
+                    fmt_raw = ctl_parts[1] if len(ctl_parts) >= 2 else "*"
+                    advance_no = any(re.match(r"(?is)^advance\s*=\s*['\"]no['\"]$", p) for p in ctl_parts[2:])
+                    unit_base_m = re.match(r"([a-z_]\w*)", unit_raw, re.I)
+                    unit_base = unit_base_m.group(1).lower() if unit_base_m else ""
+                    internal_char_target = unit_raw != "*" and (
+                        self._decl_types.get(unit_base) == "character"
+                        or self._decl_array_types.get(unit_base) == "character"
+                    )
+
+                    raw_args = [a.strip() for a in split_args(rest)] if rest else []
+
+                    def _star_args(raw_list):
+                        out = []
+                        for a in raw_list:
+                            if _is_fortran_string_literal(a):
+                                out.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    out.append(f"*{implied_py}")
+                                else:
+                                    out.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                        return out
+
+                    def _fmt_args(raw_list):
+                        out = []
+                        for a in raw_list:
+                            if _is_fortran_string_literal(a):
+                                out.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    out.append(implied_py)
+                                else:
+                                    out.append(self.translate_expr(a, arrays_1d))
+                        return out
+
+                    if fmt_raw == "*":
+                        args_star = _star_args(raw_args)
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                            rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if not args_star:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                        else:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    if _is_fortran_string_literal(fmt_raw):
+                        args_fmt = _fmt_args(raw_args)
+                        fmt_expr = None
+                        if len(raw_args) == 1:
+                            a0 = raw_args[0].strip()
+                            if _is_recyclable_io_iterable(a0, self._decl_array_types):
+                                fmt_expr = _fortran_format_recycled_expr(fmt_raw, args_fmt[0])
+                        if fmt_expr is None and len(raw_args) > 1:
+                            plan = _single_iterable_formatted_arg_plan(fmt_raw, raw_args, self._decl_array_types)
+                            if plan is not None:
+                                iter_pos, iter_need = plan
+                                iter_raw = raw_args[iter_pos].strip()
+                                iter_tmp = f"_xf2p_fmt_items_{self._code_emit_count + 1}"
+                                if re.fullmatch(r"[a-z_]\w*", iter_raw, flags=re.I) and iter_raw.lower() in self._decl_array_types:
+                                    self.emit(f"{iter_tmp} = list(np.ravel({args_fmt[iter_pos]}, order='F'))")
+                                else:
+                                    self.emit(f"{iter_tmp} = list({args_fmt[iter_pos]})")
+                                expanded_args = args_fmt[:iter_pos] + [f"{iter_tmp}[{k}]" for k in range(iter_need)] + args_fmt[iter_pos + 1:]
+                                fmt_expr = _fortran_format_expr(fmt_raw, expanded_args)
+                        if fmt_expr is None:
+                            fmt_expr = _fortran_format_expr(fmt_raw, args_fmt)
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs_core = fmt_expr if fmt_expr is not None else ("''" if not raw_args else f"_xf2p_star_text({', '.join(_star_args(raw_args))})")
+                            rhs = f"_f_str_assign({rhs_core}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if fmt_expr is not None:
+                            self.emit(f"print({fmt_expr}{', end=""' if advance_no else ''}{file_txt})")
+                        else:
+                            args_star = _star_args(raw_args)
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    args_star = _star_args(raw_args)
+                    if internal_char_target:
+                        target_py = self.translate_expr(unit_raw, arrays_1d)
+                        rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                        rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                        self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                    else:
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if args_star:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        else:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                    return True
+
+        # write(*,*)
+        mm = re.match(r"write\s*\(\s*\*\s*,\s*\*\s*\)\s*$", s, re.I)
+        if mm:
+            self.emit("print()")
             return True
 
         # write(*,*) ...
@@ -2073,22 +3563,22 @@ class basic_f2p:
                 a0 = raw_args[0].strip()
                 implied_py = _fortran_implied_do_expr(a0, self.translate_expr, arrays_1d)
                 if implied_py is not None:
-                    self.emit(f"print(*{implied_py})")
+                    self.emit(f"_xf2p_print_star(*{implied_py})")
                     return True
                 if re.fullmatch(r"[a-z_]\w*", a0, flags=re.I) and a0.lower() in self._decl_array_types:
-                    self.emit(f"print(*np.ravel({a0}, order='F'))")
+                    self.emit(f"_xf2p_print_star(*np.ravel({a0}, order='F'))")
                     return True
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
-            self.emit(f"print({', '.join(args2)})")
+                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+            self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
         # write(unit,*) ...
@@ -2104,18 +3594,18 @@ class basic_f2p:
             if len(raw_args) == 1:
                 implied_py = _fortran_implied_do_expr(raw_args[0], self.translate_expr, arrays_1d)
                 if implied_py is not None:
-                    self.emit(f"print(*{implied_py}, file={unit})")
+                    self.emit(f"_xf2p_print_star(*{implied_py}, file={unit})")
                     return True
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
                     if implied_py is not None:
                         args2.append(f"*{implied_py}")
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
-            self.emit(f"print({', '.join(args2)}, file={unit})")
+                        args2.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+            self.emit(f"_xf2p_print_star({', '.join(args2)}, file={unit})")
             return True
 
         # write(*,"fmt") ...
@@ -2129,7 +3619,7 @@ class basic_f2p:
             raw_args = [a.strip() for a in split_args(rest)]
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2163,7 +3653,7 @@ class basic_f2p:
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr})")
             else:
-                self.emit(f"print({', '.join(args2)})")
+                self.emit(f"_xf2p_print_star({', '.join(args2)})")
             return True
 
         # write(unit,"fmt") ...
@@ -2178,7 +3668,7 @@ class basic_f2p:
             raw_args = [a.strip() for a in split_args(rest)]
             args2 = []
             for a in raw_args:
-                if a.startswith(("'", "\"")):
+                if _is_fortran_string_literal(a):
                     args2.append(a)
                 else:
                     implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
@@ -2212,38 +3702,140 @@ class basic_f2p:
             if fmt_expr is not None:
                 self.emit(f"print({fmt_expr}, file={unit})")
             else:
-                self.emit(f"print({', '.join(args2)}, file={unit})")
+                self.emit(f"_xf2p_print_star({', '.join(args2)}, file={unit})")
             return True
 
         # generic write(...) ... fallback
-        mm = re.match(r"write\s*\(\s*(.*?)\s*\)\s*(.*)$", s, re.I)
-        if mm:
-            ctl = mm.group(1).strip().lower()
-            rest = mm.group(2).strip()
-            ctl_parts = split_args(ctl)
-            unit_expr = "*"
-            if ctl_parts:
-                unit_expr = ctl_parts[0].strip()
-            args2 = []
-            if rest:
-                for a in split_args(rest):
-                    a = a.strip()
-                    if a.startswith(("'", '"')):
-                        args2.append(a)
+        if re.match(r"write\b", s, re.I):
+            mkw = re.match(r"write\b", s, re.I)
+            j = mkw.end()
+            while j < len(s) and s[j].isspace():
+                j += 1
+            if j < len(s) and s[j] == "(":
+                p1 = find_matching_paren(s, j)
+                if p1 != -1:
+                    ctl = s[j + 1 : p1].strip()
+                    rest = s[p1 + 1 :].strip()
+                    ctl_parts = [p.strip() for p in split_args(ctl)]
+                    unit_raw = ctl_parts[0] if ctl_parts else "*"
+                    fmt_raw = ctl_parts[1] if len(ctl_parts) >= 2 else "*"
+                    advance_no = any(re.match(r"(?is)^advance\s*=\s*['\"]no['\"]$", p) for p in ctl_parts[2:])
+                    unit_base_m = re.match(r"([a-z_]\w*)", unit_raw, re.I)
+                    unit_base = unit_base_m.group(1).lower() if unit_base_m else ""
+                    internal_char_target = unit_raw != "*" and (
+                        self._decl_types.get(unit_base) == "character"
+                        or self._decl_array_types.get(unit_base) == "character"
+                    )
+
+                    raw_args = [a.strip() for a in split_args(rest)] if rest else []
+
+                    if fmt_raw == "*":
+                        args_star = []
+                        for a in raw_args:
+                            if _is_fortran_string_literal(a):
+                                args_star.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    args_star.append(f"*{implied_py}")
+                                else:
+                                    args_star.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                            rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if not args_star:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                        else:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    if _is_fortran_string_literal(fmt_raw):
+                        args_fmt = []
+                        for a in raw_args:
+                            if _is_fortran_string_literal(a):
+                                args_fmt.append(self.translate_expr(a, arrays_1d))
+                            else:
+                                implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                if implied_py is not None:
+                                    args_fmt.append(implied_py)
+                                else:
+                                    args_fmt.append(self.translate_expr(a, arrays_1d))
+                        fmt_expr = None
+                        if len(raw_args) == 1:
+                            a0 = raw_args[0].strip()
+                            if _is_recyclable_io_iterable(a0, self._decl_array_types):
+                                fmt_expr = _fortran_format_recycled_expr(fmt_raw, args_fmt[0])
+                        if fmt_expr is None and len(raw_args) > 1:
+                            plan = _single_iterable_formatted_arg_plan(fmt_raw, raw_args, self._decl_array_types)
+                            if plan is not None:
+                                iter_pos, iter_need = plan
+                                iter_raw = raw_args[iter_pos].strip()
+                                iter_tmp = f"_xf2p_fmt_items_{self._code_emit_count + 1}"
+                                if re.fullmatch(r"[a-z_]\w*", iter_raw, flags=re.I) and iter_raw.lower() in self._decl_array_types:
+                                    self.emit(f"{iter_tmp} = list(np.ravel({args_fmt[iter_pos]}, order='F'))")
+                                else:
+                                    self.emit(f"{iter_tmp} = list({args_fmt[iter_pos]})")
+                                expanded_args = args_fmt[:iter_pos] + [f"{iter_tmp}[{k}]" for k in range(iter_need)] + args_fmt[iter_pos + 1:]
+                                fmt_expr = _fortran_format_expr(fmt_raw, expanded_args)
+                        if fmt_expr is None:
+                            fmt_expr = _fortran_format_expr(fmt_raw, args_fmt)
+                        if internal_char_target:
+                            target_py = self.translate_expr(unit_raw, arrays_1d)
+                            rhs_core = fmt_expr if fmt_expr is not None else ("''" if not raw_args else f"_xf2p_star_text({', '.join(f'*_xf2p_io_items({self.translate_expr(a, arrays_1d)})' if not _is_fortran_string_literal(a) else self.translate_expr(a, arrays_1d) for a in raw_args)})")
+                            rhs = f"_f_str_assign({rhs_core}, _f_len({target_py}))"
+                            self.transpile_assignment(unit_raw, rhs, arrays_1d)
+                            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if fmt_expr is not None:
+                            self.emit(f"print({fmt_expr}{', end=""' if advance_no else ''}{file_txt})")
+                        else:
+                            args_star = []
+                            for a in raw_args:
+                                if _is_fortran_string_literal(a):
+                                    args_star.append(self.translate_expr(a, arrays_1d))
+                                else:
+                                    implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                                    if implied_py is not None:
+                                        args_star.append(f"*{implied_py}")
+                                    else:
+                                        args_star.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        return True
+
+                    # dynamic format expression: keep output valid even when we cannot fully
+                    # compile the runtime format string.
+                    args_star = []
+                    for a in raw_args:
+                        if _is_fortran_string_literal(a):
+                            args_star.append(self.translate_expr(a, arrays_1d))
+                        else:
+                            implied_py = _fortran_implied_do_expr(a, self.translate_expr, arrays_1d)
+                            if implied_py is not None:
+                                args_star.append(f"*{implied_py}")
+                            else:
+                                args_star.append(f"*_xf2p_io_items({self.translate_expr(a, arrays_1d)})")
+                    if internal_char_target:
+                        target_py = self.translate_expr(unit_raw, arrays_1d)
+                        rhs = "''" if not args_star else f"_xf2p_star_text({', '.join(args_star)})"
+                        rhs = f"_f_str_assign({rhs}, _f_len({target_py}))"
+                        self.transpile_assignment(unit_raw, rhs, arrays_1d)
                     else:
-                        args2.append(self.translate_expr(a, arrays_1d))
-            end_txt = ', end=""' if "advance" in ctl and "'no'" in ctl else ""
-            file_txt = ""
-            if unit_expr != "*":
-                file_txt = f", file={unit_expr}"
-            if args2:
-                self.emit(f"print({', '.join(args2)}{end_txt}{file_txt})")
-            else:
-                if file_txt:
-                    self.emit(f"print({file_txt[2:]})")
-                else:
-                    self.emit("print()")
-            return True
+                        file_txt = "" if unit_raw == "*" else f", file={self.translate_expr(unit_raw, arrays_1d)}"
+                        if args_star:
+                            self.emit(f"_xf2p_print_star({', '.join(args_star)}{file_txt})")
+                        else:
+                            if file_txt:
+                                self.emit(f"print({file_txt[2:]})")
+                            else:
+                                self.emit("print()")
+                    return True
 
         # single-line if: if (cond) stmt
         if sl.startswith("if") and not sl.endswith("then"):
@@ -2266,9 +3858,11 @@ class basic_f2p:
             lhs, rhs = s.split("=", 1)
             lhs = lhs.strip()
             rhs_py = self.translate_expr(rhs, arrays_1d)
-            if lhs in arrays_1d:
-                self.emit(f"{lhs} = _f_assign_array({lhs}, {rhs_py})")
+            # Boolean scalar to whole array (common pattern)
+            if lhs in arrays_1d and rhs_py in ("True", "False"):
+                self.emit(f"{lhs}[:] = {rhs_py}")
                 return True
+            # Defer to transpile_assignment so POINTER/TARGET aliasing is preserved.
             self.transpile_assignment(lhs, rhs_py, arrays_1d)
             return True
 
@@ -2276,6 +3870,7 @@ class basic_f2p:
 
     def transpile_function(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         hdr = header.strip()
+        is_elemental = self._is_elemental_header(hdr)
         # tolerate arbitrary prefixes such as:
         # "pure real(kind=dp) function f(...)" or "real(kind=dp) pure function f(...)"
         m = re.search(r"\bfunction\s+(\w+)\s*\(\s*([^\)]*)\s*\)\s*result\s*\(\s*(\w+)\s*\)", hdr, re.I)
@@ -2302,6 +3897,7 @@ class basic_f2p:
         result_is_scalar = True
         result_is_derived = False
         result_type_name: str | None = None
+        result_ftype = header_ftype
 
         self._emit_intrinsic_use_aliases(main_lines)
 
@@ -2334,6 +3930,9 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2345,6 +3944,7 @@ class basic_f2p:
                         arg_hints[name] = self._type_hint(ftype, type_name, is_array=False)
 
                 if name == result_name:
+                    result_ftype = ftype
                     if is_array:
                         result_hint = _type_ndarray_hint.get(ftype, "npt.NDArray[np.float64]")
                         result_is_scalar = False
@@ -2358,6 +3958,19 @@ class basic_f2p:
                             result_hint = _type_scalar_hint[ftype]
                             result_is_scalar = True
 
+        arg_specs = []
+        for a in args:
+            info = sym.get(a)
+            if info is None:
+                arg_specs.append({"ftype": None, "type_name": None, "is_array": False})
+            else:
+                arg_specs.append({
+                    "ftype": info.get("ftype"),
+                    "type_name": info.get("type_name"),
+                    "is_array": bool(info.get("is_array")),
+                })
+        self._func_sigs[fname.lower()] = {"args": list(args), "arg_specs": arg_specs}
+
         args_annot = []
         for a in args:
             hint = arg_hints.get(a, "int")
@@ -2370,8 +3983,12 @@ class basic_f2p:
             else:
                 args_annot.append(f"{a}: {hint}")
 
+        save_names = self._collect_save_names(main_lines, sym, args)
+        save_dict_name = f"_{fname}_save"
+        self.emit(f"{save_dict_name} = {{}}")
         self.emit(f"def {fname}({', '.join(args_annot)}) -> {result_hint}:")
         self.indent += 1
+        self._save_stack.append((save_dict_name, save_names))
 
         # If the first non-code lines are comments (just after signature),
         # emit them as a Python docstring.
@@ -2392,6 +4009,14 @@ class basic_f2p:
                     self.emit(ln)
                 self.emit('"""')
 
+        if is_elemental:
+            self._elemental_funcs.add(fname.lower())
+            _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in args) if args else "False"
+            self.emit(f"if {_xf2p_elem_guard}:")
+            self.indent += 1
+            self.emit(f"return np.vectorize({fname}, otypes=[{self._scalar_otype_expr(result_ftype, result_type_name)}])({', '.join(args)})")
+            self.indent -= 1
+
         for kind, header, ibody in internals:
             if kind == "function":
                 self.transpile_function(header, ibody)
@@ -2411,7 +4036,8 @@ class basic_f2p:
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
         # allocate/init explicit-shape arrays and scalars
-        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args))
+        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_names))
+        self._emit_save_restore(save_dict_name, save_names, sym, arrays_1d)
         # initialize derived-type/component bases that appear as name%field
         comp_bases: set[str] = set()
         for code, _comment in main_lines:
@@ -2429,6 +4055,11 @@ class basic_f2p:
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         # exec pass
         prev_result_name = self._current_result_name
@@ -2445,8 +4076,11 @@ class basic_f2p:
             self.handle_exec_line(s, arrays_1d)
 
         # basic default return (safe)
+        self._emit_save_sync()
         self.emit(f"return {result_name}")
         self._current_result_name = prev_result_name
+        if self._save_stack:
+            self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
@@ -2477,6 +4111,9 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2499,6 +4136,11 @@ class basic_f2p:
         self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names)
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         # exec statements
         for code, comment in body_lines:
@@ -2509,6 +4151,58 @@ class basic_f2p:
             if parse_decl(s):
                 continue
             self.handle_exec_line(s, arrays_1d)
+
+
+    def _xf2p_generic_arg_cond(self, expr: str, spec: dict) -> str:
+        ftype = str(spec.get("ftype") or "").lower()
+        is_array = bool(spec.get("is_array"))
+        if ftype == "character":
+            return f"_xf2p_is_char_array({expr})" if is_array else f"_xf2p_is_char_scalar({expr})"
+        if ftype == "integer":
+            return f"_xf2p_is_integer_array({expr})" if is_array else f"_xf2p_is_integer_scalar({expr})"
+        if ftype == "real":
+            return f"_xf2p_is_real_array({expr})" if is_array else f"_xf2p_is_real_scalar({expr})"
+        if ftype == "logical":
+            return f"_xf2p_is_logical_array({expr})" if is_array else f"_xf2p_is_logical_scalar({expr})"
+        if ftype == "complex":
+            return f"_xf2p_is_complex_array({expr})" if is_array else f"_xf2p_is_complex_scalar({expr})"
+        return "True"
+
+    def _xf2p_generic_call_arg(self, expr: str, spec: dict) -> str:
+        if not bool(spec.get("is_array")):
+            return expr
+        ftype = str(spec.get("ftype") or "").lower()
+        if ftype == "character":
+            return f"np.asarray({expr}, dtype=object)"
+        if ftype in _type_dtype:
+            return f"np.asarray({expr}, dtype={_type_dtype[ftype]})"
+        return f"np.asarray({expr})"
+
+    def _emit_generic_interface_wrapper(self, generic_name: str, proc_names: list[str]) -> None:
+        candidates: list[tuple[str, dict]] = []
+        for proc in proc_names:
+            sig = self._func_sigs.get(proc.lower()) or self._subr_sigs.get(proc.lower())
+            if sig is not None:
+                candidates.append((proc, sig))
+        if not candidates:
+            return
+        self.emit(f"def {generic_name}(*args):")
+        self.indent += 1
+        for proc, sig in candidates:
+            arg_specs = list(sig.get("arg_specs", []))
+            conds = [f"len(args) == {len(arg_specs)}"]
+            for j, spec in enumerate(arg_specs):
+                cond = self._xf2p_generic_arg_cond(f"args[{j}]", spec)
+                if cond != "True":
+                    conds.append(cond)
+            call_args = [self._xf2p_generic_call_arg(f"args[{j}]", spec) for j, spec in enumerate(arg_specs)]
+            self.emit(f"if {' and '.join(conds)}:")
+            self.indent += 1
+            self.emit(f"return {proc}({', '.join(call_args)})")
+            self.indent -= 1
+        self.emit(f"raise TypeError('no matching specific procedure for generic interface {generic_name}')")
+        self.indent -= 1
+        self.emit("")
 
 
     def transpile_module(self, header: str, body_lines: list[tuple[str, str]]) -> None:
@@ -2525,6 +4219,8 @@ class basic_f2p:
         if contains_idx is not None:
             decl_lines = body_lines[:contains_idx]
             tail = body_lines[contains_idx + 1 :]
+
+        decl_lines, generic_interfaces = _extract_generic_interfaces(decl_lines)
 
         # Emit derived types from the module declarative part.
         filtered_decl: list[tuple[str, str]] = []
@@ -2571,6 +4267,9 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2600,7 +4299,7 @@ class basic_f2p:
                 if not line:
                     i += 1
                     continue
-                if re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", line, re.I):
+                if self._is_function_header(line):
                     func_header = line
                     fbody: list[tuple[str, str]] = []
                     i += 1
@@ -2611,7 +4310,7 @@ class basic_f2p:
                         i += 1
                     self.transpile_function(func_header, fbody)
                     continue
-                if re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", line, re.I):
+                if self._is_subroutine_header(line):
                     sub_header = line
                     sbody: list[tuple[str, str]] = []
                     i += 1
@@ -2623,6 +4322,9 @@ class basic_f2p:
                     self.transpile_subroutine(sub_header, sbody)
                     continue
                 i += 1
+
+        for gi in generic_interfaces:
+            self._emit_generic_interface_wrapper(gi["name"], gi["procedures"])
 
     def transpile_program(self, body_lines: list[tuple[str, str]]) -> None:
         # Handle internal procedures after "contains".
@@ -2668,7 +4370,7 @@ class basic_f2p:
                 if not line:
                     i += 1
                     continue
-                if re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", line, re.I):
+                if self._is_function_header(line):
                     header = line
                     fbody: list[tuple[str, str]] = []
                     i += 1
@@ -2679,7 +4381,7 @@ class basic_f2p:
                         i += 1
                     self.transpile_function(header, fbody)
                     continue
-                if re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", line, re.I):
+                if self._is_subroutine_header(line):
                     header = line
                     sbody: list[tuple[str, str]] = []
                     i += 1
@@ -2703,7 +4405,8 @@ class basic_f2p:
 
     def transpile_subroutine(self, header: str, body_lines: list[tuple[str, str]]) -> None:
         hdr = header.strip()
-        m = re.match(r"(?:pure\s+)?subroutine\s+(\w+)\s*\(\s*([^\)]*)\s*\)", hdr, re.I)
+        is_elemental = self._is_elemental_header(hdr)
+        m = re.match(r"(?:(?:pure|elemental|recursive)\s+)*subroutine\s+(\w+)\s*\(\s*([^\)]*)\s*\)", hdr, re.I)
         if not m:
             return
         sname = m.group(1)
@@ -2745,6 +4448,9 @@ class basic_f2p:
                     "init": init,
                     "alloc": is_alloc,
                     "attrs_l": attrs_l,
+                    "pointer": "pointer" in attrs_l,
+                    "target": "target" in attrs_l,
+                    "char_len": self._parse_character_len(s) if ftype == "character" else None,
                 }
                 if is_array:
                     arrays_1d.add(name)
@@ -2766,23 +4472,64 @@ class basic_f2p:
             else:
                 args_annot.append(f"{a}: {hint}")
         out_formals: list[str] = []
+        pure_out_formals: list[str] = []
+        vector_formals: list[str] = []
+        out_otypes: list[str] = []
         for a in args:
             info = sym.get(a)
             if not info:
+                vector_formals.append(a)
                 continue
             attrs_l = info.get("attrs_l", "")
             if "intent(out" in attrs_l or "intent(inout" in attrs_l:
                 out_formals.append(a)
-        self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals)}
+                out_otypes.append(self._scalar_otype_expr(cast(str, info.get("ftype")), cast(str | None, info.get("type_name"))))
+            if "intent(out" in attrs_l and "intent(inout" not in attrs_l:
+                pure_out_formals.append(a)
+            else:
+                vector_formals.append(a)
+        arg_specs = []
+        for a in args:
+            info = sym.get(a)
+            if info is None:
+                arg_specs.append({"ftype": None, "type_name": None, "is_array": False})
+            else:
+                arg_specs.append({
+                    "ftype": info.get("ftype"),
+                    "type_name": info.get("type_name"),
+                    "is_array": bool(info.get("is_array")),
+                })
+        self._subr_sigs[sname.lower()] = {"args": list(args), "out": list(out_formals), "arg_specs": arg_specs}
 
+        save_names = self._collect_save_names(main_lines, sym, args)
+        save_dict_name = f"_{sname}_save"
+        self.emit(f"{save_dict_name} = {{}}")
         self.emit(f"def {sname}({', '.join(args_annot)}):")
         self.indent += 1
+        self._save_stack.append((save_dict_name, save_names))
 
         for kind, header, ibody in internals:
             if kind == "function":
                 self.transpile_function(header, ibody)
             else:
                 self.transpile_subroutine(header, ibody)
+
+        if is_elemental and out_formals and vector_formals:
+            _xf2p_elem_guard = " or ".join(f"_xf2p_is_arraylike({a})" for a in vector_formals)
+            _xf2p_lambda_args = [f"_xf2p_{a}" for a in vector_formals]
+            _xf2p_call_args: list[str] = []
+            for _xf2p_a in args:
+                if _xf2p_a in pure_out_formals:
+                    _xf2p_call_args.append("None")
+                elif _xf2p_a in vector_formals:
+                    _xf2p_call_args.append(f"_xf2p_{_xf2p_a}")
+                else:
+                    _xf2p_call_args.append(_xf2p_a)
+            self.emit(f"if {_xf2p_elem_guard}:")
+            self.indent += 1
+            self.emit(f"_xf2p_vec = np.vectorize(lambda {', '.join(_xf2p_lambda_args)}: {sname}({', '.join(_xf2p_call_args)}), otypes=[{', '.join(out_otypes)}])")
+            self.emit(f"return _xf2p_vec({', '.join(vector_formals)})")
+            self.indent -= 1
 
         parameter_names: set[str] = set()
         for code, _comment in main_lines:
@@ -2795,9 +4542,15 @@ class basic_f2p:
             if "parameter" in attrs_l:
                 parameter_names |= self.emit_parameters_from_decl(ftype, attrs_l, rest, arrays_1d)
 
-        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args))
+        self.emit_var_inits_from_sym(sym, arrays_1d, parameter_names, skip_names=set(args) | set(save_names))
+        self._emit_save_restore(save_dict_name, save_names, sym, arrays_1d)
         self._decl_types = {k.lower(): v["ftype"] for k, v in sym.items()}
         self._decl_array_types = {k.lower(): v["ftype"] for k, v in sym.items() if v.get("is_array")}
+        self._decl_pointer = {k.lower() for k, v in sym.items() if v.get('pointer') or ('pointer' in str(v.get('attrs_l', '')))}
+        self._decl_target = {k.lower() for k, v in sym.items() if v.get('target') or ('target' in str(v.get('attrs_l', '')))}
+        self._decl_char_len = {k.lower(): str(v.get('char_len')) for k, v in sym.items() if v.get('char_len') is not None}
+        self._decl_lbounds = {k.lower(): [lo for lo, _hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
+        self._decl_ubounds = {k.lower(): [hi for _lo, hi in self._shape_bounds(str(v.get('shape')))] for k, v in sym.items() if v.get('is_array') and v.get('shape') is not None}
 
         for code, comment in main_lines:
             s = code.strip()
@@ -2808,12 +4561,15 @@ class basic_f2p:
                 continue
             self.handle_exec_line(s, arrays_1d)
 
+        self._emit_save_sync()
         if out_formals:
             if len(out_formals) == 1:
                 self.emit(f"return {out_formals[0]}")
             else:
                 self.emit("return " + ", ".join(out_formals))
 
+        if self._save_stack:
+            self._save_stack.pop()
         self.indent = max(0, self.indent - 1)
         self.emit("")
 
@@ -2830,6 +4586,7 @@ class basic_f2p:
         self.indent = 0
         self._code_emit_count = 0
         self._block_code_start = []
+        self._select_case_stack = []
 
         self.emit("import numpy as np")
         self.emit("import numpy.typing as npt")
@@ -2857,6 +4614,481 @@ class basic_f2p:
         self.indent -= 1
         self.indent -= 1
         self.emit("")
+        self.emit("def _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit('"""Return True for list/tuple/ndarray values handled elementally."""')
+        self.emit("return isinstance(x, (list, tuple, np.ndarray)) and not isinstance(x, (str, bytes))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_concat(a, b):")
+        self.indent += 1
+        self.emit('"""Fortran CHARACTER concatenation with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a, dtype=object)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("aa = a")
+        self.indent -= 1
+        self.emit("if _xf2p_is_arraylike(b):")
+        self.indent += 1
+        self.emit("bb = np.asarray(b, dtype=object)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("bb = b")
+        self.indent -= 1
+        self.emit("if isinstance(aa, np.ndarray) and isinstance(bb, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.vectorize(lambda x, y: str(x) + str(y), otypes=[object])(aa, bb)")
+        self.indent -= 1
+        self.emit("if isinstance(aa, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.vectorize(lambda x: str(x) + str(bb), otypes=[object])(aa)")
+        self.indent -= 1
+        self.emit("if isinstance(bb, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.vectorize(lambda y: str(aa) + str(y), otypes=[object])(bb)")
+        self.indent -= 1
+        self.emit("return str(aa) + str(bb)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_div(a, b):")
+        self.indent += 1
+        self.emit('"""Fortran division with integer truncation and scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a) or _xf2p_is_arraylike(b):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a)")
+        self.emit("bb = np.asarray(b)")
+        self.emit("if np.issubdtype(aa.dtype, np.integer) and np.issubdtype(bb.dtype, np.integer):")
+        self.indent += 1
+        self.emit("rr = np.trunc(aa / bb)")
+        self.emit("return np.asarray(np.rint(rr), dtype=np.result_type(aa.dtype, bb.dtype))")
+        self.indent -= 1
+        self.emit("return aa / bb")
+        self.indent -= 1
+        self.emit("if isinstance(a, (int, np.integer)) and isinstance(b, (int, np.integer)) and not isinstance(a, (bool, np.bool_)) and not isinstance(b, (bool, np.bool_)):")
+        self.indent += 1
+        self.emit("return int(np.trunc(a / b))")
+        self.indent -= 1
+        self.emit("return a / b")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_nint(x):")
+        self.emit('    """Fortran NINT with ties away from zero and array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        rr = np.copysign(np.floor(np.abs(xx) + 0.5), xx)")
+        self.emit("        return np.asarray(rr, dtype=int)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return int(np.copysign(np.floor(abs(xx) + 0.5), xx))")
+        self.emit("")
+        self.emit("def _xf2p_anint(x):")
+        self.emit('    """Fortran ANINT with ties away from zero and array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.copysign(np.floor(np.abs(xx) + 0.5), xx)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return float(np.copysign(np.floor(abs(xx) + 0.5), xx))")
+        self.emit("")
+        self.emit("def _xf2p_aint(x):")
+        self.emit('    """Fortran AINT with truncation toward zero and array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.trunc(xx)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return float(np.trunc(xx))")
+        self.emit("")
+        self.emit("def _xf2p_ceiling(x):")
+        self.emit('    """Fortran CEILING with scalar/array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.asarray(np.ceil(xx), dtype=int)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return int(np.ceil(xx))")
+        self.emit("")
+        self.emit("def _xf2p_floor(x):")
+        self.emit('    """Fortran FLOOR with scalar/array support."""')
+        self.emit("    if _xf2p_is_arraylike(x):")
+        self.emit("        xx = np.asarray(x, dtype=np.float64)")
+        self.emit("        return np.asarray(np.floor(xx), dtype=int)")
+        self.emit("    xx = float(np.asarray(x))")
+        self.emit("    return int(np.floor(xx))")
+        self.emit("")
+        self.emit("def _xf2p_mod(a, p):")
+        self.indent += 1
+        self.emit('"""Fortran MOD intrinsic with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a) or _xf2p_is_arraylike(p):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a)")
+        self.emit("pp = np.asarray(p)")
+        self.emit("rr = aa - np.trunc(aa / pp) * pp")
+        self.emit("if np.issubdtype(aa.dtype, np.integer) and np.issubdtype(pp.dtype, np.integer):")
+        self.indent += 1
+        self.emit("return np.asarray(np.rint(rr), dtype=np.result_type(aa.dtype, pp.dtype))")
+        self.indent -= 1
+        self.emit("return rr")
+        self.indent -= 1
+        self.emit("rr = a - np.trunc(a / p) * p")
+        self.emit("if isinstance(a, (int, np.integer)) and isinstance(p, (int, np.integer)) and not isinstance(a, (bool, np.bool_)) and not isinstance(p, (bool, np.bool_)):")
+        self.indent += 1
+        self.emit("return int(np.rint(rr))")
+        self.indent -= 1
+        self.emit("return rr")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_modulo(a, p):")
+        self.indent += 1
+        self.emit('"""Fortran MODULO intrinsic with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(a) or _xf2p_is_arraylike(p):")
+        self.indent += 1
+        self.emit("aa = np.asarray(a)")
+        self.emit("pp = np.asarray(p)")
+        self.emit("rr = aa - np.floor(aa / pp) * pp")
+        self.emit("if np.issubdtype(aa.dtype, np.integer) and np.issubdtype(pp.dtype, np.integer):")
+        self.indent += 1
+        self.emit("return np.asarray(np.rint(rr), dtype=np.result_type(aa.dtype, pp.dtype))")
+        self.indent -= 1
+        self.emit("return rr")
+        self.indent -= 1
+        self.emit("rr = a - np.floor(a / p) * p")
+        self.emit("if isinstance(a, (int, np.integer)) and isinstance(p, (int, np.integer)) and not isinstance(a, (bool, np.bool_)) and not isinstance(p, (bool, np.bool_)):")
+        self.indent += 1
+        self.emit("return int(np.rint(rr))")
+        self.indent -= 1
+        self.emit("return rr")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_lbound(x, dim=None):")
+        self.indent += 1
+        self.emit('"""Fortran LBOUND for arraylike values with default lower bound 1."""')
+        self.emit("if dim is not None:")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("return np.ones(x.ndim, dtype=int)")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_ubound(x, dim=None):")
+        self.indent += 1
+        self.emit('"""Fortran UBOUND for arraylike values with default lower bound 1."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("if dim is not None:")
+        self.indent += 1
+        self.emit("return int(x.shape[int(dim) - 1])")
+        self.indent -= 1
+        self.emit("return np.asarray(x.shape, dtype=int)")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("if dim is not None:")
+        self.indent += 1
+        self.emit("return len(x)")
+        self.indent -= 1
+        self.emit("return np.asarray([len(x)], dtype=int)")
+        self.indent -= 1
+        self.emit("return 1")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _f_len(x):")
+        self.indent += 1
+        self.emit('"""Fortran LEN for a scalar character value or character array."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return len(str(x.item()))")
+        self.indent -= 1
+        self.emit("if x.size == 0:")
+        self.indent += 1
+        self.emit("return 0")
+        self.indent -= 1
+        self.emit("return len(str(np.ravel(x, order='F')[0]))")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("if not x:")
+        self.indent += 1
+        self.emit("return 0")
+        self.indent -= 1
+        self.emit("return _f_len(x[0])")
+        self.indent -= 1
+        self.emit("return len(str(x))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_cmplx(x, y=0.0):")
+        self.indent += 1
+        self.emit('"""Fortran CMPLX with scalar/array broadcasting."""')
+        self.emit("if _xf2p_is_arraylike(x) or _xf2p_is_arraylike(y):")
+        self.indent += 1
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("xx = np.asarray(x)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("xx = x")
+        self.indent -= 1
+        self.emit("if _xf2p_is_arraylike(y):")
+        self.indent += 1
+        self.emit("yy = np.asarray(y)")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("yy = y")
+        self.indent -= 1
+        self.emit("return np.asarray(np.real(xx), dtype=np.float64) + 1j * np.asarray(np.real(yy), dtype=np.float64)")
+        self.indent -= 1
+        self.emit("return complex(float(np.real(x)), float(np.real(y)))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_real(x):")
+        self.indent += 1
+        self.emit('"""Fortran REAL intrinsic for scalar or array input."""')
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return np.asarray(np.real(np.asarray(x)), dtype=np.float64)")
+        self.indent -= 1
+        self.emit("return np.float64(np.real(x))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_aimag(x):")
+        self.indent += 1
+        self.emit('"""Fortran AIMAG intrinsic for scalar or array input."""')
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return np.asarray(np.imag(np.asarray(x)), dtype=np.float64)")
+        self.indent -= 1
+        self.emit("return np.float64(np.imag(x))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_conjg(x):")
+        self.indent += 1
+        self.emit('"""Fortran CONJG intrinsic for scalar or array input."""')
+        self.emit("if _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return np.conj(np.asarray(x))")
+        self.indent -= 1
+        self.emit("return np.conj(x)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_io_scalar(x):")
+        self.indent += 1
+        self.emit('"""Format one scalar for Fortran-like list-directed output."""')
+        self.emit("if isinstance(x, np.ndarray) and x.ndim == 0:")
+        self.indent += 1
+        self.emit("return _xf2p_io_scalar(x.item())")
+        self.indent -= 1
+        self.emit("if isinstance(x, (complex, np.complexfloating)):")
+        self.indent += 1
+        self.emit("return f'({float(np.real(x)):.8f},{float(np.imag(x)):.8f})'")
+        self.indent -= 1
+        self.emit("return x")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_first_scalar(x):")
+        self.indent += 1
+        self.emit('"""Return the first scalar element from a scalar or arraylike value."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("if x.ndim == 0:")
+        self.indent += 1
+        self.emit("return x.item()")
+        self.indent -= 1
+        self.emit("if x.size == 0:")
+        self.indent += 1
+        self.emit("return None")
+        self.indent -= 1
+        self.emit("return np.ravel(x, order='F')[0]")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("if not x:")
+        self.indent += 1
+        self.emit("return None")
+        self.indent -= 1
+        self.emit("return _xf2p_first_scalar(x[0])")
+        self.indent -= 1
+        self.emit("return x")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_char_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (str, bytes))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_char_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_char_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_integer_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (int, np.integer)) and not isinstance(x, (bool, np.bool_))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_integer_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_integer_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_real_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (float, np.floating))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_real_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_real_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_logical_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (bool, np.bool_))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_logical_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_logical_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_complex_scalar(x):")
+        self.indent += 1
+        self.emit("return isinstance(x, (complex, np.complexfloating))")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_is_complex_array(x):")
+        self.indent += 1
+        self.emit("if not _xf2p_is_arraylike(x):")
+        self.indent += 1
+        self.emit("return False")
+        self.indent -= 1
+        self.emit("v = _xf2p_first_scalar(x)")
+        self.emit("return v is None or _xf2p_is_complex_scalar(v)")
+        self.indent -= 1
+        self.emit("")
+
+        self.emit("def _xf2p_io_items(x):")
+        self.indent += 1
+        self.emit('"""Flatten list-directed output items the way Fortran prints arrays."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("return [_xf2p_io_scalar(v) for v in np.ravel(x, order='F')]")
+        self.indent -= 1
+        self.emit("if isinstance(x, (list, tuple)) and not isinstance(x, (str, bytes)):")
+        self.indent += 1
+        self.emit("out = []")
+        self.emit("for item in x:")
+        self.indent += 1
+        self.emit("out.extend(_xf2p_io_items(item))")
+        self.indent -= 1
+        self.emit("return out")
+        self.indent -= 1
+        self.emit("return [_xf2p_io_scalar(x)]")
+        self.indent -= 1
+        self.emit("")
+
+        self.emit("def _xf2p_print_star(*args, file=None):")
+        self.indent += 1
+        self.emit('"""Approximate Fortran list-directed PRINT/WRITE to stdout or a file."""')
+        self.emit("items = []")
+        self.emit("for arg in args:")
+        self.indent += 1
+        self.emit("if isinstance(arg, np.ndarray):")
+        self.indent += 1
+        self.emit("items.extend(list(np.ravel(arg, order='F')))")
+        self.indent -= 1
+        self.emit("elif isinstance(arg, (list, tuple)) and not isinstance(arg, (str, bytes)):")
+        self.indent += 1
+        self.emit("items.extend(_xf2p_io_items(arg))")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("items.append(arg)")
+        self.indent -= 1
+        self.indent -= 1
+        self.emit("if not items:")
+        self.indent += 1
+        self.emit("print(file=file)")
+        self.emit("return")
+        self.indent -= 1
+        self.emit("if all(isinstance(x, str) for x in items):")
+        self.indent += 1
+        self.emit("print(''.join(str(x) for x in items), file=file)")
+        self.emit("return")
+        self.indent -= 1
+        self.emit("print(*items, file=file)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_star_text(*args):")
+        self.indent += 1
+        self.emit('"""Return list-directed text for internal WRITE fallbacks."""')
+        self.emit("items = []")
+        self.emit("for arg in args:")
+        self.indent += 1
+        self.emit("if isinstance(arg, np.ndarray):")
+        self.indent += 1
+        self.emit("items.extend(list(np.ravel(arg, order='F')))")
+        self.indent -= 1
+        self.emit("elif isinstance(arg, (list, tuple)) and not isinstance(arg, (str, bytes)):")
+        self.indent += 1
+        self.emit("items.extend(_xf2p_io_items(arg))")
+        self.indent -= 1
+        self.emit("else:")
+        self.indent += 1
+        self.emit("items.append(arg)")
+        self.indent -= 1
+        self.indent -= 1
+        self.emit("if not items:")
+        self.indent += 1
+        self.emit("return ''")
+        self.indent -= 1
+        self.emit("if all(isinstance(x, str) for x in items):")
+        self.indent += 1
+        self.emit("return ''.join(str(x) for x in items)")
+        self.indent -= 1
+        self.emit("return ' '.join(str(x) for x in items)")
+        self.indent -= 1
+        self.emit("")
+
         self.emit("def _xf2p_implied_do(func, lo, hi, step=1):")
         self.indent += 1
         self.emit('"""Expand a Fortran I/O implied-DO into a flat Python list."""')
@@ -2887,6 +5119,21 @@ class basic_f2p:
         self.emit("out.append(val)")
         self.indent -= 1
         self.emit("return np.asarray(out)")
+        self.indent -= 1
+        self.emit("")
+        self.emit("def _xf2p_copy_value(x):")
+        self.indent += 1
+        self.emit('"""Fortran-style assignment copy for arrays and derived-type values."""')
+        self.emit("if isinstance(x, np.ndarray):")
+        self.indent += 1
+        self.emit("return np.array(x, copy=True)")
+        self.indent -= 1
+        self.emit("if hasattr(x, '__dict__'):")
+        self.indent += 1
+        self.emit("import copy as _xf2p_copy_mod")
+        self.emit("return _xf2p_copy_mod.deepcopy(x)")
+        self.indent -= 1
+        self.emit("return x")
         self.indent -= 1
         self.emit("")
 
@@ -2930,7 +5177,7 @@ class basic_f2p:
                 self.transpile_derived_type(header, tbody)
                 continue
 
-            if re.match(r"^(?!\s*end\s+function\b)\s*(?:(?:pure\s+)?\w+(?:\s*\([^)]*\))?\s+)*function\b", line, re.I):
+            if self._is_function_header(line):
                 header = line
                 body: list[tuple[str, str]] = []
                 i += 1
@@ -2942,7 +5189,7 @@ class basic_f2p:
                 self.transpile_function(header, body)
                 continue
 
-            if re.match(r"^(?!\s*end\s+subroutine\b)\s*(?:pure\s+)?subroutine\b", line, re.I):
+            if self._is_subroutine_header(line):
                 header = line
                 body: list[tuple[str, str]] = []
                 i += 1
@@ -3032,8 +5279,8 @@ def main() -> int:
     if args.tee_both:
         args.tee = True
 
-    show_fortran_output = bool(args.run_both or args.tee_both)
-    show_python_output = bool(args.run_both or args.tee or args.tee_both)
+    show_fortran_output = bool(args.run_both or args.time_both or args.tee_both)
+    show_python_output = bool(args.run or args.run_both or args.time or args.time_both or args.tee or args.tee_both)
 
     if args.mode_program and args.mode_each:
         print("Transpile: FAIL (choose at most one of --mode-program and --mode-each)")
