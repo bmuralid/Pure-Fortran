@@ -4942,6 +4942,45 @@ def indent_fortran_blocks(
 
         out.append(f"{step * level}{stripped}")
 
+        # When a physical line contains multiple semicolon-separated statements
+        # (e.g. "end do; end do; end do"), the dedent/indent logic above only
+        # handled the first statement.  Apply level adjustments for every
+        # remaining sub-statement so subsequent lines get the right indentation.
+        _extra_stmts = split_fortran_statements(code_norm)[1:]
+        for _es in _extra_stmts:
+            _es = re.sub(r"^\d+\s+", "", _es.strip())
+            if not _es:
+                continue
+            # Unit-end (end subroutine / end function / end module)
+            if unit_stack and _unit_end_matches(_es, unit_stack[-1]["kind"]):
+                if unit_stack[-1].get("contains_active", False):
+                    level = max(0, level - 1)
+                if unit_stack[-1].get("unit_indent", False):
+                    level = max(0, level - 1)
+                unit_stack.pop()
+            # Closing construct (end do, end if, else, case, …)
+            if dedent_before.match(_es):
+                level = max(0, level - 1)
+            # Opening construct (do, if…then, subroutine, …)
+            _ek = _unit_kind_start(_es)
+            if _ek is not None:
+                _eu = (
+                    (_ek == "module" and indent_module)
+                    or (_ek == "program" and indent_program)
+                    or (_ek in {"function", "subroutine"} and indent_proc)
+                )
+                unit_stack.append({"kind": _ek, "unit_indent": bool(_eu), "contains_active": False})
+                if _eu:
+                    level += 1
+            elif indent_after.match(_es):
+                if re.match(r"^\s*if\b", _es, re.IGNORECASE) and not re.search(r"\bthen\s*$", _es, re.IGNORECASE):
+                    pass
+                elif not re.match(r"^\s*end\b", _es, re.IGNORECASE):
+                    _m_do_lbl = do_label_start_re.match(_es)
+                    if _m_do_lbl:
+                        do_label_stack.append(_m_do_lbl.group(1))
+                    level += 1
+
         if code_norm and _is_derived_type_start(code_norm):
             level += 1
             continue

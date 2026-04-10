@@ -17,7 +17,11 @@ import fortran_scan as fscan
 
 PROGRAM_START_RE = re.compile(r"^\s*program\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
 PROC_START_RE = re.compile(
-    r"^\s*(?:(?:pure|elemental|impure|recursive|module)\s+)*(function|subroutine)\s+([a-z][a-z0-9_]*)\b",
+    r"^\s*"
+    r"(?:(?:integer|real|double\s+precision|double\s+complex|complex|logical|character|type\s*\([^)]*\))"
+    r"(?:\s*\*\s*\d+|\s*\(\s*[^)]*\))?\s+)?"
+    r"(?:(?:pure|elemental|impure|recursive|module)\s+)*"
+    r"(function|subroutine)\s+([a-z][a-z0-9_]*)\b",
     re.IGNORECASE,
 )
 MODULE_START_RE = re.compile(r"^\s*module\s+([a-z][a-z0-9_]*)\b", re.IGNORECASE)
@@ -148,15 +152,19 @@ def analyze_file(path: Path) -> List[Finding]:
 
         toks = low.split()
         if len(toks) == 1:
-            if 1 <= lineno <= len(lines):
-                raw = lines[lineno - 1].rstrip("\r\n")
-                code, _comment = split_code_comment(raw)
-                if code.strip().lower() == "end" and stack:
-                    top = stack[-1]
-                    if top.kind in {"program", "subroutine", "function", "module"}:
-                        findings.append(Finding(path=path, line=lineno, kind=top.kind, name=top.name))
-            if stack:
-                stack.pop()
+            # Only treat a bare "end" as a unit terminator.
+            # Single-word legacy forms like "endif", "enddo", "endtype" etc.
+            # must NOT pop the unit stack.
+            if low == "end":
+                if 1 <= lineno <= len(lines):
+                    raw = lines[lineno - 1].rstrip("\r\n")
+                    code, _comment = split_code_comment(raw)
+                    if code.strip().lower() == "end" and stack:
+                        top = stack[-1]
+                        if top.kind in {"program", "subroutine", "function", "module"}:
+                            findings.append(Finding(path=path, line=lineno, kind=top.kind, name=top.name))
+                if stack:
+                    stack.pop()
             continue
 
         end_kind = toks[1]

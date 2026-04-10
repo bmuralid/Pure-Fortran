@@ -121,8 +121,23 @@ def main() -> int:
     transformed = {}
     for path in paths:
         src = fscan.read_text_flexible(path)
+
+        # Stash preprocessor directive lines (#ifdef, #endif, etc.) so they
+        # are neither re-indented nor allowed to confuse the block-level
+        # tracker.  Replaced with Fortran comment tokens that the indenter
+        # ignores for level tracking (strip_comment returns "").
+        preproc_keep: dict = {}
+        src_for_indent_lines = src.splitlines(keepends=True)
+        for i, ln in enumerate(src_for_indent_lines):
+            if re.match(r"^\s*#", ln):
+                tok = f"!__XINDENT_PREPROC_{len(preproc_keep)}__"
+                preproc_keep[tok] = ln.rstrip("\r\n")
+                eol = "\r\n" if ln.endswith("\r\n") else "\n"
+                src_for_indent_lines[i] = tok + eol
+        src_for_indent = "".join(src_for_indent_lines)
+
         dst = fscan.indent_fortran_blocks(
-            src,
+            src_for_indent,
             indent_step=args.indent,
             indent_proc=args.indent_proc,
             indent_module=args.indent_module,
@@ -154,6 +169,9 @@ def main() -> int:
         lines = _safe_wrap_lines(lines, max_len=args.max_len)
         if pyapi_keep:
             lines = [pyapi_keep.get(ln, ln) for ln in lines]
+        # Restore preprocessor directives verbatim (column-1, no wrapping).
+        if preproc_keep:
+            lines = [preproc_keep.get(ln.strip(), ln) for ln in lines]
         dst = "\n".join(lines) + ("\n" if src.endswith("\n") and lines else "")
         transformed[path] = dst
         if dst != src:
